@@ -92,9 +92,9 @@ def main():
                 scale_factor = 400 / monitor["width"]
                 target_height = int(monitor["height"] * scale_factor)
                 
-                cv2.setWindowProperty("Automata Vision Context", cv2.WND_PROP_TOPMOST, 1)
+                cv2.setWindowProperty("Vision Context", cv2.WND_PROP_TOPMOST, 1)
                 preview = cv2.resize(frame, (400, target_height))
-                cv2.imshow("Automata Vision Context", preview)
+                cv2.imshow("Vision Context", preview)
                 
                 cv2.setWindowProperty("Color Threshold Mask", cv2.WND_PROP_TOPMOST, 1)
                 mask_preview = cv2.resize(debug_mask, (400, target_height))

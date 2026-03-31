@@ -9,10 +9,10 @@ BAUD_RATE = 115200
 # Screen capture config (1920x1080)
 # Adjusted region to cut out the top UI and focus purely on the note dropping area
 CAPTURE_REGION = {
-    "top": 44,    
-    "left": 201,   
-    "width": 1421, 
-    "height": 988  
+    "top": 43,    
+    "left": 239,   
+    "width": 1367, 
+    "height": 1025  
 }
 
 # Gameplay config
@@ -21,12 +21,12 @@ KEYS = ['a', 's', 'd', 'j', 'k', 'l']
 
 # Calibrated X-coordinates relative to the left edge of CAPTURE_REGION (which is at X=450)
 COLUMN_CENTERS = [
-    219,
-    434,
-    651,
-    867,
-    1085,
-    1301
+    181,
+    398,
+    614,
+    830,
+    1049,
+    1265
 ]
 
 # The Y-coordinate (relative to the CAPTURE_REGION's top edge) of the "Hit Line"
@@ -38,12 +38,12 @@ HIT_LINE_Y = 877
 # OpenCV HSV ranges: H is 0-179, S is 0-255, V is 0-255
 
 # Yellow notes (Tap)
-TAP_COLOR_LOWER = (10, 138, 188)
+TAP_COLOR_LOWER = (10, 138, 189)
 TAP_COLOR_UPPER = (30, 238, 255)
 
 # Purple notes (Hold)
-HOLD_COLOR_LOWER = (116, 77, 197)
-HOLD_COLOR_UPPER = (136, 177, 255)
+HOLD_COLOR_LOWER = (117, 37, 200)
+HOLD_COLOR_UPPER = (137, 137, 255)
 
 # Delay introduced manually to simulate human reaction time variance (milliseconds)
 HUMANIZATION_MIN_LATENCY = 10 
