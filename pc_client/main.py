@@ -68,6 +68,8 @@ def main():
                     controller.hold_start(key)
                 elif action == 'HOLD_END':
                     controller.hold_end(key)
+                elif action == 'HOLD_RESTART':
+                    controller.hold_restart(key)
 
             # Debug overlay
             if DEBUG_MODE:

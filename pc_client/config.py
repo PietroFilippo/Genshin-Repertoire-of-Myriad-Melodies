@@ -42,12 +42,28 @@ TAP_COLOR_LOWER = (10, 138, 189)
 TAP_COLOR_UPPER = (30, 238, 255)
 
 # Purple notes (Hold)
-HOLD_COLOR_LOWER = (117, 37, 200)
-HOLD_COLOR_UPPER = (137, 137, 255)
+HOLD_COLOR_LOWER = (115, 30, 190)
+HOLD_COLOR_UPPER = (140, 150, 255)
 
-# Delay introduced manually to simulate human reaction time variance (milliseconds)
-HUMANIZATION_MIN_LATENCY = 10 
-HUMANIZATION_MAX_LATENCY = 30
+# === Closed Mask Probe (release detection) ===
+# Uses mask_hold_closed (with MORPH_CLOSE gap bridging) — proven in pc_client2
+HOLD_PROBE_HALF_WIDTH = 50          # horizontal half-width in pixels
+HOLD_PROBE_ABOVE = 60               # pixels above hit line
+HOLD_PROBE_BELOW = 40               # pixels below hit line
+HOLD_RELEASE_FRAMES = 2             # consecutive zero-pixel frames before release/restart
+
+# Hit animation protection: the game plays a ~250ms visual effect on hold press
+# that wipes purple from the probe area. Gate ALL checking until this clears.
+HOLD_MIN_TIME = 0.35                # seconds before any release check activates
+
+# Hold restart gap timing (used by controller.py)
+HOLD_RESTART_GAP_MS = 20
+
+# Post-tap fallback detection (hold note after tap note)
+POST_TAP_WATCH_DURATION = 0.4       # seconds after tap to apply fallback logic
+POST_TAP_PIXEL_THRESHOLD = 80       # minimum purple pixels to detect approaching hold
+POST_TAP_CONFIRM_FRAMES = 3         # consecutive frames required
+POST_TAP_EXPANDED_WINDOW = 60       # expanded hit line window (pixels above)
 
 # Show OpenCV preview window
 # Set to False to increase performance once configured

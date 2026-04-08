@@ -1,10 +1,9 @@
 # pc_client/controller.py
 import serial
 import time
-import random
 import threading
 import sys
-from config import SERIAL_PORT, BAUD_RATE, HUMANIZATION_MIN_LATENCY, HUMANIZATION_MAX_LATENCY
+from config import SERIAL_PORT, BAUD_RATE, HOLD_RESTART_GAP_MS
 
 class ArduinoHIDController:
     def __init__(self):
@@ -26,8 +25,12 @@ class ArduinoHIDController:
         """Internal method to write string to serial"""
         if self.ser and self.ser.is_open:
             cmd_str = f"{cmd}\n"
-            self.ser.write(cmd_str.encode('utf-8'))
-            self.ser.flush()
+            try:
+                self.ser.write(cmd_str.encode('utf-8'))
+                self.ser.flush()
+            except (serial.SerialTimeoutException, serial.SerialException, OSError) as e:
+                # Don't let a transient write failure crash a worker thread.
+                print(f"[serial] write failed for {cmd!r}: {e}")
 
     def _threaded_action(self, cmd, delay_ms):
         """Sleep in a separate thread, then send the command"""
@@ -35,25 +38,23 @@ class ArduinoHIDController:
             time.sleep(delay_ms / 1000.0)
         self._send_command(cmd)
 
-    def get_human_delay(self):
-        return random.uniform(HUMANIZATION_MIN_LATENCY, HUMANIZATION_MAX_LATENCY)
-
     def tap_key(self, key):
-        """Simulate a fast key tap (press and immediate release) with delay"""
-        delay = self.get_human_delay()
-        threading.Thread(target=self._threaded_action, args=(f"{key.upper()}_DOWN", delay), daemon=True).start()
-        # Release automatically after 50ms + the initial delay
-        threading.Thread(target=self._threaded_action, args=(f"{key.upper()}_UP", delay + 50), daemon=True).start()
+        """Simulate a fast key tap (press and immediate release)"""
+        self._send_command(f"{key.upper()}_DOWN")
+        threading.Thread(target=self._threaded_action, args=(f"{key.upper()}_UP", 50), daemon=True).start()
 
     def hold_start(self, key):
-        """Start holding a key down with delay"""
-        delay = self.get_human_delay()
-        threading.Thread(target=self._threaded_action, args=(f"{key.upper()}_DOWN", delay), daemon=True).start()
+        """Start holding a key down immediately"""
+        self._send_command(f"{key.upper()}_DOWN")
 
     def hold_end(self, key):
-        """Release a held key with delay"""
-        delay = self.get_human_delay()
-        threading.Thread(target=self._threaded_action, args=(f"{key.upper()}_UP", delay), daemon=True).start()
+        """Release a held key immediately"""
+        self._send_command(f"{key.upper()}_UP")
+
+    def hold_restart(self, key):
+        """Release and immediately re-press for consecutive hold notes"""
+        self._send_command(f"{key.upper()}_UP")
+        threading.Thread(target=self._threaded_action, args=(f"{key.upper()}_DOWN", HOLD_RESTART_GAP_MS), daemon=True).start()
 
     def close(self):
         if self.ser and self.ser.is_open:
