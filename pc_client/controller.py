@@ -3,17 +3,24 @@ import serial
 import time
 import threading
 import sys
-from config import SERIAL_PORT, BAUD_RATE, HOLD_RESTART_GAP_MS
+from config import (SERIAL_PORT, BAUD_RATE, HOLD_RESTART_GAP_MS,
+                    TAP_MULTI_INTERNAL_GAP_MS)
 
 class ArduinoHIDController:
     def __init__(self):
         self.port = SERIAL_PORT
         self.baud = BAUD_RATE
         self.ser = None
-        
+        # Serialize all writes from worker threads. Concurrent writes to the
+        # same Windows COM port cause race conditions and Write timeouts.
+        self._write_lock = threading.Lock()
+
         try:
             print(f"Connecting to Arduino on {self.port} at {self.baud} baud")
-            self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            # Explicit write_timeout so a stalled write fails fast instead of
+            # blocking other commands behind it for unbounded time.
+            self.ser = serial.Serial(self.port, self.baud,
+                                     timeout=1, write_timeout=0.5)
             time.sleep(2) # Allow arduino leonardo time to reset and initialize serial
             print("Connected successfully")
         except Exception as e:
@@ -26,8 +33,9 @@ class ArduinoHIDController:
         if self.ser and self.ser.is_open:
             cmd_str = f"{cmd}\n"
             try:
-                self.ser.write(cmd_str.encode('utf-8'))
-                self.ser.flush()
+                with self._write_lock:
+                    self.ser.write(cmd_str.encode('utf-8'))
+                    self.ser.flush()
             except (serial.SerialTimeoutException, serial.SerialException, OSError) as e:
                 # Don't let a transient write failure crash a worker thread.
                 print(f"[serial] write failed for {cmd!r}: {e}")
@@ -42,6 +50,32 @@ class ArduinoHIDController:
         """Simulate a fast key tap (press and immediate release)"""
         self._send_command(f"{key.upper()}_DOWN")
         threading.Thread(target=self._threaded_action, args=(f"{key.upper()}_UP", 50), daemon=True).start()
+
+    def tap_multi(self, key, count, gap_ms=None):
+        """Fire `count` taps in quick succession on the same key.
+
+        First tap fires immediately. Each subsequent tap is scheduled in its
+        own daemon thread at i*gap_ms (DOWN) and i*gap_ms+50 (UP). Used for
+        consecutive tap notes that visually merge into one tall contour.
+        """
+        if gap_ms is None:
+            gap_ms = TAP_MULTI_INTERNAL_GAP_MS
+        if count < 1:
+            return
+        # Tap #0 fires now
+        self._send_command(f"{key.upper()}_DOWN")
+        threading.Thread(target=self._threaded_action,
+                         args=(f"{key.upper()}_UP", 50), daemon=True).start()
+        # Taps #1..N-1 are scheduled with increasing offsets
+        for i in range(1, count):
+            down_delay = i * gap_ms
+            up_delay = down_delay + 50
+            threading.Thread(target=self._threaded_action,
+                             args=(f"{key.upper()}_DOWN", down_delay),
+                             daemon=True).start()
+            threading.Thread(target=self._threaded_action,
+                             args=(f"{key.upper()}_UP", up_delay),
+                             daemon=True).start()
 
     def hold_start(self, key):
         """Start holding a key down immediately"""

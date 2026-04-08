@@ -64,6 +64,12 @@ def main():
                 # Actually send to arduino here
                 if action == 'TAP':
                     controller.tap_key(key)
+                elif action == 'TAP_DOUBLE':
+                    controller.tap_multi(key, 2,
+                                         gap_ms=detector.pending_tap_gap_ms[key])
+                elif action == 'TAP_TRIPLE':
+                    controller.tap_multi(key, 3,
+                                         gap_ms=detector.pending_tap_gap_ms[key])
                 elif action == 'HOLD_START':
                     controller.hold_start(key)
                 elif action == 'HOLD_END':

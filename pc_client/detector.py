@@ -6,7 +6,14 @@ from config import (COLUMN_CENTERS, KEYS, TAP_COLOR_LOWER, TAP_COLOR_UPPER,
                      HOLD_PROBE_HALF_WIDTH, HOLD_PROBE_ABOVE, HOLD_PROBE_BELOW,
                      HOLD_RELEASE_FRAMES, HOLD_MIN_TIME,
                      POST_TAP_WATCH_DURATION, POST_TAP_PIXEL_THRESHOLD,
-                     POST_TAP_CONFIRM_FRAMES, POST_TAP_EXPANDED_WINDOW)
+                     POST_TAP_CONFIRM_FRAMES, POST_TAP_EXPANDED_WINDOW,
+                     TAP_MAX_H, TAP_DOUBLE_ASPECT, TAP_TRIPLE_ASPECT,
+                     TAP_DOUBLE_MIN_H, TAP_TRIPLE_MIN_H,
+                     TAP_DOUBLE_MIN_EXTRA_H,
+                     TAP_NEIGHBOR_MIN_GAP_PX, TAP_NEIGHBOR_MAX_GAP_PX,
+                     TAP_FALL_SPEED_PX_PER_S, TAP_MULTI_GAP_MIN_MS,
+                     TAP_MULTI_GAP_MAX_MS, TAP_MULTI_INTERNAL_GAP_MS,
+                     TAP_SINGLE_LOCKOUT_S, TAP_MULTI_LOCKOUT_S)
 
 class NoteDetector:
     def __init__(self):
@@ -18,6 +25,13 @@ class NoteDetector:
         # State tracking
         self.holding_state = {key: False for key in KEYS}
         self.last_tap_time = {key: 0.0 for key in KEYS}
+        # Absolute timestamp until which TAPs are blocked from re-firing.
+        # Multi-tap actions push this further into the future than single taps.
+        self.tap_lockout_until = {key: 0.0 for key in KEYS}
+        # Per-key dynamic gap for the most recent multi-tap action. main.py
+        # reads this when dispatching TAP_DOUBLE / TAP_TRIPLE so the inter-tap
+        # delay matches the visual stack height.
+        self.pending_tap_gap_ms = {key: TAP_MULTI_INTERNAL_GAP_MS for key in KEYS}
         self.last_hold_time = {key: 0.0 for key in KEYS}
         # Consecutive empty probe frames per key
         self.hold_empty_frames = {key: 0 for key in KEYS}
@@ -64,7 +78,10 @@ class NoteDetector:
         # Filter and group contours by column
         col_notes = {i: [] for i in range(len(self.column_centers))}
 
-        # Helper to categorize notes into columns with strict size filtering
+        # Helper to categorize notes into columns with strict size filtering.
+        # Each appended tuple is (x, y, w, h, note_type, n_taps). For HOLD,
+        # n_taps is always 1 and is unused — it just keeps the tuple shape
+        # uniform so unpacking works for both note types.
         def categorize_contours(contours_list, note_type, mask):
             for contour in contours_list:
                 x, y, w, h = cv2.boundingRect(contour)
@@ -74,16 +91,42 @@ class NoteDetector:
                 area = cv2.contourArea(contour)
                 fill_ratio = pixel_area / area if area > 0 else 0
 
+                n_taps = 1
+
                 if note_type == 'TAP':
-                    if not (50 < w < 220 and 15 < h < 150):
+                    if not (50 < w < 220 and 15 < h < TAP_MAX_H):
                         continue
-                    if fill_ratio < 0.70:
+                    if fill_ratio < 0.55:
                         continue
 
-                    perimeter = cv2.arcLength(contour, True)
-                    circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
-                    if circularity < 0.45:
-                        continue
+                    # Classify by shape. A single coin is roughly square
+                    # (h ≈ w). A merged double adds vertical extent without
+                    # changing width — even when the overlap is so heavy that
+                    # the aspect ratio barely moves, h-w is still a few px
+                    # bigger than for a single. Use three signals (any wins):
+                    #   - aspect ratio threshold (catches obvious tall stacks)
+                    #   - absolute height threshold (catches unusual zooms)
+                    #   - h-w pixel delta (catches very heavy overlaps)
+                    aspect = h / w if w > 0 else 1.0
+                    extra_h = h - w
+                    if aspect >= TAP_TRIPLE_ASPECT or h >= TAP_TRIPLE_MIN_H:
+                        n_taps = 3
+                    elif (aspect >= TAP_DOUBLE_ASPECT
+                          or h >= TAP_DOUBLE_MIN_H
+                          or extra_h >= TAP_DOUBLE_MIN_EXTRA_H):
+                        n_taps = 2
+                    else:
+                        n_taps = 1
+
+                    # Only enforce circularity on shapes that actually look
+                    # like a circle (aspect close to 1). Merged double/triple
+                    # contours are peanut-shaped and would otherwise be
+                    # rejected here, which is exactly the bug we just hit.
+                    if n_taps == 1 and aspect < 1.15:
+                        perimeter = cv2.arcLength(contour, True)
+                        circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
+                        if circularity < 0.45:
+                            continue
 
                     hsv_roi = hsv_frame[y:y+h, x:x+w]
                     mean_hsv = cv2.mean(hsv_roi, mask=roi)
@@ -97,7 +140,7 @@ class NoteDetector:
                 center_x = x + (w // 2)
                 for i, cx in enumerate(self.column_centers):
                     if abs(center_x - cx) < self.col_width:
-                        col_notes[i].append((x, y, w, h, note_type))
+                        col_notes[i].append((x, y, w, h, note_type, n_taps))
                         break
 
         categorize_contours(contours_tap, 'TAP', mask_tap)
@@ -111,7 +154,7 @@ class NoteDetector:
             # Sort notes by lowest y coordinate first (closest to bottom/hit line)
             notes_in_col.sort(key=lambda box: box[1] + box[3], reverse=True)
 
-            for (x, y, w, h, note_type) in notes_in_col:
+            for (x, y, w, h, note_type, n_from_shape) in notes_in_col:
                 bottom_y = y + h
 
                 # Check if the note bottom is within the correct hit window
@@ -126,8 +169,60 @@ class NoteDetector:
                     action_taken = False
 
                     if note_type == 'TAP' and not self.holding_state[key]:
-                        if current_t - self.last_tap_time[key] > 0.25:
-                            actions[key] = 'TAP'
+                        if current_t >= self.tap_lockout_until[key]:
+                            # Look for SEPARATE TAP contours above this one in
+                            # the same column. If a second coin is sitting up
+                            # there waiting, it's a double — we can't rely on
+                            # the single-tap cooldown to fire it later because
+                            # the gap is often shorter than the cooldown.
+                            my_bottom = bottom_y
+                            neighbors_above = []
+                            for (ox, oy, ow, oh, ot, _) in notes_in_col:
+                                if ot != 'TAP':
+                                    continue
+                                if (ox, oy, ow, oh) == (x, y, w, h):
+                                    continue  # same contour as 'me'
+                                o_bottom = oy + oh
+                                gap_px = my_bottom - o_bottom
+                                if TAP_NEIGHBOR_MIN_GAP_PX < gap_px < TAP_NEIGHBOR_MAX_GAP_PX:
+                                    neighbors_above.append(o_bottom)
+                            neighbors_above.sort(reverse=True)  # closest first
+
+                            n_from_neighbors = 1 + len(neighbors_above)
+                            n_taps = min(3, max(n_from_shape, n_from_neighbors))
+
+                            # Dynamic gap. Prefer the actual visual distance
+                            # to the closest neighbor; fall back to the
+                            # current contour's extra height (merged blob).
+                            if n_taps >= 2 and neighbors_above:
+                                visual_gap = my_bottom - neighbors_above[0]
+                            elif n_taps >= 2:
+                                visual_gap = max(0, h - w)
+                            else:
+                                visual_gap = 0
+
+                            gap_ms = int(visual_gap * 1000.0 / TAP_FALL_SPEED_PX_PER_S)
+                            if n_taps >= 2:
+                                gap_ms = max(TAP_MULTI_GAP_MIN_MS,
+                                             min(TAP_MULTI_GAP_MAX_MS, gap_ms))
+                            else:
+                                gap_ms = 0
+
+                            aspect = h / w if w > 0 else 1.0
+                            print(f"  [tap {key}] w={w} h={h} asp={aspect:.2f} "
+                                  f"neigh={len(neighbors_above)} n_shape={n_from_shape} "
+                                  f"n={n_taps} gap={gap_ms}ms")
+
+                            if n_taps >= 3:
+                                actions[key] = 'TAP_TRIPLE'
+                                self.tap_lockout_until[key] = current_t + TAP_MULTI_LOCKOUT_S
+                            elif n_taps == 2:
+                                actions[key] = 'TAP_DOUBLE'
+                                self.tap_lockout_until[key] = current_t + TAP_MULTI_LOCKOUT_S
+                            else:
+                                actions[key] = 'TAP'
+                                self.tap_lockout_until[key] = current_t + TAP_SINGLE_LOCKOUT_S
+                            self.pending_tap_gap_ms[key] = gap_ms
                             self.last_tap_time[key] = current_t
                             action_taken = True
 
@@ -201,7 +296,7 @@ class NoteDetector:
                         # contour) sits ABOVE the probe area (above hit_line-60),
                         # within visible range. Detect that contour to fire RESTART.
                         next_hold = None
-                        for (nx, ny, nw, nh, ntype) in notes_in_col:
+                        for (nx, ny, nw, nh, ntype, _ntaps) in notes_in_col:
                             if ntype != 'HOLD':
                                 continue
                             n_bottom = ny + nh
