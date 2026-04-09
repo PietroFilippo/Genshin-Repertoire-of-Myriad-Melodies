@@ -11,9 +11,11 @@ from config import (COLUMN_CENTERS, KEYS, TAP_COLOR_LOWER, TAP_COLOR_UPPER,
                      TAP_DOUBLE_MIN_H, TAP_TRIPLE_MIN_H,
                      TAP_DOUBLE_MIN_EXTRA_H,
                      TAP_NEIGHBOR_MIN_GAP_PX, TAP_NEIGHBOR_MAX_GAP_PX,
+                     TAP_NEIGHBOR_MIN_H,
                      TAP_FALL_SPEED_PX_PER_S, TAP_MULTI_GAP_MIN_MS,
                      TAP_MULTI_GAP_MAX_MS, TAP_MULTI_INTERNAL_GAP_MS,
-                     TAP_SINGLE_LOCKOUT_S, TAP_MULTI_LOCKOUT_S)
+                     TAP_SINGLE_LOCKOUT_S, TAP_MULTI_LOCKOUT_S,
+                     POST_HOLD_END_TAP_LOCKOUT_S)
 
 class NoteDetector:
     def __init__(self):
@@ -182,6 +184,8 @@ class NoteDetector:
                                     continue
                                 if (ox, oy, ow, oh) == (x, y, w, h):
                                     continue  # same contour as 'me'
+                                if oh < TAP_NEIGHBOR_MIN_H:
+                                    continue
                                 o_bottom = oy + oh
                                 gap_px = my_bottom - o_bottom
                                 if TAP_NEIGHBOR_MIN_GAP_PX < gap_px < TAP_NEIGHBOR_MAX_GAP_PX:
@@ -316,6 +320,7 @@ class NoteDetector:
                             self.hold_empty_frames[key] = 0
                             self.post_tap_active_frames[key] = 0
                             self.last_hold_time[key] = 0.0
+                            self.tap_lockout_until[key] = current_t + POST_HOLD_END_TAP_LOCKOUT_S
                 else:
                     self.hold_empty_frames[key] = 0
 

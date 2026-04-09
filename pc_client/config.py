@@ -79,12 +79,13 @@ TAP_TRIPLE_MIN_H = 195              # absolute h fallback for 3 stacked taps
 # merged double only adds a few pixels of vertical extent, the aspect ratio
 # barely moves. This catches that case directly: h must be at least this many
 # pixels taller than w to count as a stacked double.
-TAP_DOUBLE_MIN_EXTRA_H = 3
+TAP_DOUBLE_MIN_EXTRA_H = 8
 # Neighbor search: when a TAP fires, look for another TAP contour above it in
 # the same column within this vertical range. If found, treat the pair as a
 # TAP_DOUBLE so the second one doesn't get blocked by the single-tap lockout.
 TAP_NEIGHBOR_MIN_GAP_PX = 20        # ignore neighbors closer than this (self)
 TAP_NEIGHBOR_MAX_GAP_PX = 150       # ignore neighbors farther than this
+TAP_NEIGHBOR_MIN_H = 40
 # Approximate note fall speed used to compute the right inter-tap gap from
 # the visual stack height. ~300 px/sec at 60 fps ≈ 5 px/frame.
 TAP_FALL_SPEED_PX_PER_S = 300
@@ -93,7 +94,8 @@ TAP_MULTI_GAP_MAX_MS = 280          # clamp upper bound on dynamic gap
 TAP_MULTI_INTERNAL_GAP_MS = 130     # default gap if dynamic calc unavailable
 TAP_MULTI_LOCKOUT_S = 0.45          # cooldown after firing a multi-tap
 TAP_SINGLE_LOCKOUT_S = 0.25         # cooldown after firing a single tap
+POST_HOLD_END_TAP_LOCKOUT_S = 0.20
 
 # Show OpenCV preview window
 # Set to False to increase performance once configured
-DEBUG_MODE = False
+DEBUG_MODE = True
