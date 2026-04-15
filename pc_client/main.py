@@ -76,6 +76,13 @@ def main():
                     controller.hold_end(key)
                 elif action == 'HOLD_RESTART':
                     controller.hold_restart(key)
+                elif action == 'HOLD_END_THEN_TAP':
+                    # Compound action: release the still-active hold, then
+                    # immediately tap. Both calls run on the main thread so
+                    # there's no race; the tap's delayed UP is epoch-checked
+                    # against any subsequent hold_start.
+                    controller.hold_end(key)
+                    controller.tap_key(key)
 
             # Debug overlay
             if DEBUG_MODE:
