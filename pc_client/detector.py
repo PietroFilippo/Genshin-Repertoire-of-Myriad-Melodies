@@ -12,12 +12,16 @@ from config import (COLUMN_CENTERS, KEYS, TAP_COLOR_LOWER, TAP_COLOR_UPPER,
                      TAP_MAX_H, TAP_DOUBLE_ASPECT, TAP_TRIPLE_ASPECT,
                      TAP_DOUBLE_MIN_H, TAP_TRIPLE_MIN_H,
                      TAP_COIN_MIN_W, TAP_COIN_MAX_W, TAP_DOUBLE_MAX_CIRC,
+                     TAP_FAST_DOUBLE_MIN_H, TAP_FAST_DOUBLE_MIN_ASPECT,
+                     TAP_FAST_DOUBLE_MAX_CIRC, TAP_FAST_DOUBLE_TOP_DENSITY,
                      TAP_NEIGHBOR_MIN_GAP_PX, TAP_NEIGHBOR_MAX_GAP_PX,
                      TAP_NEIGHBOR_MIN_H, TAP_NEIGHBOR_HIT_LINE_EXCLUSION,
                      TAP_FALL_SPEED_PX_PER_S, TAP_MULTI_GAP_MIN_MS,
                      TAP_MULTI_GAP_MAX_MS, TAP_MULTI_INTERNAL_GAP_MS,
                      TAP_SINGLE_LOCKOUT_S, TAP_MULTI_LOCKOUT_S,
-                     POST_HOLD_END_TAP_LOCKOUT_S)
+                     POST_HOLD_END_TAP_LOCKOUT_S,
+                     PENDING_DOUBLE_WINDOW_S, PENDING_DOUBLE_MIN_CIRC,
+                     PENDING_DOUBLE_TRAIL_TOLERANCE_PX)
 
 class NoteDetector:
     def __init__(self):
@@ -41,6 +45,14 @@ class NoteDetector:
         self.hold_empty_frames = {key: 0 for key in KEYS}
         # Post-tap fallback state
         self.post_tap_active_frames = {key: 0 for key in KEYS}
+        # Bottom_y of the most recently fired tap contour. Used to project
+        # the fired coin's descending trail forward in time so a bypass-fire
+        # path doesn't retrigger on the same physical coin as it passes
+        # through the hit window.
+        self.last_tap_bottom = {key: 0.0 for key in KEYS}
+        # Absolute timestamp until which a single TAP is allowed to be
+        # followed up by a bypass-fire second tap (fast-double support).
+        self.pending_double_until = {key: 0.0 for key in KEYS}
 
     def process_frame(self, frame_bgr):
         """
@@ -123,10 +135,33 @@ class NoteDetector:
                     else:
                         n_taps = 1
 
+                    # Very-fast-double: coins overlap enough that the merged
+                    # contour's aspect stays below TAP_DOUBLE_ASPECT. Primary
+                    # classifier calls it single. Secondary rescue: coin-sized
+                    # width + non-circular + dense top third ⇒ second coin is
+                    # stacked on top (not a motion trail, which tapers).
+                    if (n_taps == 1
+                            and TAP_COIN_MIN_W <= w <= TAP_COIN_MAX_W
+                            and h >= TAP_FAST_DOUBLE_MIN_H
+                            and aspect >= TAP_FAST_DOUBLE_MIN_ASPECT
+                            and circularity < TAP_FAST_DOUBLE_MAX_CIRC):
+                        top_h = max(15, h // 3)
+                        top_roi = mask[y:y + top_h, x:x + w]
+                        top_area = top_h * w
+                        top_density = (cv2.countNonZero(top_roi) / float(top_area)
+                                       if top_area > 0 else 0.0)
+                        if top_density >= TAP_FAST_DOUBLE_TOP_DENSITY:
+                            n_taps = 2
+                            print(f"  [fast-double] w={w} h={h} asp={aspect:.2f} "
+                                  f"circ={circularity:.2f} top_den={top_density:.2f}")
+
                     # Reject non-circular junk that looks like a single tap.
-                    if n_taps == 1 and aspect < 1.15:
-                        if circularity < 0.45:
-                            continue
+                    # Applies regardless of aspect — explosion tails can reach
+                    # aspect ~1.4 with jagged perimeter (circ ~0.27) and would
+                    # otherwise fire a spurious TAP once the multi-tap lockout
+                    # expires.
+                    if n_taps == 1 and circularity < 0.45:
+                        continue
 
                     hsv_roi = hsv_frame[y:y+h, x:x+w]
                     mean_hsv = cv2.mean(hsv_roi, mask=roi)
@@ -177,7 +212,33 @@ class NoteDetector:
                         continue
 
                     if note_type == 'TAP' and not self.holding_state[key]:
-                        if current_t >= self.tap_lockout_until[key]:
+                        # Fast-double bypass: during the pending window after
+                        # a single TAP, allow a NEW coin-shaped contour at the
+                        # hit line to fire despite the single-tap lockout. The
+                        # fired coin's own descending contour is filtered out
+                        # by projecting its expected bottom_y forward from the
+                        # fire moment at TAP_FALL_SPEED — anything within
+                        # PENDING_DOUBLE_TRAIL_TOLERANCE_PX of that projection
+                        # is the same coin and must not retrigger.
+                        tap_aspect = h / w if w > 0 else 1.0
+                        is_fresh_coin = (
+                            TAP_COIN_MIN_W <= w <= TAP_COIN_MAX_W
+                            and 40 <= h <= TAP_COIN_MAX_W + 20
+                            and circ > PENDING_DOUBLE_MIN_CIRC
+                            and 0.85 <= tap_aspect <= 1.20
+                            and (y + h // 2) < self.hit_line_y - 10
+                        )
+                        bypass_fire = False
+                        if (is_fresh_coin
+                                and current_t < self.tap_lockout_until[key]
+                                and current_t < self.pending_double_until[key]):
+                            elapsed = current_t - self.last_tap_time[key]
+                            expected_bottom = (self.last_tap_bottom[key]
+                                               + elapsed * TAP_FALL_SPEED_PX_PER_S)
+                            if abs(bottom_y - expected_bottom) >= PENDING_DOUBLE_TRAIL_TOLERANCE_PX:
+                                bypass_fire = True
+
+                        if current_t >= self.tap_lockout_until[key] or bypass_fire:
                             # Look for SEPARATE TAP contours above this one in
                             # the same column. If a second coin is sitting up
                             # there waiting, it's a double — we can't rely on
@@ -185,7 +246,7 @@ class NoteDetector:
                             # the gap is often shorter than the cooldown.
                             my_bottom = bottom_y
                             neighbors_above = []
-                            for (ox, oy, ow, oh, ot, _, _) in notes_in_col:
+                            for (ox, oy, ow, oh, ot, _, o_circ) in notes_in_col:
                                 if ot != 'TAP':
                                     continue
                                 if (ox, oy, ow, oh) == (x, y, w, h):
@@ -194,17 +255,23 @@ class NoteDetector:
                                     continue
                                 o_bottom = oy + oh
                                 # Reject neighbors whose bottom is at or
-                                # near the hit line. The yellow tap-hit
-                                # explosion lingers as a contour around
-                                # the hit line area; a real second tap
-                                # in a stacked double sits cleanly above
-                                # (its bottom is well above hit_line by
-                                # at least one tap-height worth of pixels).
-                                # This suppresses the explosion-as-neighbor
-                                # false positive without dropping legitimate
-                                # stacked doubles.
+                                # near the hit line — usually explosion
+                                # glow from a recent hit. Exception: VERY
+                                # fast stacked doubles put the second coin
+                                # right above the hit line too. Bypass the
+                                # exclusion if the neighbor still has clear
+                                # coin shape (coin-sized width + round +
+                                # aspect ≈1). Explosions expand past coin
+                                # width and lose circularity.
                                 if o_bottom > self.hit_line_y - TAP_NEIGHBOR_HIT_LINE_EXCLUSION:
-                                    continue
+                                    o_aspect = oh / ow if ow > 0 else 1.0
+                                    looks_like_coin = (
+                                        TAP_COIN_MIN_W <= ow <= TAP_COIN_MAX_W
+                                        and o_circ > 0.70
+                                        and 0.85 <= o_aspect <= 1.25
+                                    )
+                                    if not looks_like_coin:
+                                        continue
                                 gap_px = my_bottom - o_bottom
                                 if TAP_NEIGHBOR_MIN_GAP_PX < gap_px < TAP_NEIGHBOR_MAX_GAP_PX:
                                     neighbors_above.append(o_bottom)
@@ -225,7 +292,18 @@ class NoteDetector:
                             else:
                                 visual_gap = 0
 
-                            gap_ms = int(visual_gap * 1000.0 / TAP_FALL_SPEED_PX_PER_S)
+                            # Early-fire compensation: if first tap fires
+                            # while the first coin is still above the hit
+                            # line by `early_px`, the second coin is also
+                            # `early_px` above its ideal hit moment. Without
+                            # compensation, the second tap lands on the
+                            # second coin still above the hit line by the
+                            # same offset. Adding early_px to visual_gap
+                            # delays the second tap just enough to catch the
+                            # second coin at the hit line.
+                            early_px = max(0, self.hit_line_y - my_bottom)
+                            gap_ms = int((visual_gap + early_px) * 1000.0
+                                         / TAP_FALL_SPEED_PX_PER_S)
                             if n_taps >= 2:
                                 gap_ms = max(TAP_MULTI_GAP_MIN_MS,
                                              min(TAP_MULTI_GAP_MAX_MS, gap_ms))
@@ -240,14 +318,25 @@ class NoteDetector:
                             if n_taps >= 3:
                                 actions[key] = 'TAP_TRIPLE'
                                 self.tap_lockout_until[key] = current_t + TAP_MULTI_LOCKOUT_S
+                                self.pending_double_until[key] = 0.0
                             elif n_taps == 2:
                                 actions[key] = 'TAP_DOUBLE'
                                 self.tap_lockout_until[key] = current_t + TAP_MULTI_LOCKOUT_S
+                                self.pending_double_until[key] = 0.0
                             else:
                                 actions[key] = 'TAP'
                                 self.tap_lockout_until[key] = current_t + TAP_SINGLE_LOCKOUT_S
+                                if bypass_fire:
+                                    # This fire IS the second tap of a fast
+                                    # double — don't re-arm the window (would
+                                    # cascade into spurious third fires).
+                                    self.pending_double_until[key] = 0.0
+                                    print(f"  [tap {key}] BYPASS FIRE bottom={bottom_y}")
+                                else:
+                                    self.pending_double_until[key] = current_t + PENDING_DOUBLE_WINDOW_S
                             self.pending_tap_gap_ms[key] = gap_ms
                             self.last_tap_time[key] = current_t
+                            self.last_tap_bottom[key] = bottom_y
                             action_taken = True
 
                     elif note_type == 'TAP' and self.holding_state[key]:

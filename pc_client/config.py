@@ -97,6 +97,18 @@ TAP_COIN_MAX_W = 90
 # single coins with glow are elliptical (high circularity ~0.95+). This
 # replaces the height check as the main discriminator for shape-based doubles.
 TAP_DOUBLE_MAX_CIRC = 0.88
+# Very-fast-double detection (merged contour, sub-aspect-threshold).
+# When two coins overlap by more than ~half a coin, the merged blob's
+# aspect stays below TAP_DOUBLE_ASPECT so the primary classifier misses
+# it. Secondary check: contour is coin-width, moderately tall, non-
+# circular, AND its top third carries coin-level pixel density. Single
+# coins with motion trail fail the density test (trails taper).
+# MIN_H=70 covers overlap down to ~50px (near full stack); below that
+# the two coins are visually indistinguishable.
+TAP_FAST_DOUBLE_MIN_H = 70
+TAP_FAST_DOUBLE_MIN_ASPECT = 1.03   # real doubles asp~1.05; singles asp~1.00 even w/ halo
+TAP_FAST_DOUBLE_MAX_CIRC = 0.85     # real doubles circ~0.82; singles circ~0.89
+TAP_FAST_DOUBLE_TOP_DENSITY = 0.55  # top-third pixel density cutoff
 # Neighbor search: when a TAP fires, look for another TAP contour above it in
 # the same column within this vertical range. If found, treat the pair as a
 # TAP_DOUBLE so the second one doesn't get blocked by the single-tap lockout.
@@ -112,12 +124,34 @@ TAP_NEIGHBOR_HIT_LINE_EXCLUSION = 40
 # Only affects multi-tap gap calculation (detector.py inside the TAP firing
 # branch); single taps, holds, and hit-line tolerances are unaffected.
 TAP_FALL_SPEED_PX_PER_S = 460
-TAP_MULTI_GAP_MIN_MS = 60           # clamp lower bound on dynamic gap
+TAP_MULTI_GAP_MIN_MS = 45           # clamp lower bound on dynamic gap.
+                                    # Must stay > TAP_UP_DELAY_MS + ~1 game
+                                    # frame (16.7ms at 60 Hz) so the release
+                                    # window between DOWN/UP/DOWN/UP is wide
+                                    # enough for the game to see two taps,
+                                    # not one held press.
 TAP_MULTI_GAP_MAX_MS = 280          # clamp upper bound on dynamic gap
 TAP_MULTI_INTERNAL_GAP_MS = 130     # default gap if dynamic calc unavailable
+# Duration a tap key is held DOWN before UP fires. Shorter = wider release
+# window between consecutive taps in tap_multi (critical for the game to
+# register both keystrokes instead of merging into one long press). 25ms
+# is longer than a 60 Hz game frame so single taps register reliably,
+# while leaving >16ms release gap at TAP_MULTI_GAP_MIN_MS=45.
+TAP_UP_DELAY_MS = 25
 TAP_MULTI_LOCKOUT_S = 0.25          # cooldown after firing a multi-tap
 TAP_SINGLE_LOCKOUT_S = 0.32         # cooldown after firing a single tap; must
                                     # outlast the yellow explosion effect (~270ms)
+# Pending-double window: after a single TAP fires, briefly allow a SECOND
+# coin-shaped contour arriving at hit line to bypass the single-tap lockout
+# (fast doubles whose gap is too wide for in-frame neighbor detection but
+# whose second coin reaches hit line well before the 320ms lockout expires).
+# Self-retrigger from the fired coin's own descending trail is blocked via
+# trail-position check (see detector.py).
+PENDING_DOUBLE_WINDOW_S = 0.30
+# Shape gates for the bypass-fire contour. Tight on purpose — explosion
+# artifacts must not masquerade as fresh coins.
+PENDING_DOUBLE_MIN_CIRC = 0.75
+PENDING_DOUBLE_TRAIL_TOLERANCE_PX = 30
 POST_HOLD_END_TAP_LOCKOUT_S = 0.05  # just enough for serial flush; tap-after-hold
                                     # is now mostly handled by HOLD_END_THEN_TAP
 

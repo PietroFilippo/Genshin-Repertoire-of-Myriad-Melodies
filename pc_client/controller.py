@@ -4,7 +4,7 @@ import time
 import threading
 import sys
 from config import (SERIAL_PORT, BAUD_RATE, HOLD_RESTART_GAP_MS,
-                    TAP_MULTI_INTERNAL_GAP_MS)
+                    TAP_MULTI_INTERNAL_GAP_MS, TAP_UP_DELAY_MS)
 
 class ArduinoHIDController:
     def __init__(self):
@@ -72,14 +72,14 @@ class ArduinoHIDController:
             epoch = self._up_epoch[key.lower()]
         self._send_command(f"{key.upper()}_DOWN")
         threading.Thread(target=self._delayed_up,
-                         args=(key, 50, epoch), daemon=True).start()
+                         args=(key, TAP_UP_DELAY_MS, epoch), daemon=True).start()
 
     def tap_multi(self, key, count, gap_ms=None):
         """Fire `count` taps in quick succession on the same key.
 
         First tap fires immediately. Each subsequent tap is scheduled in its
-        own daemon thread at i*gap_ms (DOWN) and i*gap_ms+50 (UP). Used for
-        consecutive tap notes that visually merge into one tall contour.
+        own daemon thread at i*gap_ms (DOWN) and i*gap_ms+TAP_UP_DELAY_MS (UP).
+        Used for consecutive tap notes that visually merge into one tall contour.
 
         All UPs share a single epoch snapshot taken at the start of the
         burst. If a hold_start fires before any UP runs, every UP in the
@@ -94,11 +94,11 @@ class ArduinoHIDController:
         # Tap #0 fires now
         self._send_command(f"{key.upper()}_DOWN")
         threading.Thread(target=self._delayed_up,
-                         args=(key, 50, epoch), daemon=True).start()
+                         args=(key, TAP_UP_DELAY_MS, epoch), daemon=True).start()
         # Taps #1..N-1 are scheduled with increasing offsets
         for i in range(1, count):
             down_delay = i * gap_ms
-            up_delay = down_delay + 50
+            up_delay = down_delay + TAP_UP_DELAY_MS
             threading.Thread(target=self._threaded_action,
                              args=(f"{key.upper()}_DOWN", down_delay),
                              daemon=True).start()
