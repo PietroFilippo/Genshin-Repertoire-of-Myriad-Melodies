@@ -22,3 +22,7 @@ __pycache__/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Macro tool: user recordings and hotkey overrides (not source)
+pc_client/macro.json
+pc_client/macro_*.json

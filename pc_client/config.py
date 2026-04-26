@@ -2,7 +2,7 @@
 
 # Hardware config
 # The COM port the arduino is connected to
-SERIAL_PORT = 'COM5'
+SERIAL_PORT = 'COM7'
 # Ensure this matches the arduino sketch setup
 BAUD_RATE = 115200
 
@@ -41,11 +41,33 @@ KEY_POLL_DELAY_S = 0.005
 #   KEY_UP   fires when ANY sample  is bright  (gap touches strip anywhere)
 # This widens the bright-window for inter-flower gaps, so very fast double
 # taps are caught even when the visual gap between two stacked notes is brief.
-# Trade-off: tight strip stays inside the solid flower body (away from
-# anti-aliased edges that could glitch ANY-bright detection). Setting this
-# to [0] reverts to single-pixel (BGI-equivalent) behaviour.
-Y_SAMPLE_OFFSETS = [-3, 0, 3]
+#
+# Center sample (dy=0) is intentionally skipped: the flower's bright
+# yellow-white core has B near the threshold and reads "bright" while it
+# crosses the hit line. With Hard Notes modifier (smaller flowers) that
+# core-bright window is a large fraction of the note's transit time and
+# can swallow every poll between dark-petal moments. Sampling petals only
+# (dy in {-5,-3,3,5}) keeps every sample firmly under threshold for the
+# entire time the note covers the strip. Setting this to [0] reverts to
+# single-pixel (BGI-equivalent) behaviour.
+Y_SAMPLE_OFFSETS = [-5, -3, 3, 5]
 
 # Show OpenCV debug visualization window. Detection runs in threads and is
 # independent of this flag — disable for max performance once tuned.
 DEBUG_MODE = False
+
+# === Macro tool keybinds ===
+# Keyboard bindings use `keyboard` package names ('y', 'f11', 'ctrl+m', ...).
+# Mouse bindings use the 'mouse:<name>' prefix. Valid mouse names:
+#   'left', 'right', 'middle', 'x' (Mouse 4), 'x2' (Mouse 5)
+# Note: 'play' is idempotent — pressing it while a macro is already running
+# is a no-op, so the play key can be safely spammed without cancelling the
+# run. Use the 'stop' binding (or 'exit') to interrupt playback.
+MACRO_HOTKEYS = {
+    'record': 'y',
+    'play':   'mouse:x',
+    'stop':   'mouse:x2',
+    'save':   'u',
+    'load':   'f11',
+    'exit':   'f12',
+}
