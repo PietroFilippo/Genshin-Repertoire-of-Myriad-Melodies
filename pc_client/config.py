@@ -56,6 +56,46 @@ Y_SAMPLE_OFFSETS = [-5, -3, 3, 5]
 # independent of this flag — disable for max performance once tuned.
 DEBUG_MODE = False
 
+# === Album auto-runner (album.py) ===
+# Difficulty for the rhythm task. One of:
+#   'normal' (普通)  → click (480,  600)
+#   'hard'   (困难)  → click (800,  600)
+#   'master' (大师)  → click (1150, 600)
+#   'pro'    (传说)  → click (1400, 600)   ← BGI's "Legend"; the highest tier
+ALBUM_DIFFICULTY = 'pro'
+
+# 1080p reference click coords for each difficulty button. Mirrored from
+# BGI AutoAlbumTask.cs.
+ALBUM_DIFFICULTY_COORDS = {
+    'normal': (480,  600),
+    'hard':   (800,  600),
+    'master': (1150, 600),
+    'pro':    (1400, 600),
+}
+
+# 1080p reference coord for the album-list "next song" arrow.
+# Hardcoded by BGI as (310, 220).
+ALBUM_NEXT_ARROW_XY = (310, 220)
+
+# Template-match score threshold (cv2.TM_CCOEFF_NORMED) for static UI
+# elements (album icon, list button, canorus, complete). 0.85 is solid.
+ALBUM_MATCH_THRESHOLD = 0.85
+
+# Looser threshold for the white Confirm button. The button's text and
+# styling vary slightly between the song-detail and difficulty-confirm
+# screens, so use a more permissive match.
+ALBUM_WHITE_CONFIRM_THRESHOLD = 0.80
+
+# End-of-song watcher poll interval (seconds). BGI uses 5s.
+ALBUM_END_POLL_S = 5.0
+
+# Skip-completed criterion. Mirrors BGI's MustCanorusLevel.
+#   True  → skip song only if Canorus rank is achieved at the chosen
+#           difficulty (per-difficulty canorus icon match).
+#   False → skip song if all rewards are collected (album_music_complate),
+#           regardless of difficulty.
+ALBUM_USE_CANORUS_CHECK = True
+
 # === Macro tool keybinds ===
 # Keyboard bindings use `keyboard` package names ('y', 'f11', 'ctrl+m', ...).
 # Mouse bindings use the 'mouse:<name>' prefix. Valid mouse names:
