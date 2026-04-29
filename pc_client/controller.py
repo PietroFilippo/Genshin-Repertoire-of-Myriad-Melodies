@@ -81,6 +81,13 @@ class ArduinoHIDController:
         code = MOUSE_MAP.get(button.lower(), 1)
         self._send_command(f"M:{code}:UP")
 
+    def mouse_move(self, dx, dy):
+        """Move the mouse pointer by (dx, dy) pixels via HID. Genshin's
+        anti-cheat ignores SetCursorPos / synthetic SendInput, so use the
+        Arduino's hardware-style relative move. The sketch chunks deltas
+        larger than ±127 into multiple HID reports."""
+        self._send_command(f"P:{int(dx)}:{int(dy)}")
+
     def close(self):
         if self.ser and self.ser.is_open:
             # Send UP to all standard rhythm keys just in case

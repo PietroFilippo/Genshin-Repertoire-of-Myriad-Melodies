@@ -57,44 +57,40 @@ Y_SAMPLE_OFFSETS = [-5, -3, 3, 5]
 DEBUG_MODE = False
 
 # === Album auto-runner (album.py) ===
-# Difficulty for the rhythm task. One of:
-#   'normal' (普通)  → click (480,  600)
-#   'hard'   (困难)  → click (800,  600)
-#   'master' (大师)  → click (1150, 600)
-#   'pro'    (传说)  → click (1400, 600)   ← BGI's "Legend"; the highest tier
-ALBUM_DIFFICULTY = 'pro'
+# Difficulty target. Genshin's English UI uses:
+#   'normal'    →  card center (465, 530)
+#   'hard'      →  card center (790, 530)
+#   'pro'       →  card center (1115, 530)
+#   'legendary' →  card center (1440, 530)   ← highest tier
+ALBUM_DIFFICULTY = 'legendary'
 
-# 1080p reference click coords for each difficulty button. Mirrored from
-# BGI AutoAlbumTask.cs.
+# 1080p click coords for the 4-card difficulty selection screen
+# (post "Go Perform"). All at y=530 (card vertical center).
 ALBUM_DIFFICULTY_COORDS = {
-    'normal': (480,  600),
-    'hard':   (800,  600),
-    'master': (1150, 600),
-    'pro':    (1400, 600),
+    'normal':    (465,  530),
+    'hard':      (790,  530),
+    'pro':       (1115, 530),
+    'legendary': (1440, 530),
 }
 
-# 1080p reference coord for the album-list "next song" arrow.
-# Hardcoded by BGI as (310, 220).
-ALBUM_NEXT_ARROW_XY = (310, 220)
+# 1080p click coord for advancing to the next song. Genshin's UI rotates
+# the song wheel so the same on-screen slot always shows the next-up song;
+# clicking this stable coord 12× iterates the whole album.
+ALBUM_NEXT_SONG_XY = (280, 480)
 
-# Template-match score threshold (cv2.TM_CCOEFF_NORMED) for static UI
-# elements (album icon, list button, canorus, complete). 0.85 is solid.
+# 1080p click coords for action buttons (bottom-bar pills).
+ALBUM_GO_PERFORM_XY        = (1714, 1018)   # album page → diff selection
+ALBUM_BEGIN_PERFORMANCE_XY = (1130, 1018)   # diff selection → rhythm
+
+# Songs per album. Currently 12 across every album in-game.
+ALBUM_SONG_COUNT = 12
+
+# Template-match score threshold (cv2.TM_CCOEFF_NORMED). 0.85 is solid for
+# clean UI text. Drop to 0.75 if matches misfire after a UI patch.
 ALBUM_MATCH_THRESHOLD = 0.85
-
-# Looser threshold for the white Confirm button. The button's text and
-# styling vary slightly between the song-detail and difficulty-confirm
-# screens, so use a more permissive match.
-ALBUM_WHITE_CONFIRM_THRESHOLD = 0.80
 
 # End-of-song watcher poll interval (seconds). BGI uses 5s.
 ALBUM_END_POLL_S = 5.0
-
-# Skip-completed criterion. Mirrors BGI's MustCanorusLevel.
-#   True  → skip song only if Canorus rank is achieved at the chosen
-#           difficulty (per-difficulty canorus icon match).
-#   False → skip song if all rewards are collected (album_music_complate),
-#           regardless of difficulty.
-ALBUM_USE_CANORUS_CHECK = True
 
 # === Macro tool keybinds ===
 # Keyboard bindings use `keyboard` package names ('y', 'f11', 'ctrl+m', ...).

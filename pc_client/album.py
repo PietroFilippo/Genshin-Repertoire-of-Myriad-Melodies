@@ -1,36 +1,37 @@
 # pc_client/album.py
 """
-Auto-album runner. Iterates one Genshin Impact "Repertoire of Myriad
-Melodies" album page (Mondstadt / Liyue / Inazuma / ...), playing each
-unfinished song with the rhythm bot and advancing to the next.
+Auto-album runner. Plays one Genshin Impact "Repertoire of Myriad
+Melodies" album page (Mondstadt / Liyue / Inazuma / Fontaine / ...),
+running each unfinished song with the rhythm bot and rotating through
+all 12 slots via the song-wheel on the left.
 
-Mirrors BGI's AutoAlbumTask.cs flow:
-  - verify on an album page (UiLeftTopAlbumIcon match)
-  - for each of 13 song slots:
-      - skip if already done (per-difficulty canorus match, or all-rewards
-        match if ALBUM_USE_CANORUS_CHECK = False)
-      - else: click white Confirm → click difficulty → click white Confirm
-        → run rhythm detector while a 5s watcher polls for the
-        return-to-list button → click it → wait for album page → next-arrow
+Per-song flow (current English UI):
+  - verify on the album page (anchor: "Go Perform" pill bottom-right)
+  - check Canorus pill in the target difficulty's inline row
+  - if Canorus → click next-song slot, advance
+  - else: click "Go Perform" → click difficulty card → click
+    "Begin Performance" → run rhythm detector while a 5s watcher polls
+    for the "Select Song" button → click it → wait for album page →
+    advance via next-song click
 
-Run from an album page (NOT the All-Songs list):
+Run from inside a country album page (NOT the All Albums grid):
     python pc_client/album.py
 """
 import ctypes
+import ctypes.wintypes
 import sys
 import threading
 import time
 from pathlib import Path
 
 import cv2
-import mouse
 import mss
 import numpy as np
 
-from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
-                    ALBUM_END_POLL_S, ALBUM_MATCH_THRESHOLD,
-                    ALBUM_NEXT_ARROW_XY, ALBUM_USE_CANORUS_CHECK,
-                    ALBUM_WHITE_CONFIRM_THRESHOLD,
+from config import (ALBUM_BEGIN_PERFORMANCE_XY, ALBUM_DIFFICULTY,
+                    ALBUM_DIFFICULTY_COORDS, ALBUM_END_POLL_S,
+                    ALBUM_GO_PERFORM_XY, ALBUM_MATCH_THRESHOLD,
+                    ALBUM_NEXT_SONG_XY, ALBUM_SONG_COUNT,
                     KEY_POLL_DELAY_S, REF_COLUMN_X, REF_HIT_LINE_Y,
                     Y_SAMPLE_OFFSETS)
 from controller import ArduinoHIDController
@@ -38,15 +39,28 @@ from detector import NoteDetector
 from main import find_game_window, get_game_geometry
 
 
-# 1080p reference ROIs from BGI AutoMusicAssets.cs.
-ROI_ALBUM_ICON = (0,   0,   150, 120)   # top-left
-ROI_COMPLETE   = (900, 320, 100, 80)    # all-rewards indicator
-ROI_CANORUS = {                         # per-difficulty canorus badge
-    'normal': (450, 430, 200, 60),
-    'hard':   (450, 520, 200, 60),
-    'master': (450, 610, 200, 60),
-    'pro':    (450, 690, 200, 60),
+# 1080p reference ROIs (search bounding boxes), derived from screenshots
+# of the current English UI.
+# Per-difficulty Canorus pill — inline row on the album song-detail panel.
+ROI_CANORUS = {
+    'normal':    (440, 445, 220, 50),
+    'hard':      (440, 530, 220, 50),
+    'pro':       (440, 615, 220, 50),
+    'legendary': (440, 700, 220, 50),
 }
+
+# "Go Perform" pill (album-page anchor + click target). ROIs need to be
+# wider than `tpl.shape[1]` for matchTemplate's sliding window — leaving
+# generous horizontal slack so a few-pixel UI shift doesn't push the
+# template clean off the ROI edge (cost a debugging session to learn).
+ROI_GO_PERFORM  = (1530, 975, 380, 75)
+
+# "Select Song" pill on the post-song results screen.
+ROI_SELECT_SONG = (1260, 975, 260, 75)
+
+# "Begin Performance" pill on the difficulty-selection screen — used as
+# the anchor that the prior "Go Perform" click actually landed.
+ROI_BEGIN_PERFORMANCE = (970, 975, 320, 75)
 
 
 class AlbumRunner:
@@ -57,17 +71,20 @@ class AlbumRunner:
             sys.exit(1)
         self.region, self.scale_x, self.scale_y = get_game_geometry(self.hwnd)
         # Game enforces 16:9, so scale_x ~= scale_y. Use scale_x for
-        # template resampling (BGI's AssetScale is a single scalar).
+        # template resampling (single scalar AssetScale, mirroring BGI).
         self.scale = self.scale_x
-        self.sct = mss.mss()
+        # mss handles are thread-local in mss>=6: each thread that calls
+        # grab() needs its own mss.mss() or it dies with
+        # `_thread._local has no attribute 'srcdc'`. Lazily create one per
+        # thread via threading.local().
+        self._sct_local = threading.local()
 
         assets_dir = Path(__file__).parent / 'assets' / '1920x1080'
         self.tpl = {
-            'icon':     self._load_tpl(assets_dir / 'ui_left_top_album_icon.png'),
-            'list':     self._load_tpl(assets_dir / 'btn_list.png'),
-            'complete': self._load_tpl(assets_dir / 'album_music_complate.png'),
-            'canorus':  self._load_tpl(assets_dir / 'music_canorus.png'),
-            'confirm':  self._load_tpl(assets_dir / 'btn_white_confirm.png'),
+            'go_perform':   self._load_tpl(assets_dir / 'btn_go_perform.png'),
+            'begin_perf':   self._load_tpl(assets_dir / 'btn_begin_performance.png'),
+            'select_song':  self._load_tpl(assets_dir / 'btn_select_song.png'),
+            'canorus':      self._load_tpl(assets_dir / 'music_canorus.png'),
         }
         if abs(self.scale - 1.0) > 0.01:
             for k, t in self.tpl.items():
@@ -93,7 +110,11 @@ class AlbumRunner:
     # --- screen / coord helpers --------------------------------------------
 
     def _grab(self):
-        shot = self.sct.grab(self.region)
+        sct = getattr(self._sct_local, 'sct', None)
+        if sct is None:
+            sct = mss.mss()
+            self._sct_local.sct = sct
+        shot = sct.grab(self.region)
         return np.ascontiguousarray(np.array(shot)[:, :, :3])
 
     def _ref_to_screen(self, x, y):
@@ -104,15 +125,37 @@ class AlbumRunner:
         return (int(ref_x * self.scale_x), int(ref_y * self.scale_y),
                 int(ref_w * self.scale_x), int(ref_h * self.scale_y))
 
-    def _frac_rect_to_local(self, fx, fy, fw, fh):
-        # BGI's CutRightTop / CutRightBottom are fractions of the capture rect.
-        w, h = self.region['width'], self.region['height']
-        return (int(w * fx), int(h * fy), int(w * fw), int(h * fh))
+    def _move_cursor_to(self, target_x, target_y, max_iters=15, tol=2):
+        """Iteratively move the cursor to (target_x, target_y) via Arduino
+        HID relative moves. Genshin's anti-cheat ignores SetCursorPos and
+        SendInput-style cursor moves entirely — only real HID hardware
+        deltas update the in-game cursor. We close the loop with
+        GetCursorPos to compensate for Windows pointer-precision scaling
+        (HID mickeys != screen pixels at non-default settings)."""
+        pt = ctypes.wintypes.POINT()
+        for _ in range(max_iters):
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            dx = target_x - pt.x
+            dy = target_y - pt.y
+            if abs(dx) <= tol and abs(dy) <= tol:
+                return True
+            self.controller.mouse_move(dx, dy)
+            time.sleep(0.04)
+        return False
 
     def _click_screen(self, sx, sy):
-        mouse.move(sx, sy, absolute=True, duration=0)
-        time.sleep(0.05)
-        mouse.click('left')
+        converged = self._move_cursor_to(int(sx), int(sy))
+        pt = ctypes.wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        print(f"    click target=({int(sx)},{int(sy)}), "
+              f"final=({pt.x},{pt.y}), converged={converged}")
+        # Longer hover + click hold than synthetic clicks need; some games
+        # debounce sub-100ms presses or treat them as "tap-cancel".
+        time.sleep(0.15)
+        self.controller.mouse_down('left')
+        time.sleep(0.10)
+        self.controller.mouse_up('left')
+        time.sleep(0.15)
 
     def _click_ref(self, ref_x, ref_y):
         self._click_screen(*self._ref_to_screen(ref_x, ref_y))
@@ -155,8 +198,36 @@ class AlbumRunner:
     def _on_album_page(self, frame=None):
         if frame is None:
             frame = self._grab()
-        roi = self._ref_rect_to_local(*ROI_ALBUM_ICON)
-        return self._match(frame, self.tpl['icon'], roi=roi) is not None
+        roi = self._ref_rect_to_local(*ROI_GO_PERFORM)
+        return self._match(frame, self.tpl['go_perform'], roi=roi) is not None
+
+    def _dump_frame(self, tag):
+        """Save current frame to disk so the user can see what was on
+        screen when something went wrong."""
+        out = Path(__file__).parent / f'_album_debug_{tag}.png'
+        cv2.imwrite(str(out), self._grab())
+        print(f"  diag: dumped {out.name}")
+
+    def _diagnose_album_page(self):
+        """On entry-check fail: print best score and dump frame + ROI to
+        disk so the user can verify ROI placement / template suitability."""
+        frame = self._grab()
+        x, y, w, h = self._ref_rect_to_local(*ROI_GO_PERFORM)
+        haystack = frame[y:y + h, x:x + w]
+        tpl = self.tpl['go_perform']
+        if haystack.shape[0] < tpl.shape[0] or haystack.shape[1] < tpl.shape[1]:
+            print(f"  diag: ROI {haystack.shape} smaller than template {tpl.shape}")
+        else:
+            result = cv2.matchTemplate(haystack, tpl, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            print(f"  diag: best go_perform score = {max_val:.3f} "
+                  f"(threshold {ALBUM_MATCH_THRESHOLD}); "
+                  f"ROI local=(x={x},y={y},w={w},h={h})")
+        out_full = Path(__file__).parent / '_album_debug_grab.png'
+        out_roi = Path(__file__).parent / '_album_debug_roi.png'
+        cv2.imwrite(str(out_full), frame)
+        cv2.imwrite(str(out_roi), haystack)
+        print(f"  diag: dumped {out_full.name} and {out_roi.name}")
 
     def _is_canorus(self, frame=None):
         if frame is None:
@@ -164,37 +235,29 @@ class AlbumRunner:
         roi = self._ref_rect_to_local(*ROI_CANORUS[ALBUM_DIFFICULTY])
         return self._match(frame, self.tpl['canorus'], roi=roi) is not None
 
-    def _is_complete(self, frame=None):
+    def _find_select_song(self, frame=None):
         if frame is None:
             frame = self._grab()
-        roi = self._ref_rect_to_local(*ROI_COMPLETE)
-        return self._match(frame, self.tpl['complete'], roi=roi) is not None
+        roi = self._ref_rect_to_local(*ROI_SELECT_SONG)
+        return self._match(frame, self.tpl['select_song'], roi=roi)
 
-    def _find_btn_list(self, frame=None):
-        if frame is None:
+    def _wait_for(self, tpl_key, ref_roi, timeout=5.0, present=True):
+        """Poll until template is present (or absent) in `ref_roi`. Returns
+        True iff the desired state is reached within timeout."""
+        end = time.time() + timeout
+        while time.time() < end:
             frame = self._grab()
-        # BGI: CutRightBottom(0.4, 0.2) = right 40% × bottom 20%
-        roi = self._frac_rect_to_local(0.6, 0.8, 0.4, 0.2)
-        return self._match(frame, self.tpl['list'], roi=roi)
-
-    def _click_white_confirm(self):
-        """Find + click the white Confirm button. BGI's
-        Bv.ClickWhiteConfirmButton: full-screen template match, sleep 500ms,
-        click centroid. Returns True iff found."""
-        frame = self._grab()
-        m = self._match(frame, self.tpl['confirm'],
-                        threshold=ALBUM_WHITE_CONFIRM_THRESHOLD)
-        if m is None:
-            return False
-        _, (cx, cy) = m
-        time.sleep(0.5)
-        self._click_local(cx, cy)
-        return True
+            roi = self._ref_rect_to_local(*ref_roi)
+            found = self._match(frame, self.tpl[tpl_key], roi=roi) is not None
+            if found == present:
+                return True
+            time.sleep(0.2)
+        return False
 
     # --- per-song flow ------------------------------------------------------
 
     def _next_song(self):
-        self._click_ref(*ALBUM_NEXT_ARROW_XY)
+        self._click_ref(*ALBUM_NEXT_SONG_XY)
         time.sleep(0.8)
 
     def _wait_for_album_page(self, timeout=60.0):
@@ -206,25 +269,31 @@ class AlbumRunner:
         return False
 
     def _play_song(self):
-        # Open song detail.
-        if not self._click_white_confirm():
-            print("  could not find white Confirm button (entry)")
+        # album page → difficulty selection
+        self._click_ref(*ALBUM_GO_PERFORM_XY)
+        if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
+                              timeout=5.0, present=True):
+            print("  ERROR: difficulty screen never appeared "
+                  "(Go Perform click missed?). Aborting song.")
+            self._dump_frame('postclick_go_perform')
+            return False
+
+        # pick difficulty card
+        dx, dy = ALBUM_DIFFICULTY_COORDS[ALBUM_DIFFICULTY]
+        self._click_ref(dx, dy)
+        time.sleep(0.3)
+
+        # start rhythm minigame; verify we left the diff screen
+        self._click_ref(*ALBUM_BEGIN_PERFORMANCE_XY)
+        if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
+                              timeout=5.0, present=False):
+            print("  ERROR: still on difficulty screen after Begin "
+                  "Performance click. Aborting song.")
             return False
         time.sleep(0.8)
 
-        # Pick difficulty.
-        dx, dy = ALBUM_DIFFICULTY_COORDS[ALBUM_DIFFICULTY]
-        self._click_ref(dx, dy)
-        time.sleep(0.2)
-
-        # Confirm + start.
-        if not self._click_white_confirm():
-            print("  could not find white Confirm button (start)")
-            return False
-        time.sleep(0.5)
-
         # Fire up rhythm detector. Watcher signals end-of-song by clicking
-        # the return-to-list button when it becomes visible.
+        # the "Select Song" button when the results screen appears.
         column_centers = [int(x * self.scale_x) for x in REF_COLUMN_X]
         hit_line_y = int(REF_HIT_LINE_Y * self.scale_y)
         detector = NoteDetector(self.hwnd, column_centers, hit_line_y,
@@ -236,7 +305,15 @@ class AlbumRunner:
                                    args=(stop_evt,), daemon=True)
         watcher.start()
         try:
-            stop_evt.wait()
+            # Polled wait so SIGINT (Ctrl+C) can wake the main thread on
+            # Windows — Event.wait() with no timeout blocks in a native
+            # condition variable that ignores Python signal delivery.
+            # Also bail out if the watcher dies unexpectedly.
+            while not stop_evt.wait(0.5):
+                if not watcher.is_alive():
+                    print("  WARN: watcher thread died "
+                          "(see traceback above); aborting song")
+                    break
         finally:
             detector.stop()
 
@@ -244,11 +321,10 @@ class AlbumRunner:
         return True
 
     def _end_watcher(self, stop_evt):
-        # First check after one poll interval (mirrors BGI: Delay(5000) then check).
         while not stop_evt.is_set():
             if stop_evt.wait(ALBUM_END_POLL_S):
                 return
-            res = self._find_btn_list()
+            res = self._find_select_song()
             if res is not None:
                 _, (cx, cy) = res
                 self._click_local(cx, cy)
@@ -259,29 +335,27 @@ class AlbumRunner:
 
     def run(self):
         if not self._on_album_page():
-            print("ERROR: not on an album page. Open Mondstadt/Liyue/etc. "
-                  "album first (NOT the All Songs list).")
+            print("ERROR: not on an album page. Open a country album "
+                  "(Fontaine / Liyue / Mondstadt / ...), NOT the All Albums grid.")
+            self._diagnose_album_page()
             return
 
-        check_name = 'canorus' if ALBUM_USE_CANORUS_CHECK else 'complete'
         print(f"Per-key {KEY_POLL_DELAY_S * 1000:.0f}ms, strip {Y_SAMPLE_OFFSETS}")
-        print(f"Album loop: 13 songs, difficulty={ALBUM_DIFFICULTY}, "
-              f"skip-check={check_name}")
+        print(f"Album loop: {ALBUM_SONG_COUNT} songs, "
+              f"difficulty={ALBUM_DIFFICULTY}, skip-on-canorus")
 
-        for i in range(13):
-            print(f"\n--- Song {i+1}/13 ---")
+        for i in range(ALBUM_SONG_COUNT):
+            print(f"\n--- Song {i+1}/{ALBUM_SONG_COUNT} ---")
             frame = self._grab()
-            already_done = (self._is_canorus(frame) if ALBUM_USE_CANORUS_CHECK
-                            else self._is_complete(frame))
-            if already_done:
-                print("  skip — already done")
+            if self._is_canorus(frame):
+                print("  skip — already canorus")
                 self._next_song()
                 continue
 
             print("  playing")
-            ok = self._play_song()
-            if not ok:
-                print(f"  song {i+1} aborted; advancing anyway")
+            if not self._play_song():
+                print("  aborting album (state machine broke; check coords).")
+                return
 
             if not self._wait_for_album_page(timeout=60.0):
                 print("  WARN: never returned to album page; stopping")
@@ -296,6 +370,21 @@ class AlbumRunner:
             self.controller.close()
         except Exception:
             pass
+
+
+SPI_GETMOUSE = 0x0003
+SPI_SETMOUSE = 0x0004
+
+
+def _get_mouse_params():
+    arr = (ctypes.c_int * 3)()
+    ctypes.windll.user32.SystemParametersInfoW(SPI_GETMOUSE, 0, arr, 0)
+    return tuple(arr)
+
+
+def _set_mouse_params(thresh1, thresh2, accel):
+    arr = (ctypes.c_int * 3)(thresh1, thresh2, accel)
+    ctypes.windll.user32.SystemParametersInfoW(SPI_SETMOUSE, 0, arr, 0)
 
 
 def main():
@@ -313,6 +402,19 @@ def main():
     except Exception as e:
         print(f"[warn] timeBeginPeriod: {e}")
 
+    # Disable Enhance Pointer Precision (EPP) for the run. EPP applies a
+    # velocity-dependent gain curve so a single HID burst of N mickeys
+    # travels 1.5x-3.5x N pixels, which makes our cursor closed-loop
+    # overshoot wildly and pinball off screen edges. Linear (accel=0)
+    # gives a constant mickey:pixel ratio that converges in 1-2 iters.
+    saved_mouse = None
+    try:
+        saved_mouse = _get_mouse_params()
+        _set_mouse_params(0, 0, 0)
+        print(f"Pointer precision disabled (saved {saved_mouse})")
+    except Exception as e:
+        print(f"[warn] disable EPP: {e}")
+
     runner = AlbumRunner()
     try:
         runner.run()
@@ -320,6 +422,12 @@ def main():
         print("\nCtrl+C")
     finally:
         runner.close()
+        if saved_mouse is not None:
+            try:
+                _set_mouse_params(*saved_mouse)
+                print("Pointer precision restored")
+            except Exception as e:
+                print(f"[warn] restore EPP: {e}")
         if timer_boosted:
             try:
                 ctypes.windll.winmm.timeEndPeriod(1)

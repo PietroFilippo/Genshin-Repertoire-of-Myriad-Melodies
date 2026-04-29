@@ -17,20 +17,22 @@ void loop() {
     String command = Serial.readStringUntil('\n');
     command.trim(); // Remove any leftover carriage returns or spaces
     
-    // Command format expected: "K:<code>:<action>" or "M:<code>:<action>"
-    // Example: "K:97:DOWN" (Press 'a')
-    // Example: "M:1:UP" (Release Left Mouse Button)
-    
-    if (command.length() >= 6 && command.charAt(1) == ':') {
+    // Command format expected:
+    //   "K:<code>:<action>"   keyboard, action = DOWN | UP
+    //   "M:<code>:<action>"   mouse button, action = DOWN | UP
+    //   "P:<dx>:<dy>"         mouse pointer relative move (signed pixels)
+    // Examples: "K:97:DOWN", "M:1:UP", "P:-40:120"
+
+    if (command.length() >= 5 && command.charAt(1) == ':') {
       char type = command.charAt(0);
       int sepIndex = command.lastIndexOf(':');
-      
+
       if (sepIndex > 2) {
         String codeStr = command.substring(2, sepIndex);
         String action = command.substring(sepIndex + 1);
-        
+
         int code = codeStr.toInt();
-        
+
         if (type == 'K') {
           if (action == "DOWN") {
             Keyboard.press(code);
@@ -42,6 +44,18 @@ void loop() {
             Mouse.press(code);
           } else if (action == "UP") {
             Mouse.release(code);
+          }
+        } else if (type == 'P') {
+          // Relative mouse move. Mouse.move takes signed char (-127..127),
+          // so chunk larger deltas into multiple HID reports.
+          int dx = code;
+          int dy = action.toInt();
+          while (dx != 0 || dy != 0) {
+            int sx = constrain(dx, -127, 127);
+            int sy = constrain(dy, -127, 127);
+            Mouse.move(sx, sy, 0);
+            dx -= sx;
+            dy -= sy;
           }
         }
       }
