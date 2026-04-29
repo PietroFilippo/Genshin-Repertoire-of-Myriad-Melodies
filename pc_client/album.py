@@ -17,6 +17,7 @@ Per-song flow (current English UI):
 Run from inside a country album page (NOT the All Albums grid):
     python pc_client/album.py
 """
+import argparse
 import ctypes
 import ctypes.wintypes
 import sys
@@ -64,7 +65,8 @@ ROI_BEGIN_PERFORMANCE = (970, 975, 320, 75)
 
 
 class AlbumRunner:
-    def __init__(self):
+    def __init__(self, replay_canorus=False):
+        self.replay_canorus = replay_canorus
         self.hwnd = find_game_window()
         if not self.hwnd:
             print("ERROR: game window not found")
@@ -340,17 +342,19 @@ class AlbumRunner:
             self._diagnose_album_page()
             return
 
+        mode = "replay-canorus" if self.replay_canorus else "skip-on-canorus"
         print(f"Per-key {KEY_POLL_DELAY_S * 1000:.0f}ms, strip {Y_SAMPLE_OFFSETS}")
         print(f"Album loop: {ALBUM_SONG_COUNT} songs, "
-              f"difficulty={ALBUM_DIFFICULTY}, skip-on-canorus")
+              f"difficulty={ALBUM_DIFFICULTY}, {mode}")
 
         for i in range(ALBUM_SONG_COUNT):
             print(f"\n--- Song {i+1}/{ALBUM_SONG_COUNT} ---")
-            frame = self._grab()
-            if self._is_canorus(frame):
-                print("  skip — already canorus")
-                self._next_song()
-                continue
+            if not self.replay_canorus:
+                frame = self._grab()
+                if self._is_canorus(frame):
+                    print("  skip — already canorus")
+                    self._next_song()
+                    continue
 
             print("  playing")
             if not self._play_song():
@@ -387,7 +391,35 @@ def _set_mouse_params(thresh1, thresh2, accel):
     ctypes.windll.user32.SystemParametersInfoW(SPI_SETMOUSE, 0, arr, 0)
 
 
+def _prompt_replay_canorus():
+    """Interactive y/n prompt. Returns True if user wants to replay
+    Canorus'd songs, False to skip them."""
+    print()
+    print("Skip songs already at Canorus rank?")
+    print("  [Y] yes, skip them (default)")
+    print("  [N] no, replay every song")
+    while True:
+        ans = input("Choice [Y/n]: ").strip().lower()
+        if ans in ('', 'y', 'yes'):
+            return False
+        if ans in ('n', 'no'):
+            return True
+        print("Enter Y or N.")
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="Auto-play one Genshin album page at the configured "
+                    "difficulty.")
+    parser.add_argument(
+        '--replay-canorus', action='store_true',
+        help="Play every song in the album, including ones already at "
+             "Canorus rank on the chosen difficulty. If omitted, the "
+             "script prompts at startup.")
+    args = parser.parse_args()
+
+    replay = args.replay_canorus or _prompt_replay_canorus()
+
     print("Initializing album runner")
 
     try:
@@ -415,7 +447,7 @@ def main():
     except Exception as e:
         print(f"[warn] disable EPP: {e}")
 
-    runner = AlbumRunner()
+    runner = AlbumRunner(replay_canorus=replay)
     try:
         runner.run()
     except KeyboardInterrupt:
