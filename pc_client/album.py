@@ -65,8 +65,11 @@ ROI_BEGIN_PERFORMANCE = (970, 975, 320, 75)
 
 
 class AlbumRunner:
-    def __init__(self, replay_canorus=False):
+    def __init__(self, replay_canorus=False, difficulty=ALBUM_DIFFICULTY):
+        if difficulty not in ALBUM_DIFFICULTY_COORDS:
+            raise ValueError(f"unknown difficulty: {difficulty!r}")
         self.replay_canorus = replay_canorus
+        self.difficulty = difficulty
         self.hwnd = find_game_window()
         if not self.hwnd:
             print("ERROR: game window not found")
@@ -100,7 +103,7 @@ class AlbumRunner:
         print(f"Album: {self.region['width']}x{self.region['height']} @ "
               f"({self.region['left']},{self.region['top']}), "
               f"scale {self.scale_x:.3f}x{self.scale_y:.3f}, "
-              f"difficulty={ALBUM_DIFFICULTY}")
+              f"difficulty={self.difficulty}")
 
     @staticmethod
     def _load_tpl(path):
@@ -234,7 +237,7 @@ class AlbumRunner:
     def _is_canorus(self, frame=None):
         if frame is None:
             frame = self._grab()
-        roi = self._ref_rect_to_local(*ROI_CANORUS[ALBUM_DIFFICULTY])
+        roi = self._ref_rect_to_local(*ROI_CANORUS[self.difficulty])
         return self._match(frame, self.tpl['canorus'], roi=roi) is not None
 
     def _find_select_song(self, frame=None):
@@ -281,7 +284,7 @@ class AlbumRunner:
             return False
 
         # pick difficulty card
-        dx, dy = ALBUM_DIFFICULTY_COORDS[ALBUM_DIFFICULTY]
+        dx, dy = ALBUM_DIFFICULTY_COORDS[self.difficulty]
         self._click_ref(dx, dy)
         time.sleep(0.3)
 
@@ -345,7 +348,7 @@ class AlbumRunner:
         mode = "replay-canorus" if self.replay_canorus else "skip-on-canorus"
         print(f"Per-key {KEY_POLL_DELAY_S * 1000:.0f}ms, strip {Y_SAMPLE_OFFSETS}")
         print(f"Album loop: {ALBUM_SONG_COUNT} songs, "
-              f"difficulty={ALBUM_DIFFICULTY}, {mode}")
+              f"difficulty={self.difficulty}, {mode}")
 
         for i in range(ALBUM_SONG_COUNT):
             print(f"\n--- Song {i+1}/{ALBUM_SONG_COUNT} ---")
@@ -407,6 +410,28 @@ def _prompt_replay_canorus():
         print("Enter Y or N.")
 
 
+def _prompt_difficulty():
+    """Interactive difficulty prompt. Returns one of
+    'normal' | 'hard' | 'pro' | 'legendary'."""
+    print()
+    print("Select difficulty:")
+    print("  [1] Normal")
+    print("  [2] Hard")
+    print("  [3] Pro")
+    print("  [4] Legendary (default)")
+    options = {
+        '': 'legendary', '4': 'legendary', 'l': 'legendary', 'legendary': 'legendary',
+        '1': 'normal', 'n': 'normal', 'normal': 'normal',
+        '2': 'hard', 'h': 'hard', 'hard': 'hard',
+        '3': 'pro', 'p': 'pro', 'pro': 'pro',
+    }
+    while True:
+        ans = input("Choice [1/2/3/4]: ").strip().lower()
+        if ans in options:
+            return options[ans]
+        print("Enter 1, 2, 3, or 4.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Auto-play one Genshin album page at the configured "
@@ -416,9 +441,14 @@ def main():
         help="Play every song in the album, including ones already at "
              "Canorus rank on the chosen difficulty. If omitted, the "
              "script prompts at startup.")
+    parser.add_argument(
+        '--difficulty', choices=list(ALBUM_DIFFICULTY_COORDS),
+        help="Skip the difficulty prompt and use this one. "
+             "If omitted, the script prompts at startup.")
     args = parser.parse_args()
 
     replay = args.replay_canorus or _prompt_replay_canorus()
+    difficulty = args.difficulty or _prompt_difficulty()
 
     print("Initializing album runner")
 
@@ -447,7 +477,7 @@ def main():
     except Exception as e:
         print(f"[warn] disable EPP: {e}")
 
-    runner = AlbumRunner(replay_canorus=replay)
+    runner = AlbumRunner(replay_canorus=replay, difficulty=difficulty)
     try:
         runner.run()
     except KeyboardInterrupt:
