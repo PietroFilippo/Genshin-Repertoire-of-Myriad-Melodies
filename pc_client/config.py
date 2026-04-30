@@ -1,8 +1,11 @@
 # pc_client/config.py
 
 # Hardware config
-# The COM port the arduino is connected to
-SERIAL_PORT = 'COM7'
+# The COM port the arduino is connected to. Set to None for auto-detection
+# (matches by USB VID for Arduino Leonardo / Pro Micro / common clones, then
+# by description containing "Arduino"/"Leonardo"). Set to e.g. 'COM7' to
+# force a specific port — useful if multiple Arduinos are connected.
+SERIAL_PORT = None
 # Ensure this matches the arduino sketch setup
 BAUD_RATE = 115200
 

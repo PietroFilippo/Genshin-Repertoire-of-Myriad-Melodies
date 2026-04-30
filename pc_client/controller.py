@@ -1,9 +1,55 @@
 # pc_client/controller.py
 import serial
+from serial.tools import list_ports
 import time
 import threading
 import sys
 from config import SERIAL_PORT, BAUD_RATE
+
+# Known USB VIDs for Arduino-compatible ATmega32u4 boards capable of HID.
+# Match priority is list order: genuine Arduino first, then Sparkfun Pro
+# Micro, then CH340-based clones (which advertise a generic Qinheng VID).
+_KNOWN_VIDS = [
+    0x2341,  # Arduino LLC (Leonardo, Micro)
+    0x2A03,  # Arduino SRL (post-split clone of 0x2341)
+    0x1B4F,  # Sparkfun Pro Micro
+    0x1A86,  # QinHeng CH340 — common on cheap clones
+    0x10C4,  # Silicon Labs CP210x — some clones
+]
+
+# Description-substring fallback when VID isn't recognized. Match is
+# case-insensitive on the port's `description` (e.g. "Arduino Leonardo
+# (COM7)" on Windows).
+_DESCRIPTION_HINTS = ('arduino', 'leonardo', 'pro micro')
+
+
+def _auto_detect_port():
+    """Find the first plausible Arduino COM port. Returns device name
+    (e.g. 'COM7') or None if no candidate found. Prefers VID match; falls
+    back to description-substring match."""
+    ports = list(list_ports.comports())
+    # VID match — strongest signal.
+    for vid in _KNOWN_VIDS:
+        for p in ports:
+            if p.vid == vid:
+                print(f"Auto-detected Arduino on {p.device} "
+                      f"(VID=0x{p.vid:04X}, '{p.description}')")
+                return p.device
+    # Description fallback for boards with unknown VIDs.
+    for p in ports:
+        desc = (p.description or '').lower()
+        if any(hint in desc for hint in _DESCRIPTION_HINTS):
+            print(f"Auto-detected Arduino on {p.device} "
+                  f"(description match: '{p.description}')")
+            return p.device
+    if ports:
+        print("No Arduino-like port matched. Available ports:")
+        for p in ports:
+            vid = f"0x{p.vid:04X}" if p.vid is not None else '?'
+            print(f"  {p.device}  VID={vid}  '{p.description}'")
+    else:
+        print("No serial ports found at all.")
+    return None
 
 # Arduino Keyboard.h modifiers
 KEY_MAP = {
@@ -22,7 +68,17 @@ MOUSE_MAP = {
 
 class ArduinoHIDController:
     def __init__(self):
-        self.port = SERIAL_PORT
+        # Resolve port: explicit config value wins; None/empty triggers
+        # auto-detection. Auto-detect failure exits — no port = no bot.
+        if SERIAL_PORT:
+            self.port = SERIAL_PORT
+        else:
+            detected = _auto_detect_port()
+            if not detected:
+                print("ERROR: SERIAL_PORT is None and auto-detection failed. "
+                      "Plug in the Arduino or set SERIAL_PORT in config.py.")
+                sys.exit(1)
+            self.port = detected
         self.baud = BAUD_RATE
         self.ser = None
         # Serialize all writes from worker threads. Concurrent writes to the
