@@ -145,7 +145,7 @@ def auto_detect(stop_evt=None):
 
 def run_visualization(capture_region, column_centers, hit_line_y, detector,
                       stop_evt=None, debug_evt=None, fps_callback=None,
-                      pin_console=True):
+                      pin_console=True, pause_evt=None):
     """Debug visualization loop. Decoupled from detection — purely shows
     state. The detector threads update detector.pressed independently.
 
@@ -160,6 +160,9 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             frame so the UI can mirror viz FPS in its status panel.
         pin_console: when True, re-pins the console window topmost each
             frame (legacy CLI behavior). UI mode passes False to skip this.
+        pause_evt: when set, exit cleanly so the caller can take down the
+            detector and idle. Treated as a soft stop — caller decides
+            whether to resume (re-enter this function) or quit.
     """
     window_open = False
 
@@ -178,6 +181,11 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
     with mss.mss() as sct:
         while True:
             if stop_evt is not None and stop_evt.is_set():
+                break
+            if pause_evt is not None and pause_evt.is_set():
+                if window_open:
+                    close_window()
+                    window_open = False
                 break
 
             # Debug toggle: when off, drop the window and idle until on.
@@ -282,9 +290,13 @@ def set_dpi_aware():
         print(f"[warn] SetProcessDPIAware failed: {e}")
 
 
-def run_standalone(stop_evt, debug_evt, status_cb=None):
+def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None):
     """Reusable standalone-mode entrypoint for the UI. Blocks until
-    stop_evt is set. Caller handles DPI/timer setup."""
+    stop_evt is set. Caller handles DPI/timer setup.
+
+    If pause_evt is provided and gets set, the detector is stopped
+    (releasing all keys) and the function idles until pause_evt is
+    cleared. On resume a fresh detector is spun up."""
     detected = auto_detect(stop_evt=stop_evt)
     if detected is None:
         # Either game window unavailable, or stop fired during the
@@ -297,26 +309,51 @@ def run_standalone(stop_evt, debug_evt, status_cb=None):
         return
 
     controller = ArduinoHIDController()
-    detector = NoteDetector(hwnd, column_centers, hit_line_y, controller)
-    if status_cb:
-        status_cb({'state': 'running', 'mode': 'standalone'})
-    print(f"Starting per-key detection threads "
-          f"(poll {KEY_POLL_DELAY_S*1000:.0f}ms, strip {Y_SAMPLE_OFFSETS})")
-    detector.start()
 
     fps_cb = None
     if status_cb:
         fps_cb = lambda f: status_cb({'fps': f})
 
     try:
-        # Always run viz loop — it self-gates on debug_evt and idles cheap
-        # when off (no grab, no overlay computation).
-        run_visualization(capture_region, column_centers, hit_line_y, detector,
-                          stop_evt=stop_evt, debug_evt=debug_evt,
-                          fps_callback=fps_cb, pin_console=False)
+        while not (stop_evt and stop_evt.is_set()):
+            detector = NoteDetector(hwnd, column_centers, hit_line_y,
+                                    controller)
+            if status_cb:
+                status_cb({'state': 'running', 'mode': 'standalone'})
+            print(f"Starting per-key detection threads "
+                  f"(poll {KEY_POLL_DELAY_S*1000:.0f}ms, "
+                  f"strip {Y_SAMPLE_OFFSETS})")
+            detector.start()
+
+            try:
+                # Viz loop self-gates on debug_evt and idles cheap when off.
+                run_visualization(capture_region, column_centers, hit_line_y,
+                                  detector, stop_evt=stop_evt,
+                                  debug_evt=debug_evt, fps_callback=fps_cb,
+                                  pin_console=False, pause_evt=pause_evt)
+            finally:
+                print("Stopping detector")
+                detector.stop()
+
+            # If we exited because of stop (not pause), we're done.
+            if stop_evt and stop_evt.is_set():
+                break
+            if pause_evt is None or not pause_evt.is_set():
+                break
+
+            # --- paused: idle until resume or stop ---
+            if status_cb:
+                status_cb({'state': 'paused'})
+            print("[standalone] paused — detector stopped, waiting for resume")
+            while pause_evt.is_set():
+                if stop_evt and stop_evt.is_set():
+                    break
+                time.sleep(0.1)
+            if stop_evt and stop_evt.is_set():
+                break
+            print("[standalone] resumed")
+            # Loop back to spin up a fresh detector.
     finally:
-        print("Stopping detector")
-        detector.stop()
         controller.close()
         if status_cb:
             status_cb({'state': 'idle', 'fps': 0.0})

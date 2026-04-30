@@ -101,6 +101,22 @@ class AlbumRunner:
             # Re-raise as RuntimeError so the BotController worker exits.
             raise RuntimeError("album-init aborted by stop_evt")
         self.region, self.scale_x, self.scale_y = geom
+
+        # Disable Enhance Pointer Precision (EPP) for the run. EPP applies
+        # a velocity-dependent gain curve so a single HID burst of N
+        # mickeys travels 1.5x-3.5x N pixels, which makes _move_cursor_to
+        # overshoot wildly and pinball off the screen edges. Linear
+        # (accel=0) gives a constant mickey:pixel ratio that converges in
+        # 1-2 iters. Saved here and restored in close() so this works the
+        # same whether the CLI or the UI is driving the runner — the CLI
+        # also wraps with its own save/restore as belt-and-suspenders.
+        self._saved_mouse = None
+        try:
+            self._saved_mouse = _get_mouse_params()
+            _set_mouse_params(0, 0, 0)
+            print(f"Pointer precision disabled (saved {self._saved_mouse})")
+        except Exception as e:
+            print(f"[warn] disable EPP: {e}")
         # Game enforces 16:9, so scale_x ~= scale_y. Use scale_x for
         # template resampling (single scalar AssetScale, mirroring BGI).
         self.scale = self.scale_x
@@ -331,51 +347,82 @@ class AlbumRunner:
                                 self.controller)
         detector.start()
 
-        # Optional viz thread — gated by debug_evt. Imported lazily to
-        # avoid a hard cv2 dep when the album CLI runs headless.
-        viz_thread = None
-        viz_stop = threading.Event()
-        if self.debug_evt is not None:
+        # Helper to (re-)create the optional viz thread. Used for initial
+        # start and after mid-song pause resume. Gated by debug_evt.
+        def _start_viz(det):
+            """Spin up a viz thread for the given detector. Returns
+            (thread, stop_event) or (None, stop_event) if debug is off."""
+            vs = threading.Event()
+            if self.debug_evt is None:
+                return None, vs
             from main import run_visualization
-            capture_region = {'top': self.region['top'],
-                              'left': self.region['left'],
-                              'width': self.region['width'],
-                              'height': self.region['height']}
+            cap = {'top': self.region['top'], 'left': self.region['left'],
+                   'width': self.region['width'],
+                   'height': self.region['height']}
 
-            def _viz_worker():
+            def _worker():
                 try:
-                    run_visualization(capture_region, column_centers,
-                                      hit_line_y, detector,
-                                      stop_evt=viz_stop,
-                                      debug_evt=self.debug_evt,
-                                      fps_callback=(lambda f: self._emit({'fps': f}))
-                                                    if self.status_cb else None,
-                                      pin_console=False)
+                    run_visualization(
+                        cap, column_centers, hit_line_y, det,
+                        stop_evt=vs, debug_evt=self.debug_evt,
+                        fps_callback=(lambda f: self._emit({'fps': f}))
+                                      if self.status_cb else None,
+                        pin_console=False)
                 except Exception as e:
                     print(f"[viz] worker died: {e}")
 
-            viz_thread = threading.Thread(target=_viz_worker, daemon=True,
-                                          name='album-viz')
-            viz_thread.start()
+            vt = threading.Thread(target=_worker, daemon=True,
+                                  name='album-viz')
+            vt.start()
+            return vt, vs
+
+        viz_thread, viz_stop = _start_viz(detector)
 
         watcher_evt = threading.Event()
         watcher = threading.Thread(target=self._end_watcher,
                                    args=(watcher_evt,), daemon=True)
         watcher.start()
+
         try:
-            # Wait for either the watcher (end of song) or external
-            # stop/pause to fire. Pause aborts the song mid-flight (keys
-            # released by detector.stop in finally), and the album loop
-            # blocks at the boundary check before the next song.
             while not watcher_evt.wait(0.5):
-                if self.stop_evt.is_set() or self.pause_evt.is_set():
-                    print("  external stop/pause — aborting current song")
+                if self.stop_evt.is_set():
                     break
                 if not watcher.is_alive():
                     print("  WARN: watcher thread died "
                           "(see traceback above); aborting song")
                     break
+
+                if self.pause_evt.is_set():
+                    # --- mid-song pause ---
+                    # Stop detector (releases keys) and viz, but keep the
+                    # watcher alive so it can detect end-of-song.
+                    print("  paused mid-song — releasing keys")
+                    detector.stop()
+                    viz_stop.set()
+                    if viz_thread is not None:
+                        viz_thread.join(timeout=2.0)
+                        viz_thread = None
+                    self._emit({'state': 'paused'})
+
+                    # Idle until resume, stop, or song-end.
+                    while (self.pause_evt.is_set()
+                           and not self.stop_evt.is_set()
+                           and not watcher_evt.is_set()):
+                        time.sleep(0.1)
+
+                    if self.stop_evt.is_set() or watcher_evt.is_set():
+                        break
+
+                    # --- resume: fresh detector + viz for the same song ---
+                    print("  resumed — restarting detector")
+                    self._emit({'state': 'running'})
+                    detector = NoteDetector(self.hwnd, column_centers,
+                                            hit_line_y, self.controller)
+                    detector.start()
+                    viz_thread, viz_stop = _start_viz(detector)
         finally:
+            watcher_evt.set()
+            watcher.join(timeout=2.0)
             detector.stop()
             viz_stop.set()
             if viz_thread is not None:
@@ -464,6 +511,18 @@ class AlbumRunner:
             if self.stop_evt.is_set():
                 break
 
+            # After a mid-song pause the rhythm game may have ended while
+            # the bot was idle, leaving the results screen up (the watcher
+            # was killed on pause, so nobody clicked Select Song). Check
+            # for it now and click through if present.
+            if not self._on_album_page():
+                res = self._find_select_song()
+                if res is not None:
+                    print("  clicking Select Song (results screen after pause)")
+                    _, (cx, cy) = res
+                    self._click_local(cx, cy)
+                    time.sleep(2.0)
+
             if not self._wait_for_album_page(timeout=60.0):
                 print("  WARN: never returned to album page; stopping")
                 return
@@ -474,6 +533,13 @@ class AlbumRunner:
         self._emit({'state': 'idle', 'fps': 0.0})
 
     def close(self):
+        if getattr(self, '_saved_mouse', None) is not None:
+            try:
+                _set_mouse_params(*self._saved_mouse)
+                print("Pointer precision restored")
+            except Exception as e:
+                print(f"[warn] restore EPP: {e}")
+            self._saved_mouse = None
         try:
             self.controller.close()
         except Exception:
@@ -569,19 +635,8 @@ def main():
     except Exception as e:
         print(f"[warn] timeBeginPeriod: {e}")
 
-    # Disable Enhance Pointer Precision (EPP) for the run. EPP applies a
-    # velocity-dependent gain curve so a single HID burst of N mickeys
-    # travels 1.5x-3.5x N pixels, which makes our cursor closed-loop
-    # overshoot wildly and pinball off screen edges. Linear (accel=0)
-    # gives a constant mickey:pixel ratio that converges in 1-2 iters.
-    saved_mouse = None
-    try:
-        saved_mouse = _get_mouse_params()
-        _set_mouse_params(0, 0, 0)
-        print(f"Pointer precision disabled (saved {saved_mouse})")
-    except Exception as e:
-        print(f"[warn] disable EPP: {e}")
-
+    # EPP save / restore is handled by AlbumRunner (so UI mode gets it
+    # too). See AlbumRunner.__init__ for the rationale.
     runner = AlbumRunner(replay_canorus=replay, difficulty=difficulty)
     try:
         runner.run(songs_count=args.songs)
@@ -589,12 +644,6 @@ def main():
         print("\nCtrl+C")
     finally:
         runner.close()
-        if saved_mouse is not None:
-            try:
-                _set_mouse_params(*saved_mouse)
-                print("Pointer precision restored")
-            except Exception as e:
-                print(f"[warn] restore EPP: {e}")
         if timer_boosted:
             try:
                 ctypes.windll.winmm.timeEndPeriod(1)

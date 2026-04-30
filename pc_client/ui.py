@@ -2,9 +2,10 @@
 """
 Tkinter front-end for the rhythm bot. Single window with mode selector
 (Standalone / Album), difficulty / song-count / skip-canorus controls,
-Start/Pause/Stop buttons, a real-time debug-viz toggle, and a status pane.
-Hotkeys (configurable in-app) trigger the same actions and only fire while
-Genshin Impact is the foreground window.
+a Start / Stop button, a real-time debug-viz toggle, a status pane, and
+an embedded log pane that captures stdout/stderr from the worker threads.
+Hotkeys (configurable in-app) trigger the same actions and only fire
+while Genshin Impact or this UI is the foreground window.
 
 Run:
     python pc_client/ui.py
@@ -16,12 +17,13 @@ import ctypes
 import ctypes.wintypes
 import json
 import os
+import queue
 import sys
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, scrolledtext, ttk
 
 import keyboard
 
@@ -55,11 +57,26 @@ def _is_admin():
         return False
 
 
+def _windowed_python_exe():
+    """Return the windowed (console-less) Python interpreter path. Falls
+    back to the current sys.executable if pythonw isn't alongside it."""
+    exe = sys.executable
+    base = os.path.basename(exe).lower()
+    if base in ('pythonw.exe', 'pythonw'):
+        return exe
+    if base in ('python.exe', 'python'):
+        candidate = os.path.join(os.path.dirname(exe), 'pythonw.exe')
+        if os.path.exists(candidate):
+            return candidate
+    return exe
+
+
 def _try_relaunch_as_admin():
-    """Re-spawn this script under UAC. Returns True iff a new elevated
-    process was launched (caller should exit). Returns False if the user
-    declined the UAC prompt or ShellExecute failed for any reason —
-    caller should continue without admin and warn the user."""
+    """Re-spawn this script under UAC using pythonw so the elevated child
+    has no console window. Returns True iff a new elevated process was
+    launched (caller should exit). Returns False if the user declined the
+    UAC prompt or ShellExecute failed for any reason — caller should
+    continue without admin and warn the user."""
     script = os.path.abspath(sys.argv[0])
     script_dir = os.path.dirname(script)
     # Forward original args plus the marker so the elevated child skips
@@ -67,15 +84,31 @@ def _try_relaunch_as_admin():
     forwarded = [a for a in sys.argv[1:] if a != _ELEVATION_MARKER]
     params = ' '.join(f'"{a}"' for a in [script] + forwarded + [_ELEVATION_MARKER])
     SW_SHOWNORMAL = 1
+    exe = _windowed_python_exe()
     # lpDirectory pinned to the script's folder so the elevated process'
     # cwd matches the non-elevated launch (matters for any future
     # cwd-relative file I/O even though current code uses absolute paths).
     rc = ctypes.windll.shell32.ShellExecuteW(
-        None, 'runas', sys.executable, params, script_dir, SW_SHOWNORMAL)
+        None, 'runas', exe, params, script_dir, SW_SHOWNORMAL)
     # ShellExecuteW returns an HINSTANCE > 32 on success; <=32 means
     # error (5 / SE_ERR_ACCESSDENIED is typical when the user declines
     # the UAC prompt).
     return int(rc) > 32
+
+
+def _hide_attached_console():
+    """If the current process owns a console window (i.e. launched via
+    python.exe), hide it. Used as a fallback when the user runs
+    `python ui.py` directly instead of `pythonw ui.py`. Hidden writes
+    still succeed silently — they just go nowhere visible. The mirror
+    in _QueueWriter still works."""
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            SW_HIDE = 0
+            ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
+    except Exception:
+        pass
 
 
 def _ensure_admin_or_warn():
@@ -100,12 +133,12 @@ def _ensure_admin_or_warn():
         messagebox.showwarning(
             'Administrator required',
             "Couldn't elevate to administrator — Genshin's anti-cheat "
-            "blocks hotkeys from non-admin processes, so F8 / F9 / F10 "
-            "will not work while the game is focused.\n\n"
+            "blocks hotkeys from non-admin processes, so the configured "
+            "hotkeys will not work while the game is focused.\n\n"
             "Close this window, right-click the launcher and choose "
             "\"Run as administrator\" to enable in-game hotkeys.\n\n"
-            "The UI buttons (Start / Stop / Pause / Debug toggle) will "
-            "still work normally.")
+            "The UI buttons (Start / Stop / Debug toggle) will still "
+            "work normally.")
         warn_root.destroy()
     except Exception:
         pass
@@ -147,6 +180,45 @@ def save_settings(settings):
         print(f"[ui] failed to save settings: {e}")
 
 
+# --- log pane plumbing ------------------------------------------------------
+
+class _QueueWriter:
+    """File-like object that pushes writes onto a thread-safe queue. The Tk
+    thread drains the queue on a timer and appends to the log Text widget.
+    Avoids calling Tk APIs from worker threads (detector / album loop /
+    keyboard package listener) which is unsupported."""
+
+    def __init__(self, q, mirror=None):
+        self._q = q
+        # mirror lets us tee to the real stdout/stderr too — handy when
+        # ui.py is launched from a console for live debugging.
+        self._mirror = mirror
+
+    def write(self, s):
+        if not s:
+            return 0
+        try:
+            self._q.put_nowait(s)
+        except queue.Full:
+            pass
+        if self._mirror is not None:
+            try:
+                self._mirror.write(s)
+            except Exception:
+                pass
+        return len(s)
+
+    def flush(self):
+        if self._mirror is not None:
+            try:
+                self._mirror.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
 # --- foreground-window gate -------------------------------------------------
 
 def _foreground_hwnd():
@@ -166,11 +238,47 @@ def _window_title(hwnd):
     return buf.value
 
 
+# Genshin's pause menu doesn't change the window title, but in some cases
+# (alt-tab from pause, overlay popups) the focused HWND temporarily belongs
+# to a child/overlay window with a different title. The process exe is the
+# stable identifier across all of these.
+_GAME_EXE_NAMES = {'GenshinImpact.exe', 'YuanShen.exe'}
+
+
+def _foreground_process_name():
+    """Best-effort: return the exe basename of the process that owns the
+    foreground window. Empty string on any failure (used for fallback
+    matching, so silent failure is fine)."""
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    fg = user32.GetForegroundWindow()
+    if not fg:
+        return ''
+    pid = ctypes.wintypes.DWORD()
+    user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+    if not pid.value:
+        return ''
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                             pid.value)
+    if not h:
+        return ''
+    try:
+        buf = ctypes.create_unicode_buffer(520)
+        size = ctypes.wintypes.DWORD(len(buf))
+        ok = kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+        if not ok:
+            return ''
+        return os.path.basename(buf.value)
+    finally:
+        kernel32.CloseHandle(h)
+
+
 def is_allowed_foreground(ui_hwnd):
     """Hotkey gate: pass if the focused window is the Genshin client OR
-    the bot UI itself. Title-based to avoid the per-keypress
-    find_game_window log spam and to handle Genshin window-class
-    quirks where hwnd identity didn't compare equal."""
+    the bot UI itself. Falls back to process-exe match so the gate keeps
+    passing while Genshin is paused / showing an overlay (the focused
+    HWND may not have the "Genshin Impact" title in those states)."""
     fg = _foreground_hwnd()
     if not fg:
         return False
@@ -179,7 +287,10 @@ def is_allowed_foreground(ui_hwnd):
     title = _window_title(fg)
     if title == UI_WINDOW_TITLE:
         return True
-    return title in GAME_WINDOW_TITLE
+    if title in GAME_WINDOW_TITLE:
+        return True
+    proc = _foreground_process_name()
+    return proc in _GAME_EXE_NAMES
 
 
 # --- keybind manager --------------------------------------------------------
@@ -252,6 +363,7 @@ class BotController:
     STATE_IDLE = 'idle'
     STATE_RUNNING = 'running'
     STATE_PAUSED = 'paused'
+    STATE_STOPPING = 'stopping'
 
     def __init__(self, on_status):
         self._on_status = on_status
@@ -298,8 +410,14 @@ class BotController:
             self.state = self.STATE_IDLE
             self._emit({'state': self.state})
             return
+        # Reflect "stopping" immediately so the UI updates on the next
+        # status tick instead of waiting for the worker thread to actually
+        # exit (which can take 100ms+ if it has to tear down a cv2 window
+        # or finish the current detector poll).
         self._stop_evt.set()
         self._pause_evt.clear()  # unblock any pause-waiters
+        self.state = self.STATE_STOPPING
+        self._emit({'state': self.state})
 
     def pause_toggle(self):
         if not self.is_running():
@@ -347,7 +465,8 @@ class BotController:
             self._ensure_system_setup()
             if self._mode == 'standalone':
                 bot_main.run_standalone(self._stop_evt, self._debug_evt,
-                                        status_cb=self._emit)
+                                        status_cb=self._emit,
+                                        pause_evt=self._pause_evt)
             elif self._mode == 'album':
                 opts = self._mode_options
                 runner = AlbumRunner(replay_canorus=opts.get('replay_canorus', False),
@@ -372,13 +491,13 @@ class BotController:
 # --- Tk app -----------------------------------------------------------------
 
 class App:
-    POLL_MS = 100  # status panel refresh
+    POLL_MS = 50  # status panel refresh — shorter = snappier hotkey feedback
 
     def __init__(self, root):
         self.root = root
         root.title(UI_WINDOW_TITLE)
-        root.geometry('420x540')
-        root.resizable(False, False)
+        root.geometry('480x570')
+        root.minsize(460, 480)
         root.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self.settings = load_settings()
@@ -387,6 +506,13 @@ class App:
         self._status_lock = threading.Lock()
         self._capture_action = None  # while != None, next key event rebinds
 
+        # Redirect stdout/stderr into the in-window log pane. The original
+        # streams are captured first so a console launch can still tee to
+        # the terminal, and so _on_close can restore them cleanly.
+        self._log_queue = queue.Queue(maxsize=10000)
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+
         self.bot = BotController(self._enqueue_status)
         # winfo_id() on Windows returns the underlying HWND, which is what
         # GetForegroundWindow returns. We capture it lazily because
@@ -394,9 +520,40 @@ class App:
         # callable so the gate fetches it on each keypress.
         self.keybinds = KeybindManager(lambda: self._ui_hwnd())
 
+        # Snapshot of the Tk option vars, kept current via traces below.
+        # Hotkey callbacks read this from the keyboard listener thread —
+        # touching Tk vars off-thread is undefined behavior, so the cache
+        # is the only thread-safe view of "what mode is selected".
+        self._cached_opts = {}
+
         self._build_ui()
+        # Install redirection only after the Text widget exists.
+        sys.stdout = _QueueWriter(self._log_queue, mirror=self._orig_stdout)
+        sys.stderr = _QueueWriter(self._log_queue, mirror=self._orig_stderr)
+
+        # Initial cache fill, then keep it synced. trace_add fires on every
+        # var write (UI clicks, programmatic .set() in _poll_status, etc).
+        self._refresh_opts_cache()
+        for var in (self.mode_var, self.songs_var, self.difficulty_var,
+                    self.replay_canorus_var, self.debug_var):
+            var.trace_add('write', lambda *_a: self._refresh_opts_cache())
+
         self._install_keybinds()
         self.root.after(self.POLL_MS, self._poll_status)
+        self.root.after(50, self._drain_log_queue)
+
+    def _refresh_opts_cache(self):
+        try:
+            self._cached_opts = {
+                'mode': self.mode_var.get(),
+                'songs': int(self.songs_var.get()),
+                'difficulty': self.difficulty_var.get(),
+                'replay_canorus': bool(self.replay_canorus_var.get()),
+                'debug': bool(self.debug_var.get()),
+            }
+        except Exception:
+            # Spinbox can briefly hold a non-int while the user types.
+            pass
 
     def _ui_hwnd(self):
         try:
@@ -409,8 +566,19 @@ class App:
     def _build_ui(self):
         pad = {'padx': 8, 'pady': 4}
 
+        # Top-level notebook so the noisy log pane lives in its own tab
+        # and doesn't crowd the controls.
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill='both', expand=True, **pad)
+        main_tab = ttk.Frame(notebook)
+        logs_tab = ttk.Frame(notebook)
+        notebook.add(main_tab, text='Main')
+        notebook.add(logs_tab, text='Logs')
+
+        # ---- Main tab ----
+
         # Mode selector
-        mode_frame = ttk.LabelFrame(self.root, text='Mode')
+        mode_frame = ttk.LabelFrame(main_tab, text='Mode')
         mode_frame.pack(fill='x', **pad)
         self.mode_var = tk.StringVar(value='standalone')
         ttk.Radiobutton(mode_frame, text='Standalone (manual song select)',
@@ -421,7 +589,7 @@ class App:
                         command=self._on_mode_change).pack(anchor='w')
 
         # Album options (greyed out in standalone)
-        self.album_frame = ttk.LabelFrame(self.root, text='Album options')
+        self.album_frame = ttk.LabelFrame(main_tab, text='Album options')
         self.album_frame.pack(fill='x', **pad)
 
         row = ttk.Frame(self.album_frame)
@@ -452,7 +620,7 @@ class App:
         # running and back to disabled on stop.
         self.debug_var = tk.BooleanVar(value=False)
         self.debug_checkbox = ttk.Checkbutton(
-            self.root,
+            main_tab,
             text='Show debug visualization (toggle live with hotkey)',
             variable=self.debug_var,
             command=self._on_debug_checkbox,
@@ -460,17 +628,21 @@ class App:
         self.debug_checkbox.pack(anchor='w', **pad)
 
         # Action buttons
-        btn_frame = ttk.Frame(self.root)
+        btn_frame = ttk.Frame(main_tab)
         btn_frame.pack(fill='x', **pad)
         self.btn_start = ttk.Button(btn_frame, text='Start',
                                     command=self._on_start_stop)
         self.btn_start.pack(side='left', expand=True, fill='x', padx=2)
+        # Pause: in album mode it aborts the current song and blocks at
+        # the next boundary. In standalone mode it stops the detector
+        # (releasing all keys) and idles until resumed.
         self.btn_pause = ttk.Button(btn_frame, text='Pause',
-                                    command=self._on_pause)
+                                    command=self._on_pause,
+                                    state='disabled')
         self.btn_pause.pack(side='left', expand=True, fill='x', padx=2)
 
         # Keybinds
-        kb_frame = ttk.LabelFrame(self.root, text='Hotkeys '
+        kb_frame = ttk.LabelFrame(main_tab, text='Hotkeys '
                                   '(only fire when Genshin is focused)')
         kb_frame.pack(fill='x', **pad)
         self.kb_labels = {}
@@ -490,8 +662,8 @@ class App:
             self.kb_buttons[action] = btn
 
         # Status panel
-        st_frame = ttk.LabelFrame(self.root, text='Status')
-        st_frame.pack(fill='both', expand=True, **pad)
+        st_frame = ttk.LabelFrame(main_tab, text='Status')
+        st_frame.pack(fill='x', **pad)
         self.lbl_state = ttk.Label(st_frame, text='State: idle')
         self.lbl_state.pack(anchor='w')
         self.lbl_song = ttk.Label(st_frame, text='Song: —')
@@ -508,6 +680,18 @@ class App:
         self.lbl_admin.pack(anchor='w')
         self.lbl_capture = ttk.Label(st_frame, text='', foreground='blue')
         self.lbl_capture.pack(anchor='w')
+
+        # ---- Logs tab ----
+        # Captures stdout/stderr from worker threads. Read-only to the
+        # user; "Clear" wipes the buffer. _drain_log_queue caps line count
+        # so long-running sessions don't blow memory.
+        self.log_text = scrolledtext.ScrolledText(
+            logs_tab, wrap='word', state='disabled', font=('Consolas', 9))
+        self.log_text.pack(fill='both', expand=True, padx=4, pady=(4, 0))
+        log_btn_row = ttk.Frame(logs_tab)
+        log_btn_row.pack(fill='x', padx=4, pady=4)
+        ttk.Button(log_btn_row, text='Clear',
+                   command=self._clear_log).pack(side='right')
 
         self._on_mode_change()  # set initial enable state
 
@@ -545,20 +729,20 @@ class App:
                 self.bot.toggle_debug()
 
     def _on_start_stop(self):
+        # Reads cached opts (kept current by trace_add). Safe to call from
+        # any thread — bot.start / bot.stop are thread-safe and the cache
+        # avoids touching Tk vars off-thread.
         if self.bot.is_running():
             self.bot.stop()
             return
-        opts = {
-            'songs': int(self.songs_var.get()),
-            'difficulty': self.difficulty_var.get(),
-            'replay_canorus': bool(self.replay_canorus_var.get()),
-            'debug': bool(self.debug_var.get()),
-        }
-        if not self.bot.start(self.mode_var.get(), opts):
+        opts = dict(self._cached_opts)
+        mode = opts.pop('mode', 'standalone')
+        if not self.bot.start(mode, opts):
             print('[ui] start failed (already running?)')
 
     def _on_pause(self):
-        self.bot.pause_toggle()
+        if self.bot.is_running():
+            self.bot.pause_toggle()
 
     def _begin_capture(self, action):
         """Capture next keypress as the new hotkey for `action`. Cancels
@@ -644,25 +828,24 @@ class App:
         for action, lbl in self.kb_labels.items():
             lbl.configure(text=self._kb(action))
 
-    # Hotkey callbacks dispatch onto the Tk thread so widget updates from
-    # the keyboard listener thread don't trip Tk's threading rules.
+    # Hotkey callbacks run directly on the keyboard listener thread.
+    # Going through root.after(0, ...) added enough latency that holding
+    # the key was sometimes needed to register a single press. The bot
+    # methods used here (start / stop / toggle_debug) only mutate
+    # threading.Events and the BotController's own internal state, all of
+    # which are thread-safe; widget updates land later via _poll_status.
     def _hotkey_start_stop(self):
-        self.root.after(0, self._on_start_stop)
+        self._on_start_stop()
 
     def _hotkey_pause(self):
-        self.root.after(0, self._on_pause)
+        if self.bot.is_running():
+            self.bot.pause_toggle()
 
     def _hotkey_debug(self):
-        self.root.after(0, self._toggle_debug_from_hotkey)
-
-    def _toggle_debug_from_hotkey(self):
-        # Mirror into the checkbox + delegate to the bot only if running;
-        # otherwise just flip the start-state checkbox.
+        # No-op when the bot is off (matches the disabled checkbox + the
+        # disabled rebind row on the Main tab).
         if self.bot.is_running():
             self.bot.toggle_debug()
-            # status update will refresh the checkbox via _poll_status
-        else:
-            self.debug_var.set(not self.debug_var.get())
 
     # ----- status panel polling -----
 
@@ -686,24 +869,80 @@ class App:
             self.debug_var.set(debug_on)
 
         running = self.bot.is_running()
-        self.btn_start.configure(text='Stop' if running else 'Start')
-        self.btn_pause.configure(
-            state='normal' if running else 'disabled',
-            text='Resume' if snap.get('state') == BotController.STATE_PAUSED
-                          else 'Pause')
-        # Debug checkbox is only clickable while the bot is running.
-        # When stopped, force it back off and disable so the visual state
-        # never disagrees with the (always-off) bot debug_evt.
-        self.debug_checkbox.configure(
-            state='normal' if running else 'disabled')
+        if snap.get('state') == BotController.STATE_STOPPING:
+            self.btn_start.configure(text='Stopping…', state='disabled')
+        else:
+            self.btn_start.configure(
+                text='Stop' if running else 'Start', state='normal')
+        # Pause works for both album and standalone modes.
+        pause_active = (snap.get('state') == BotController.STATE_PAUSED)
+        if running and snap.get('state') != BotController.STATE_STOPPING:
+            self.btn_pause.configure(
+                text='Resume' if pause_active else 'Pause',
+                state='normal')
+        else:
+            self.btn_pause.configure(text='Pause', state='disabled')
+        # Hotkey row for pause follows the same gating.
+        if ACTION_PAUSE in self.kb_buttons:
+            pause_kb_state = 'normal' if running else 'disabled'
+            self.kb_buttons[ACTION_PAUSE].configure(state=pause_kb_state)
+            self.kb_labels[ACTION_PAUSE].configure(
+                foreground='' if running else 'gray')
+        # Debug checkbox + its hotkey row are only meaningful while the
+        # bot is running. Disable both when stopped so the user can't
+        # click the checkbox or rebind the (no-op) hotkey by mistake.
+        debug_state = 'normal' if running else 'disabled'
+        self.debug_checkbox.configure(state=debug_state)
         if not running and self.debug_var.get():
             self.debug_var.set(False)
+        if ACTION_DEBUG in self.kb_buttons:
+            self.kb_buttons[ACTION_DEBUG].configure(state=debug_state)
+            self.kb_labels[ACTION_DEBUG].configure(
+                foreground='' if running else 'gray')
 
         self.root.after(self.POLL_MS, self._poll_status)
+
+    # ----- log pane -----
+
+    LOG_MAX_LINES = 1000  # trim oldest down to ~80% when exceeded
+
+    def _drain_log_queue(self):
+        try:
+            chunks = []
+            # Drain everything queued so far in one shot.
+            try:
+                while True:
+                    chunks.append(self._log_queue.get_nowait())
+            except queue.Empty:
+                pass
+            if chunks:
+                self.log_text.configure(state='normal')
+                self.log_text.insert('end', ''.join(chunks))
+                # Cap line count: deletes the oldest lines once we're over
+                # the budget. 'end-1c' is end-of-text minus the implicit
+                # trailing newline, so the index split gives a usable line
+                # count.
+                last_line = int(self.log_text.index('end-1c').split('.')[0])
+                if last_line > self.LOG_MAX_LINES:
+                    cutoff = last_line - int(self.LOG_MAX_LINES * 0.8)
+                    self.log_text.delete('1.0', f'{cutoff}.0')
+                self.log_text.see('end')
+                self.log_text.configure(state='disabled')
+        finally:
+            self.root.after(50, self._drain_log_queue)
+
+    def _clear_log(self):
+        self.log_text.configure(state='normal')
+        self.log_text.delete('1.0', 'end')
+        self.log_text.configure(state='disabled')
 
     # ----- shutdown -----
 
     def _on_close(self):
+        # Restore stdio first so any teardown prints go to the original
+        # streams (the Tk widget is about to be destroyed).
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
         print('[ui] closing — stopping bot')
         self.keybinds.clear_all()
         self.bot.shutdown()
@@ -715,6 +954,10 @@ def main():
     # work (keyboard hooks, controller open, etc.) is done. If we elevated,
     # this call exits the current (non-admin) process.
     _ensure_admin_or_warn()
+    # Hide the console window if the script was launched with python.exe
+    # rather than pythonw.exe. The elevated relaunch already uses pythonw
+    # so this is just a safety net for direct (already-admin) launches.
+    _hide_attached_console()
     root = tk.Tk()
     App(root)
     root.mainloop()
