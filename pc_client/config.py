@@ -110,3 +110,13 @@ MACRO_HOTKEYS = {
     'load':   'f11',
     'exit':   'f12',
 }
+
+# === UI hotkeys (ui.py) ===
+# Defaults loaded when no ui_settings.json override is present. Names follow
+# the `keyboard` package convention ('f8', 'ctrl+shift+a', etc.). Hotkeys are
+# gated by foreground-window: they only fire while Genshin Impact is focused.
+UI_KEYBINDS_DEFAULT = {
+    'start_stop': 'f8',   # toggle bot run / stop
+    'pause':      'f9',   # pause / resume (releases keys, halts album clicker)
+    'debug':      'f10',  # toggle OpenCV viz window in real time
+}

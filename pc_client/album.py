@@ -65,16 +65,42 @@ ROI_BEGIN_PERFORMANCE = (970, 975, 320, 75)
 
 
 class AlbumRunner:
-    def __init__(self, replay_canorus=False, difficulty=ALBUM_DIFFICULTY):
+    def __init__(self, replay_canorus=False, difficulty=ALBUM_DIFFICULTY,
+                 stop_evt=None, pause_evt=None, debug_evt=None,
+                 status_cb=None):
+        """
+        Args:
+            stop_evt: external Event — when set, abort cleanly. UI uses this
+                for the Stop button.
+            pause_evt: external Event — when set, the album loop blocks at
+                the next safe boundary (between songs). Mid-song pause
+                aborts the current song (releases keys via detector.stop)
+                and waits at the next boundary. Clear to resume.
+            debug_evt: external Event — when set, the rhythm-mode portion
+                of _play_song spawns a viz thread that mirrors main.py's
+                overlay. Toggling clears/recreates the cv2 window in real
+                time without restarting the bot.
+            status_cb: optional callable(dict) — emits status updates so
+                the UI can mirror state ('state', 'song', 'fps', ...).
+        """
         if difficulty not in ALBUM_DIFFICULTY_COORDS:
             raise ValueError(f"unknown difficulty: {difficulty!r}")
         self.replay_canorus = replay_canorus
         self.difficulty = difficulty
-        self.hwnd = find_game_window()
+        self.stop_evt = stop_evt if stop_evt is not None else threading.Event()
+        self.pause_evt = pause_evt if pause_evt is not None else threading.Event()
+        self.debug_evt = debug_evt if debug_evt is not None else threading.Event()
+        self.status_cb = status_cb
+        self.hwnd = find_game_window(verbose=True)
         if not self.hwnd:
             print("ERROR: game window not found")
             sys.exit(1)
-        self.region, self.scale_x, self.scale_y = get_game_geometry(self.hwnd)
+        geom = get_game_geometry(self.hwnd, stop_evt=self.stop_evt)
+        if geom is None:
+            # Stop fired while waiting for the game window to be visible.
+            # Re-raise as RuntimeError so the BotController worker exits.
+            raise RuntimeError("album-init aborted by stop_evt")
+        self.region, self.scale_x, self.scale_y = geom
         # Game enforces 16:9, so scale_x ~= scale_y. Use scale_x for
         # template resampling (single scalar AssetScale, mirroring BGI).
         self.scale = self.scale_x
@@ -305,22 +331,55 @@ class AlbumRunner:
                                 self.controller)
         detector.start()
 
-        stop_evt = threading.Event()
+        # Optional viz thread — gated by debug_evt. Imported lazily to
+        # avoid a hard cv2 dep when the album CLI runs headless.
+        viz_thread = None
+        viz_stop = threading.Event()
+        if self.debug_evt is not None:
+            from main import run_visualization
+            capture_region = {'top': self.region['top'],
+                              'left': self.region['left'],
+                              'width': self.region['width'],
+                              'height': self.region['height']}
+
+            def _viz_worker():
+                try:
+                    run_visualization(capture_region, column_centers,
+                                      hit_line_y, detector,
+                                      stop_evt=viz_stop,
+                                      debug_evt=self.debug_evt,
+                                      fps_callback=(lambda f: self._emit({'fps': f}))
+                                                    if self.status_cb else None,
+                                      pin_console=False)
+                except Exception as e:
+                    print(f"[viz] worker died: {e}")
+
+            viz_thread = threading.Thread(target=_viz_worker, daemon=True,
+                                          name='album-viz')
+            viz_thread.start()
+
+        watcher_evt = threading.Event()
         watcher = threading.Thread(target=self._end_watcher,
-                                   args=(stop_evt,), daemon=True)
+                                   args=(watcher_evt,), daemon=True)
         watcher.start()
         try:
-            # Polled wait so SIGINT (Ctrl+C) can wake the main thread on
-            # Windows — Event.wait() with no timeout blocks in a native
-            # condition variable that ignores Python signal delivery.
-            # Also bail out if the watcher dies unexpectedly.
-            while not stop_evt.wait(0.5):
+            # Wait for either the watcher (end of song) or external
+            # stop/pause to fire. Pause aborts the song mid-flight (keys
+            # released by detector.stop in finally), and the album loop
+            # blocks at the boundary check before the next song.
+            while not watcher_evt.wait(0.5):
+                if self.stop_evt.is_set() or self.pause_evt.is_set():
+                    print("  external stop/pause — aborting current song")
+                    break
                 if not watcher.is_alive():
                     print("  WARN: watcher thread died "
                           "(see traceback above); aborting song")
                     break
         finally:
             detector.stop()
+            viz_stop.set()
+            if viz_thread is not None:
+                viz_thread.join(timeout=2.0)
 
         time.sleep(2.0)
         return True
@@ -338,7 +397,31 @@ class AlbumRunner:
 
     # --- main loop ----------------------------------------------------------
 
-    def run(self):
+    def _emit(self, update):
+        if self.status_cb:
+            try:
+                self.status_cb(update)
+            except Exception:
+                pass
+
+    def _await_resume(self):
+        """Block while pause_evt is set; bail out if stop fires. Called at
+        safe boundaries between songs."""
+        if not self.pause_evt.is_set():
+            return
+        self._emit({'state': 'paused'})
+        print("  paused — waiting for resume")
+        while self.pause_evt.is_set() and not self.stop_evt.is_set():
+            time.sleep(0.1)
+        if not self.stop_evt.is_set():
+            self._emit({'state': 'running'})
+            print("  resumed")
+
+    def run(self, songs_count=None):
+        if songs_count is None:
+            songs_count = ALBUM_SONG_COUNT
+        songs_count = max(1, min(int(songs_count), ALBUM_SONG_COUNT))
+
         if not self._on_album_page():
             print("ERROR: not on an album page. Open a country album "
                   "(Fontaine / Liyue / Mondstadt / ...), NOT the All Albums grid.")
@@ -347,11 +430,22 @@ class AlbumRunner:
 
         mode = "replay-canorus" if self.replay_canorus else "skip-on-canorus"
         print(f"Per-key {KEY_POLL_DELAY_S * 1000:.0f}ms, strip {Y_SAMPLE_OFFSETS}")
-        print(f"Album loop: {ALBUM_SONG_COUNT} songs, "
+        print(f"Album loop: {songs_count}/{ALBUM_SONG_COUNT} songs, "
               f"difficulty={self.difficulty}, {mode}")
 
-        for i in range(ALBUM_SONG_COUNT):
-            print(f"\n--- Song {i+1}/{ALBUM_SONG_COUNT} ---")
+        self._emit({'state': 'running', 'mode': 'album',
+                    'song': f'0/{songs_count}'})
+
+        for i in range(songs_count):
+            if self.stop_evt.is_set():
+                print("\nstop requested — exiting album loop")
+                break
+            self._await_resume()
+            if self.stop_evt.is_set():
+                break
+
+            print(f"\n--- Song {i+1}/{songs_count} ---")
+            self._emit({'song': f'{i+1}/{songs_count}'})
             if not self.replay_canorus:
                 frame = self._grab()
                 if self._is_canorus(frame):
@@ -364,13 +458,20 @@ class AlbumRunner:
                 print("  aborting album (state machine broke; check coords).")
                 return
 
+            # Pause may have fired mid-song — _play_song aborted and we
+            # land here. Wait at the boundary before clicking next-song.
+            self._await_resume()
+            if self.stop_evt.is_set():
+                break
+
             if not self._wait_for_album_page(timeout=60.0):
                 print("  WARN: never returned to album page; stopping")
                 return
 
             self._next_song()
 
-        print("\nAlbum complete")
+        print("\nAlbum complete" if not self.stop_evt.is_set() else "\nAlbum stopped")
+        self._emit({'state': 'idle', 'fps': 0.0})
 
     def close(self):
         try:
@@ -445,6 +546,10 @@ def main():
         '--difficulty', choices=list(ALBUM_DIFFICULTY_COORDS),
         help="Skip the difficulty prompt and use this one. "
              "If omitted, the script prompts at startup.")
+    parser.add_argument(
+        '--songs', type=int, default=ALBUM_SONG_COUNT,
+        help=f"Number of songs to run (1..{ALBUM_SONG_COUNT}). "
+             f"Defaults to the full album ({ALBUM_SONG_COUNT}).")
     args = parser.parse_args()
 
     replay = args.replay_canorus or _prompt_replay_canorus()
@@ -479,7 +584,7 @@ def main():
 
     runner = AlbumRunner(replay_canorus=replay, difficulty=difficulty)
     try:
-        runner.run()
+        runner.run(songs_count=args.songs)
     except KeyboardInterrupt:
         print("\nCtrl+C")
     finally:
