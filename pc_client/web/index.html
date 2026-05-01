@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Genshin Rhythm Bot</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Custom titlebar. The drag region honors pywebview's drag class. -->
+    <div class="titlebar">
+        <div class="titlebar-drag pywebview-drag-region">
+            <span class="titlebar-title">Genshin Rhythm Bot</span>
+        </div>
+        <div class="titlebar-buttons">
+            <button class="titlebar-btn" id="btn-min" title="Minimize">&#xE921;</button>
+            <button class="titlebar-btn" id="btn-max" title="Maximize">&#xE922;</button>
+            <button class="titlebar-btn titlebar-btn-close" id="btn-close" title="Close">&#xE8BB;</button>
+        </div>
+    </div>
+
+    <!-- Tab strip -->
+    <nav class="tabs">
+        <button class="tab tab-active" data-tab="main">Main</button>
+        <button class="tab" data-tab="logs">Logs</button>
+    </nav>
+
+    <!-- Main tab -->
+    <section class="panel panel-active" data-panel="main">
+        <fieldset class="card">
+            <legend>Mode</legend>
+            <div class="row">
+                <label class="radio">
+                    <input type="radio" name="mode" value="standalone" checked>
+                    <span class="radio-mark"></span>
+                    <span>Standalone</span>
+                </label>
+                <label class="radio">
+                    <input type="radio" name="mode" value="album">
+                    <span class="radio-mark"></span>
+                    <span>Album</span>
+                </label>
+            </div>
+        </fieldset>
+
+        <fieldset class="card" id="album-card">
+            <legend>Album options</legend>
+            <div class="row row-grid">
+                <label for="songs">Songs</label>
+                <div class="spinbox">
+                    <input type="number" id="songs" min="1" max="12" value="12">
+                    <div class="spinbox-buttons">
+                        <button type="button" class="spinbox-up" data-target="songs">&#x25B2;</button>
+                        <button type="button" class="spinbox-down" data-target="songs">&#x25BC;</button>
+                    </div>
+                </div>
+            </div>
+            <div class="row row-grid">
+                <label for="difficulty">Difficulty</label>
+                <div class="select-wrapper">
+                    <select id="difficulty">
+                        <option value="normal">Normal</option>
+                        <option value="hard">Hard</option>
+                        <option value="pro">Pro</option>
+                        <option value="legendary" selected>Legendary</option>
+                    </select>
+                </div>
+            </div>
+        </fieldset>
+
+        <label class="checkbox">
+            <input type="checkbox" id="replay-canorus">
+            <span class="check-mark"></span>
+            <span>Replay songs already at Canorus</span>
+        </label>
+
+        <label class="checkbox">
+            <input type="checkbox" id="debug">
+            <span class="check-mark"></span>
+            <span>Show debug visualization</span>
+        </label>
+
+        <div class="bottom-row">
+            <fieldset class="card hotkeys">
+                <legend>Hotkeys</legend>
+                <div class="hk-row" data-action="start_stop">
+                    <span class="hk-label">Start/Stop</span>
+                    <span class="hk-binding">—</span>
+                    <button type="button" class="rebind">Rebind</button>
+                </div>
+                <div class="hk-row" data-action="pause">
+                    <span class="hk-label">Pause/Resume</span>
+                    <span class="hk-binding">—</span>
+                    <button type="button" class="rebind">Rebind</button>
+                </div>
+                <div class="hk-row" data-action="debug">
+                    <span class="hk-label">Toggle Debug</span>
+                    <span class="hk-binding">—</span>
+                    <button type="button" class="rebind">Rebind</button>
+                </div>
+                <div class="hk-capture-msg" id="capture-msg"></div>
+            </fieldset>
+
+            <fieldset class="card status">
+                <legend>Status</legend>
+                <div class="status-grid">
+                    <div class="status-rows">
+                        <div class="st-row"><span class="st-key">State</span><span class="st-val" id="st-state">idle</span></div>
+                        <div class="st-row"><span class="st-key">Song</span><span class="st-val" id="st-song">—</span></div>
+                        <div class="st-row"><span class="st-key">FPS</span><span class="st-val" id="st-fps">—</span></div>
+                        <div class="st-row"><span class="st-key">Debug</span><span class="st-val" id="st-debug">off</span></div>
+                        <div class="st-row"><span class="st-key">Admin</span><span class="st-val" id="st-admin">…</span></div>
+                    </div>
+                    <div class="status-buttons">
+                        <button type="button" id="btn-start" class="btn-primary">Start</button>
+                        <button type="button" id="btn-pause" class="btn-secondary" disabled>Pause</button>
+                    </div>
+                </div>
+            </fieldset>
+        </div>
+    </section>
+
+    <!-- Logs tab -->
+    <section class="panel" data-panel="logs">
+        <div class="log-toolbar">
+            <button type="button" id="btn-clear-log">Clear</button>
+        </div>
+        <pre class="log-pane" id="log-pane"></pre>
+    </section>
+
+    <script src="app.js"></script>
+</body>
+</html>
