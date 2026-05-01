@@ -19,6 +19,45 @@ import threading
 import time
 from pathlib import Path
 
+
+def _strip_motw_under(root):
+    """Remove the `Zone.Identifier` NTFS alternate data stream from every
+    file under `root`. Files extracted from a zip downloaded via browser
+    inherit Mark-of-the-Web; the .NET Framework assembly loader silently
+    fails to resolve `Python.Runtime.Loader.Initialize` from a
+    MOTW-tagged DLL, which kills pywebview's WinForms backend. Stripping
+    the ADS once at startup makes downstream loads trust the bundled
+    assemblies. Cheap (~hundreds of os.remove on a missing path)."""
+    if not root or not os.path.exists(root):
+        return
+    marker = os.path.join(root, '.motw_stripped')
+    if os.path.exists(marker):
+        return
+    try:
+        for dirpath, _, files in os.walk(root):
+            for name in files:
+                # Removing the ADS — a NoneFoundError just means the file
+                # never carried MOTW; ignore.
+                try:
+                    os.remove(os.path.join(dirpath, name) + ':Zone.Identifier')
+                except (FileNotFoundError, OSError):
+                    pass
+        # Drop a marker so subsequent launches skip the walk.
+        try:
+            with open(marker, 'w', encoding='utf-8') as fh:
+                fh.write('1')
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+# Strip MOTW from bundled DLLs/assemblies before importing pywebview
+# (which transitively loads pythonnet → Python.Runtime.dll). Only runs
+# in frozen builds; source layouts have no MOTW.
+if getattr(sys, 'frozen', False):
+    _strip_motw_under(sys._MEIPASS)
+
 import webview
 
 import ui_core
