@@ -1,5 +1,6 @@
 # Virtual Environments
 venv/
+venv_old/
 env/
 .env
 
@@ -7,6 +8,17 @@ env/
 __pycache__/
 *.py[cod]
 *$py.class
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Album-flow debug PNGs dumped at runtime
+pc_client/_album_debug_*.png
+
+# Claude / agent local state
+.claude/
 
 # IDEs / Text Editors
 .vscode/

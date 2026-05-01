@@ -55,8 +55,20 @@ button {
     flex: 1;
     display: flex;
     align-items: center;
+    gap: 8px;
     padding: 0 14px;
     -webkit-app-region: drag;
+}
+
+.titlebar-icon {
+    width: 16px;
+    height: 16px;
+    /* Multi-size .ico — Chromium picks the largest frame; nearest-neighbor
+       keeps the music-book pixels crisp at this size. */
+    image-rendering: -webkit-optimize-contrast;
+    pointer-events: none;
+    user-select: none;
+    flex-shrink: 0;
 }
 
 .titlebar-title {

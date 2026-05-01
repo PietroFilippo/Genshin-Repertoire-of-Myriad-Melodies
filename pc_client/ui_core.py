@@ -2,9 +2,13 @@
 """
 UI-agnostic logic shared by any front-end. Holds the bot orchestration
 (`BotController`), keybind plumbing (`KeybindManager`), settings
-persistence, admin/UAC self-elevation, console hiding, foreground gate,
-and a thread-safe stdout/stderr queue redirector. The PyWebView entry
-point in `ui.py` consumes this module; no Tk dependency.
+persistence, admin check, foreground gate, and a thread-safe
+stdout/stderr queue redirector. The PyWebView entry point in `ui.py`
+consumes this module; no Tk dependency.
+
+Admin elevation is now handled by the PyInstaller-embedded UAC manifest
+(`uac-admin`), so the runtime no longer self-elevates. Dev launches via
+`python ui.py` show a warning message box if not admin.
 """
 import ctypes
 import ctypes.wintypes
@@ -23,78 +27,42 @@ from config import (ALBUM_DIFFICULTY, ALBUM_SONG_COUNT, GAME_WINDOW_TITLE,
                     UI_KEYBINDS_DEFAULT)
 
 
-SETTINGS_PATH = Path(__file__).parent / 'ui_settings.json'
 UI_WINDOW_TITLE = 'Genshin Rhythm Bot'
 
-# Marker arg: when present, skip the elevation check. Set on the elevated
-# relaunch so a UAC failure loop is impossible.
-_ELEVATION_MARKER = '--no-elevate'
+
+def is_frozen():
+    """True when running from a PyInstaller bundle."""
+    return getattr(sys, 'frozen', False)
+
+
+def settings_path():
+    """User-writable settings file. For the bundled .exe, sit next to the
+    executable (onedir folder is user-writable). For dev launches, sit
+    next to the source script."""
+    if is_frozen():
+        return Path(sys.executable).parent / 'ui_settings.json'
+    return Path(__file__).parent / 'ui_settings.json'
+
 
 # MessageBoxW flags.
 _MB_OK = 0x0
 _MB_ICONWARNING = 0x30
 
 
-# --- admin / UAC ------------------------------------------------------------
+# --- admin check ------------------------------------------------------------
 #
 # Genshin Impact's anti-cheat (mhyprot) blocks low-level keyboard hooks
 # coming from non-elevated processes. Without admin, the `keyboard`
-# package's hotkeys silently drop while Genshin owns the foreground —
-# that's why macro_tool.py prints a giant admin warning. The UI takes the
-# stronger position and self-elevates via UAC on launch so the user
-# doesn't have to remember to right-click → "Run as administrator".
+# package's hotkeys silently drop while Genshin owns the foreground.
+# The bundled .exe carries a `requireAdministrator` manifest so UAC fires
+# on launch — by the time we reach Python, we are guaranteed admin. For
+# dev launches (`python ui.py`) we just check + warn.
 
 def is_admin():
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
-
-
-def _windowed_python_exe():
-    """Return the windowed (console-less) Python interpreter path. Falls
-    back to the current sys.executable if pythonw isn't alongside it."""
-    exe = sys.executable
-    base = os.path.basename(exe).lower()
-    if base in ('pythonw.exe', 'pythonw'):
-        return exe
-    if base in ('python.exe', 'python'):
-        candidate = os.path.join(os.path.dirname(exe), 'pythonw.exe')
-        if os.path.exists(candidate):
-            return candidate
-    return exe
-
-
-def _try_relaunch_as_admin():
-    """Re-spawn this script under UAC using pythonw so the elevated child
-    has no console window. Returns True iff a new elevated process was
-    launched (caller should exit). Returns False if the user declined the
-    UAC prompt or ShellExecute failed for any reason — caller should
-    continue without admin and warn the user."""
-    script = os.path.abspath(sys.argv[0])
-    script_dir = os.path.dirname(script)
-    forwarded = [a for a in sys.argv[1:] if a != _ELEVATION_MARKER]
-    params = ' '.join(f'"{a}"' for a in [script] + forwarded + [_ELEVATION_MARKER])
-    SW_SHOWNORMAL = 1
-    exe = _windowed_python_exe()
-    rc = ctypes.windll.shell32.ShellExecuteW(
-        None, 'runas', exe, params, script_dir, SW_SHOWNORMAL)
-    return int(rc) > 32
-
-
-def hide_attached_console():
-    """If the current process owns a console window (i.e. launched via
-    python.exe), hide it. Used as a fallback when the user runs
-    `python ui.py` directly instead of `pythonw ui.py`. Hidden writes
-    still succeed silently — they just go nowhere visible. The mirror
-    in _QueueWriter still works."""
-    try:
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            SW_HIDE = 0
-            ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
-    except Exception:
-        pass
 
 
 def _message_box(text, title, flags=_MB_ICONWARNING | _MB_OK):
@@ -104,26 +72,18 @@ def _message_box(text, title, flags=_MB_ICONWARNING | _MB_OK):
         pass
 
 
-def ensure_admin_or_warn():
-    """Self-elevate on launch. If already admin, no-op. If elevation
-    succeeds, the original process exits and the elevated one takes
-    over. If the user declines UAC, show a native MessageBox so the
-    warning is visible without a console."""
+def warn_if_not_admin():
+    """Surface a native message box if we're not running as admin. The
+    bundled .exe never reaches this path (manifest enforces elevation).
+    Dev launches without admin still get a visible warning."""
     if is_admin():
         return
-    if _ELEVATION_MARKER in sys.argv:
-        # Elevated relaunch came back without admin — don't recurse.
-        # Warn and continue; user will hit a non-functional in-game gate.
-        print("[ui] elevation marker present but not admin — giving up.")
-        return
-    if _try_relaunch_as_admin():
-        sys.exit(0)
     _message_box(
-        "Couldn't elevate to administrator — Genshin's anti-cheat "
-        "blocks hotkeys from non-admin processes, so the configured "
-        "hotkeys will not work while the game is focused.\n\n"
-        "Close this window, right-click the launcher and choose "
-        "\"Run as administrator\" to enable in-game hotkeys.\n\n"
+        "Not running as administrator — Genshin's anti-cheat blocks "
+        "hotkeys from non-admin processes, so the configured hotkeys "
+        "will not work while the game is focused.\n\n"
+        "Close this window and relaunch as administrator (right-click "
+        "the launcher → \"Run as administrator\").\n\n"
         "The UI buttons (Start / Stop / Debug toggle) will still "
         "work normally.",
         'Administrator required')
@@ -145,10 +105,11 @@ ACTION_LABELS = {
 def load_settings():
     """Load UI settings (currently just keybinds). Falls back to config
     defaults on missing file or parse errors."""
-    if not SETTINGS_PATH.exists():
+    p = settings_path()
+    if not p.exists():
         return {'keybinds': dict(UI_KEYBINDS_DEFAULT)}
     try:
-        with SETTINGS_PATH.open('r', encoding='utf-8') as fh:
+        with p.open('r', encoding='utf-8') as fh:
             data = json.load(fh)
         kb = dict(UI_KEYBINDS_DEFAULT)
         kb.update(data.get('keybinds', {}))
@@ -159,8 +120,10 @@ def load_settings():
 
 
 def save_settings(settings):
+    p = settings_path()
     try:
-        with SETTINGS_PATH.open('w', encoding='utf-8') as fh:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open('w', encoding='utf-8') as fh:
             json.dump(settings, fh, indent=2)
     except Exception as e:
         print(f"[ui] failed to save settings: {e}")

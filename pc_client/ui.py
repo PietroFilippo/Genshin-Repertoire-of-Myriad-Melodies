@@ -26,13 +26,24 @@ from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
                     ALBUM_SONG_COUNT)
 from ui_core import (ACTION_DEBUG, ACTION_PAUSE, ACTION_START_STOP,
                      BotController, KeybindManager, QueueWriter,
-                     UI_WINDOW_TITLE, ensure_admin_or_warn,
-                     hide_attached_console, is_admin, js_event_to_hotkey,
-                     load_settings, save_settings)
+                     UI_WINDOW_TITLE, is_admin, is_frozen,
+                     js_event_to_hotkey, load_settings, save_settings,
+                     warn_if_not_admin)
 
-WEB_DIR = Path(__file__).parent / 'web'
+
+def _resource_dir():
+    """Where to read bundled read-only assets from. PyInstaller onedir
+    extracts data files under sys._MEIPASS (which equals the .exe's
+    `_internal/` folder for onedir, or a temp extraction dir for
+    onefile). Source layouts read straight from the package directory."""
+    if is_frozen():
+        return Path(sys._MEIPASS)
+    return Path(__file__).parent
+
+
+WEB_DIR = _resource_dir() / 'web'
 INDEX_PATH = WEB_DIR / 'index.html'
-ICON_PATH = Path(__file__).parent / 'assets' / 'icon.ico'
+ICON_PATH = _resource_dir() / 'assets' / 'icon.ico'
 
 POLL_MS = 50          # status drain cadence — matches Tk version
 LOG_QUEUE_SIZE = 10000
@@ -55,12 +66,226 @@ _GCLP_HICON = -14
 _GCLP_HICONSM = -34
 
 
+APP_DISPLAY_NAME = 'Genshin Rhythm Bot'
+
+
+def _register_app_id(icon_path):
+    """Persist the AppUserModelID's display name + icon under HKCU so
+    Windows shell uses them in the right-click jump-list / hover label
+    instead of falling back to the process exe's File Description
+    ("Python 3.x"). Idempotent — safe to run on every launch."""
+    try:
+        import winreg
+        key_path = f'Software\\Classes\\AppUserModelId\\{APP_USER_MODEL_ID}'
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as k:
+            winreg.SetValueEx(k, 'DisplayName', 0, winreg.REG_SZ,
+                              APP_DISPLAY_NAME)
+            if icon_path and os.path.exists(icon_path):
+                # Same `,<index>` form as RelaunchIconResource — picks
+                # the first icon group inside the .ico file.
+                winreg.SetValueEx(k, 'IconResource', 0, winreg.REG_SZ,
+                                  f'{os.path.abspath(icon_path)},0')
+    except Exception as e:
+        print(f"[ui] AppID registry write failed: {e}")
+
+
 def _set_app_user_model_id():
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             APP_USER_MODEL_ID)
     except Exception as e:
         print(f"[ui] AppUserModelID set failed: {e}")
+
+
+# --- per-window AppUserModelID via IPropertyStore --------------------------
+# The process-wide call (`SetCurrentProcessExplicitAppUserModelID`) silently
+# loses if any window — including hidden ones from pythonnet/.NET CLR or
+# pywebview's WinForms backend — was created before we got to it. The
+# per-window property is authoritative: the shell honors PKEY_AppUserModel_ID
+# on the window's IPropertyStore even if a process-wide AppID was set
+# differently. Without this, the right-click / hover labels keep falling
+# back to python.exe's File Description.
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ('Data1', ctypes.c_ulong),
+        ('Data2', ctypes.c_ushort),
+        ('Data3', ctypes.c_ushort),
+        ('Data4', ctypes.c_ubyte * 8),
+    ]
+
+
+def _make_guid(d1, d2, d3, d4):
+    g = _GUID()
+    g.Data1 = d1
+    g.Data2 = d2
+    g.Data3 = d3
+    for i, b in enumerate(d4):
+        g.Data4[i] = b
+    return g
+
+
+class _PROPERTYKEY(ctypes.Structure):
+    _fields_ = [('fmtid', _GUID), ('pid', ctypes.wintypes.DWORD)]
+
+
+# 24-byte PROPVARIANT layout on x64 (vt + 3 reserved words + 16-byte union).
+class _PROPVARIANT(ctypes.Structure):
+    _fields_ = [
+        ('vt', ctypes.wintypes.USHORT),
+        ('wReserved1', ctypes.wintypes.WORD),
+        ('wReserved2', ctypes.wintypes.WORD),
+        ('wReserved3', ctypes.wintypes.WORD),
+        ('val', ctypes.c_void_p),
+        ('_pad', ctypes.c_void_p),
+    ]
+
+
+# All AppUserModel_* PROPERTYKEYs share fmtid {9F4C2855-...}; pid varies.
+_AUM_FMTID = _make_guid(
+    0x9F4C2855, 0x9F79, 0x4B39,
+    [0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3])
+
+
+def _aum_pkey(pid):
+    pk = _PROPERTYKEY()
+    pk.fmtid = _AUM_FMTID
+    pk.pid = pid
+    return pk
+
+
+_PKEY_AppUserModel_ID = _aum_pkey(5)
+# RelaunchDisplayNameResource (4): explicit text the shell shows in the
+# jump-list / hover label for this window. Bypasses AppID display-name
+# lookup, so it works even if the shell has already cached the wrong
+# group identity for this exe.
+_PKEY_AppUserModel_RelaunchDisplayNameResource = _aum_pkey(4)
+# RelaunchIconResource (3): icon shown in the jump-list group header.
+_PKEY_AppUserModel_RelaunchIconResource = _aum_pkey(3)
+# RelaunchCommand (2): what to launch when the user "Pin to taskbar" +
+# clicks the pinned tile later. Must be a full executable path string.
+_PKEY_AppUserModel_RelaunchCommand = _aum_pkey(2)
+
+# {886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99} — IID_IPropertyStore
+_IID_IPropertyStore = _make_guid(
+    0x886D8EEB, 0x8CF2, 0x4446,
+    [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99])
+
+
+_VT_LPWSTR = 31
+
+
+def _stamp_window_props(hwnd, props):
+    """Stamp a list of (PROPERTYKEY, string) on the window's IPropertyStore.
+    Per-window AppID + display name + icon resource together convince the
+    shell to render this window with our identity in the jump-list, hover
+    label, and pinned-tile display — even if the shell has already
+    finalized taskbar grouping under python.exe's implicit AppID.
+
+    PROPVARIANT is built by hand because InitPropVariantFromString is an
+    inline propvarutil.h helper, not exported. The unicode buffers are
+    kept alive in the local list `keepalive` so they outlive every
+    SetValue + Commit pair (PropVariantClear would CoTaskMemFree them —
+    we own the storage, so skip the clear)."""
+    if not hwnd or not props:
+        return
+    try:
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
+        shell32.SHGetPropertyStoreForWindow.argtypes = [
+            ctypes.wintypes.HWND, ctypes.POINTER(_GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        shell32.SHGetPropertyStoreForWindow.restype = ctypes.wintypes.LONG
+        ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+        ole32.CoInitialize.restype = ctypes.wintypes.LONG
+
+        ole32.CoInitialize(None)
+        ps_ptr = ctypes.c_void_p()
+        hr = shell32.SHGetPropertyStoreForWindow(
+            hwnd, ctypes.byref(_IID_IPropertyStore), ctypes.byref(ps_ptr))
+        if hr != 0 or not ps_ptr.value:
+            try:
+                sys.__stdout__.write(
+                    f"[ui] SHGetPropertyStoreForWindow hr=0x{hr & 0xFFFFFFFF:x}\n")
+                sys.__stdout__.flush()
+            except Exception:
+                pass
+            return
+        vtbl = ctypes.cast(
+            ps_ptr,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        SetValueProto = ctypes.WINFUNCTYPE(
+            ctypes.wintypes.LONG, ctypes.c_void_p,
+            ctypes.POINTER(_PROPERTYKEY), ctypes.POINTER(_PROPVARIANT))
+        CommitProto = ctypes.WINFUNCTYPE(
+            ctypes.wintypes.LONG, ctypes.c_void_p)
+        ReleaseProto = ctypes.WINFUNCTYPE(
+            ctypes.wintypes.ULONG, ctypes.c_void_p)
+        SetValue = SetValueProto(vtbl[6])
+        Commit = CommitProto(vtbl[7])
+        Release = ReleaseProto(vtbl[2])
+        try:
+            keepalive = []
+            for pkey, value in props:
+                str_buf = ctypes.create_unicode_buffer(value)
+                keepalive.append(str_buf)
+                pv = _PROPVARIANT()
+                ctypes.memset(ctypes.byref(pv), 0, ctypes.sizeof(pv))
+                pv.vt = _VT_LPWSTR
+                pv.val = ctypes.cast(str_buf, ctypes.c_void_p).value
+                hr_set = SetValue(
+                    ps_ptr, ctypes.byref(pkey), ctypes.byref(pv))
+                try:
+                    sys.__stdout__.write(
+                        f"[ui] SetValue pid={pkey.pid} "
+                        f"hr=0x{hr_set & 0xFFFFFFFF:x} val={value!r}\n")
+                    sys.__stdout__.flush()
+                except Exception:
+                    pass
+            hr_commit = Commit(ps_ptr)
+            try:
+                sys.__stdout__.write(
+                    f"[ui] Commit hr=0x{hr_commit & 0xFFFFFFFF:x}\n")
+                sys.__stdout__.flush()
+            except Exception:
+                pass
+        finally:
+            Release(ps_ptr)
+    except Exception as e:
+        try:
+            sys.__stdout__.write(f"[ui] _stamp_window_props failed: {e}\n")
+            sys.__stdout__.flush()
+        except Exception:
+            pass
+
+
+def _set_window_app_id(hwnd, app_id, icon_path=None):
+    """Convenience wrapper: stamp AppID + display name + icon resource +
+    relaunch command. RelaunchIconResource needs the `,<index>` suffix
+    so the shell's resource parser picks the first icon group out of
+    the .ico file (without it, shell falls back to the host process exe
+    icon = python.exe's). RelaunchCommand is required by some shell code
+    paths to honor RelaunchIconResource — set it to the current
+    interpreter + script."""
+    props = [
+        (_PKEY_AppUserModel_ID, app_id),
+        (_PKEY_AppUserModel_RelaunchDisplayNameResource, APP_DISPLAY_NAME),
+    ]
+    if icon_path and os.path.exists(icon_path):
+        icon_resource = f'{os.path.abspath(icon_path)},0'
+        props.append(
+            (_PKEY_AppUserModel_RelaunchIconResource, icon_resource))
+    # Relaunch command — what the shell would run if the user pinned the
+    # tile and clicked it later. Quote the script path in case it ever
+    # contains a space.
+    try:
+        script = os.path.abspath(sys.argv[0])
+        relaunch = f'"{sys.executable}" "{script}"'
+        props.append((_PKEY_AppUserModel_RelaunchCommand, relaunch))
+    except Exception:
+        pass
+    _stamp_window_props(hwnd, props)
 
 
 def _bind_user32_icon_apis():
@@ -497,8 +722,34 @@ def _on_shown(api, icon_path):
         sys.__stdout__.flush()
     except Exception:
         pass
+    # Per-window AppID + display name + icon resource. The shell already
+    # finalized taskbar grouping under python.exe's implicit AppID by the
+    # time `shown` fires, so stamping AppID alone isn't enough — the
+    # explicit RelaunchDisplayNameResource property is what overrides
+    # the right-click label without a re-group.
+    if hwnd:
+        _set_window_app_id(hwnd, APP_USER_MODEL_ID, icon_path)
     if hwnd and icon_path:
         _set_window_icon(hwnd, icon_path)
+    # Force Windows to drop and re-add this window's taskbar button so it
+    # picks up the freshly-stamped AppID for grouping. ShowWindow(hide)
+    # removes the taskbar entry; ShowWindow(show) re-creates it, this
+    # time reading our PKEY_AppUserModel_ID. Brief flicker but no
+    # alternative — once the shell has cached a window's AppID, only a
+    # taskbar-button recreate updates it.
+    if hwnd:
+        try:
+            user32 = ctypes.windll.user32
+            SW_HIDE = 0
+            SW_SHOW = 5
+            user32.ShowWindow(hwnd, SW_HIDE)
+            user32.ShowWindow(hwnd, SW_SHOW)
+        except Exception as e:
+            try:
+                sys.__stdout__.write(f"[ui] taskbar refresh failed: {e}\n")
+                sys.__stdout__.flush()
+            except Exception:
+                pass
     # If pywebview's native HWND differs from the FindWindowW result,
     # apply the icon to the other one too — costs nothing and covers
     # the case where the top-level taskbar window is the wrapper.
@@ -510,10 +761,11 @@ def _on_shown(api, icon_path):
             alt = int(handle.ToInt64())
             if alt and alt != hwnd:
                 try:
-                    sys.__stdout__.write(f"[ui] also applying icon to native HWND 0x{alt:x}\n")
+                    sys.__stdout__.write(f"[ui] also applying icon + AppID to native HWND 0x{alt:x}\n")
                     sys.__stdout__.flush()
                 except Exception:
                     pass
+                _set_window_app_id(alt, APP_USER_MODEL_ID, icon_path)
                 _set_window_icon(alt, icon_path)
     except Exception as e:
         try:
@@ -525,13 +777,19 @@ def _on_shown(api, icon_path):
 
 
 def main():
-    # Self-elevate before any heavy lifting (keyboard hooks need admin to
-    # fire while Genshin is foreground). If we elevated, this exits the
-    # current (non-admin) process.
-    ensure_admin_or_warn()
-    hide_attached_console()
-    # Must be set BEFORE create_window so the first taskbar registration
-    # uses our identity instead of python.exe's.
+    # In a frozen build, the embedded UAC manifest already enforced
+    # elevation on launch — we'll always be admin here. Dev launches
+    # (`python ui.py`) get a warning if not admin so the user knows
+    # in-game hotkeys won't fire.
+    if not is_frozen():
+        warn_if_not_admin()
+    # Persist display name + icon for our AppID so the taskbar right-click
+    # / hover label reads "Genshin Rhythm Bot". Then bind this process to
+    # that AppID before any window is created so the first taskbar
+    # registration uses our identity. Both still useful even with a
+    # custom .exe — the per-window stamp in _on_shown is the authoritative
+    # override but these set the floor.
+    _register_app_id(str(ICON_PATH) if ICON_PATH.exists() else None)
     _set_app_user_model_id()
 
     if not INDEX_PATH.exists():
