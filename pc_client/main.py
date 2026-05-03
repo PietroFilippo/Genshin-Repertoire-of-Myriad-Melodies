@@ -6,6 +6,7 @@ import threading
 import ctypes
 import ctypes.wintypes
 import sys
+from collections import deque
 
 from config import (KEYS, DEBUG_MODE, PIXEL_THRESHOLD, KEY_POLL_DELAY_S,
                     Y_SAMPLE_OFFSETS,
@@ -166,9 +167,57 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
     """
     window_open = False
 
+    # Preview geometry — fixed once per call, since capture_region is too.
+    # Drawing overlays on the preview (post-resize) instead of the native
+    # frame avoids the "tiny illegible cluster in the corner" artifact:
+    # native fontScale=1 text on a 1920-wide frame became ~6px tall after
+    # the resize, which the user then saw stretched + blurred in the
+    # window. Drawing post-resize keeps text crisp at the displayed size.
+    #
+    # Also crop the captured frame to a band around the hit line before
+    # resize. The full client area includes the game's top HUD (combo
+    # counter, score, etc.) which has nothing to do with detection and
+    # otherwise leaks into the preview as visual noise. The band keeps
+    # ~70% of the lane height above the hit line (enough context to see
+    # notes falling) plus a small margin below it.
+    PREVIEW_W = 640
+    LOG_PANEL_W = 180        # dedicated strip right of the lane image
+    CANVAS_W = PREVIEW_W + LOG_PANEL_W
+    BAND_ABOVE_PCT = 0.50    # ~half the captured height above the hit
+                             # line. Tight enough to drop the game's
+                             # top-of-screen HUD (combo counter / score)
+                             # while keeping enough lane context to see
+                             # incoming notes
+    BAND_BELOW_PX = 90       # extends through the game's own A/S/D/J/K/L
+                             # column key indicators below the hit line —
+                             # no need to draw our own labels since the
+                             # game already shows them
+    band_top = max(0, hit_line_y
+                   - int(capture_region["height"] * BAND_ABOVE_PCT))
+    band_bottom = min(capture_region["height"],
+                      hit_line_y + BAND_BELOW_PX)
+    band_h = band_bottom - band_top
+
+    viz_scale = PREVIEW_W / capture_region["width"]
+    preview_h = int(band_h * viz_scale)
+    preview_col_x = [int(cx * viz_scale) for cx in column_centers]
+    preview_hit_y = int((hit_line_y - band_top) * viz_scale)
+    band_size = (PREVIEW_W, preview_h)
+    initial_window_size = (CANVAS_W, preview_h + 40)  # +40 for titlebar
+
+    # Live log tail — DOWN/UP transitions of detector.pressed, displayed in
+    # the viz window so the user can see real-time keypresses without
+    # alt-tabbing to the UI's Logs tab. The log panel lives in its own
+    # right-side strip so it never overlaps the lane (the L column would
+    # otherwise sit underneath it).
+    LOG_MAX = max(6, (preview_h - 30) // 16)
+    log_lines = deque(maxlen=LOG_MAX)
+    prev_pressed = {k: False for k in KEYS}
+
     def open_window():
         cv2.namedWindow("Vision Context", cv2.WINDOW_NORMAL)
         cv2.setWindowProperty("Vision Context", cv2.WND_PROP_TOPMOST, 1)
+        cv2.resizeWindow("Vision Context", *initial_window_size)
         cv2.moveWindow("Vision Context", 0, 0)
 
     def close_window():
@@ -214,26 +263,53 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             screenshot = sct.grab(capture_region)
             frame = np.ascontiguousarray(np.array(screenshot)[:, :, :3])
 
-            # Hit line
-            cv2.line(frame, (0, hit_line_y), (capture_region["width"], hit_line_y),
-                     (0, 0, 255), 2)
+            # Sample blue values at native resolution BEFORE the crop /
+            # resize — the preview's interpolation would smear the readout.
+            blue_vals = []
+            for cx in column_centers:
+                if (0 <= hit_line_y < frame.shape[0]
+                        and 0 <= cx < frame.shape[1]):
+                    blue_vals.append(int(frame[hit_line_y, cx, 0]))
+                else:
+                    blue_vals.append(-1)
 
-            # Per-column overlays - strip dots match the actual sample points.
-            for i, cx in enumerate(column_centers):
-                cv2.line(frame, (cx, 0), (cx, capture_region["height"]),
-                         (255, 0, 0), 1)
+            # Crop to the lane band (drops the game's top HUD).
+            band = frame[band_top:band_bottom, :, :]
+
+            # Detect KEY DOWN/UP transitions and append to the live log tail.
+            now_ts = time.strftime('%H:%M:%S')
+            for k in KEYS:
+                cur = detector.pressed[k]
+                if cur != prev_pressed[k]:
+                    arrow = 'DOWN' if cur else 'UP'
+                    log_lines.append((cur, f"[{now_ts}] {k.upper()} {arrow}"))
+                    prev_pressed[k] = cur
+
+            band_resized = cv2.resize(band, band_size)
+
+            # Composite: lane image on the left (now extends past the hit
+            # line so the game's own A/S/D/J/K/L column letters are
+            # visible), log strip on the right.
+            canvas = np.zeros((preview_h, CANVAS_W, 3), dtype=np.uint8)
+            canvas[:, :PREVIEW_W] = band_resized
+
+            # Hit line + column verticals — drawn on the canvas's lane
+            # area at native preview pixel sizes so they stay crisp.
+            cv2.line(canvas, (0, preview_hit_y), (PREVIEW_W, preview_hit_y),
+                     (0, 0, 255), 2)
+            for i, cx in enumerate(preview_col_x):
+                cv2.line(canvas, (cx, 0), (cx, preview_h), (255, 0, 0), 1)
                 is_pressed = detector.pressed[KEYS[i]]
                 dot_color = (0, 0, 255) if is_pressed else (0, 255, 0)
-                for dy in Y_SAMPLE_OFFSETS:
-                    y = hit_line_y + dy
-                    if 0 <= y < frame.shape[0]:
-                        cv2.circle(frame, (cx, y), 4, dot_color, -1)
-                        cv2.circle(frame, (cx, y), 4, (255, 255, 255), 1)
-                if 0 <= hit_line_y < frame.shape[0] and 0 <= cx < frame.shape[1]:
-                    blue_val = int(frame[hit_line_y, cx, 0])
-                    cv2.putText(frame, f"B:{blue_val}",
-                                (cx - 20, hit_line_y - 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                # Single dot at hit line — the multi-offset strip clusters
+                # to within 1-2px on the preview anyway.
+                cv2.circle(canvas, (cx, preview_hit_y), 5, dot_color, -1)
+                cv2.circle(canvas, (cx, preview_hit_y), 5, (255, 255, 255), 1)
+                if blue_vals[i] >= 0:
+                    cv2.putText(canvas, f"B:{blue_vals[i]}",
+                                (cx - 22, preview_hit_y - 14),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                                (255, 255, 255), 1)
 
             curr_time = time.time()
             fps = 1.0 / (curr_time - last_time) if curr_time - last_time > 0 else 0
@@ -243,19 +319,31 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
                     fps_callback(fps)
                 except Exception:
                     pass
-            cv2.putText(frame, f"Viz FPS: {fps:.1f}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, f"Threshold: B < {PIXEL_THRESHOLD}",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(frame,
-                        f"Per-key {KEY_POLL_DELAY_S*1000:.0f}ms, strip {Y_SAMPLE_OFFSETS}",
-                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
-            scale_factor = 400 / capture_region["width"]
-            target_height = int(capture_region["height"] * scale_factor)
+            # Header overlays — top-left, on the lane image.
+            cv2.rectangle(canvas, (4, 4), (180, 70), (0, 0, 0), -1)
+            cv2.putText(canvas, f"FPS: {fps:.1f}", (10, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(canvas, f"B < {PIXEL_THRESHOLD}", (10, 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(canvas,
+                        f"poll {KEY_POLL_DELAY_S*1000:.0f}ms",
+                        (10, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (0, 255, 255), 1)
+
+            # Live key-log panel — right strip, fully outside the lane
+            # image so it never overlaps the columns.
+            log_x = PREVIEW_W + 8
+            cv2.putText(canvas, "Key log", (log_x, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            for n, (is_down, text) in enumerate(log_lines):
+                color = (80, 200, 255) if is_down else (160, 160, 160)
+                cv2.putText(canvas, text,
+                            (log_x, 36 + n * 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+
             cv2.setWindowProperty("Vision Context", cv2.WND_PROP_TOPMOST, 1)
-            preview = cv2.resize(frame, (400, target_height))
-            cv2.imshow("Vision Context", preview)
+            cv2.imshow("Vision Context", canvas)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 if stop_evt is not None:
