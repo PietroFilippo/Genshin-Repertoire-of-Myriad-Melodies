@@ -35,13 +35,39 @@ def is_frozen():
     return getattr(sys, 'frozen', False)
 
 
+def _appdata_settings_dir():
+    """`%APPDATA%\\GenshinRhythmBot` (Roaming). Falls back to
+    `~/AppData/Roaming/GenshinRhythmBot` if APPDATA is unset."""
+    base = os.environ.get('APPDATA')
+    if base:
+        return Path(base) / 'GenshinRhythmBot'
+    return Path.home() / 'AppData' / 'Roaming' / 'GenshinRhythmBot'
+
+
 def settings_path():
-    """User-writable settings file. For the bundled .exe, sit next to the
-    executable (onedir folder is user-writable). For dev launches, sit
-    next to the source script."""
+    """User-writable settings file. For the bundled .exe, live under
+    `%APPDATA%\\GenshinRhythmBot` so the download folder stays clean and
+    settings survive a re-extract / move of the .exe. For dev launches,
+    sit next to the source script (gitignored)."""
     if is_frozen():
-        return Path(sys.executable).parent / 'ui_settings.json'
+        path = _appdata_settings_dir() / 'ui_settings.json'
+        _migrate_legacy_settings(path)
+        return path
     return Path(__file__).parent / 'ui_settings.json'
+
+
+def _migrate_legacy_settings(new_path):
+    """One-shot move: pre-AppData builds wrote `ui_settings.json` next to
+    the .exe. If that legacy file exists and the new location does not,
+    move it so existing users keep their keybinds without re-binding."""
+    try:
+        legacy = Path(sys.executable).parent / 'ui_settings.json'
+        if legacy.exists() and not new_path.exists():
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(new_path)
+            print(f"[ui] migrated settings: {legacy} -> {new_path}")
+    except Exception as e:
+        print(f"[ui] settings migration skipped: {e}")
 
 
 # MessageBoxW flags.
