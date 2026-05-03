@@ -154,6 +154,17 @@ class AlbumRunner:
             raise RuntimeError(f"failed to load template: {path}")
         return img
 
+    def _stop_wait(self, secs):
+        """Cancellable sleep. Blocks up to `secs` and returns True if
+        `stop_evt` fired during the wait. Use everywhere a plain
+        `time.sleep` would otherwise stall the album loop after the user
+        hits Stop — the worst offenders (post-click waits, long template
+        polls) used to hold the worker thread for tens of seconds before
+        noticing stop_evt."""
+        if secs <= 0:
+            return self.stop_evt.is_set()
+        return self.stop_evt.wait(secs)
+
     # --- screen / coord helpers --------------------------------------------
 
     def _grab(self):
@@ -181,28 +192,36 @@ class AlbumRunner:
         (HID mickeys != screen pixels at non-default settings)."""
         pt = ctypes.wintypes.POINT()
         for _ in range(max_iters):
+            if self.stop_evt.is_set():
+                return False
             ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
             dx = target_x - pt.x
             dy = target_y - pt.y
             if abs(dx) <= tol and abs(dy) <= tol:
                 return True
             self.controller.mouse_move(dx, dy)
-            time.sleep(0.04)
+            if self._stop_wait(0.04):
+                return False
         return False
 
     def _click_screen(self, sx, sy):
         converged = self._move_cursor_to(int(sx), int(sy))
+        if self.stop_evt.is_set():
+            return
         pt = ctypes.wintypes.POINT()
         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
         print(f"    click target=({int(sx)},{int(sy)}), "
               f"final=({pt.x},{pt.y}), converged={converged}")
         # Longer hover + click hold than synthetic clicks need; some games
-        # debounce sub-100ms presses or treat them as "tap-cancel".
-        time.sleep(0.15)
+        # debounce sub-100ms presses or treat them as "tap-cancel". Sleeps
+        # are cancellable; if stop fires after mouse_down we still issue
+        # mouse_up so the Arduino doesn't end the run with the button held.
+        if self._stop_wait(0.15):
+            return
         self.controller.mouse_down('left')
-        time.sleep(0.10)
+        self._stop_wait(0.10)
         self.controller.mouse_up('left')
-        time.sleep(0.15)
+        self._stop_wait(0.15)
 
     def _click_ref(self, ref_x, ref_y):
         self._click_screen(*self._ref_to_screen(ref_x, ref_y))
@@ -290,36 +309,50 @@ class AlbumRunner:
 
     def _wait_for(self, tpl_key, ref_roi, timeout=5.0, present=True):
         """Poll until template is present (or absent) in `ref_roi`. Returns
-        True iff the desired state is reached within timeout."""
+        True iff the desired state is reached within timeout. Stop-aware:
+        bails immediately on stop_evt (returns False)."""
         end = time.time() + timeout
         while time.time() < end:
+            if self.stop_evt.is_set():
+                return False
             frame = self._grab()
             roi = self._ref_rect_to_local(*ref_roi)
             found = self._match(frame, self.tpl[tpl_key], roi=roi) is not None
             if found == present:
                 return True
-            time.sleep(0.2)
+            if self._stop_wait(0.2):
+                return False
         return False
 
     # --- per-song flow ------------------------------------------------------
 
     def _next_song(self):
         self._click_ref(*ALBUM_NEXT_SONG_XY)
-        time.sleep(0.8)
+        self._stop_wait(0.8)
 
     def _wait_for_album_page(self, timeout=60.0):
+        """Poll up to `timeout` for the album page anchor. Worst-case
+        blocker for stop-responsiveness (60s default), so the poll uses
+        stop-aware sleep."""
         end = time.time() + timeout
         while time.time() < end:
+            if self.stop_evt.is_set():
+                return False
             if self._on_album_page():
                 return True
-            time.sleep(0.5)
+            if self._stop_wait(0.5):
+                return False
         return False
 
     def _play_song(self):
         # album page → difficulty selection
         self._click_ref(*ALBUM_GO_PERFORM_XY)
+        if self.stop_evt.is_set():
+            return False
         if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
                               timeout=5.0, present=True):
+            if self.stop_evt.is_set():
+                return False
             print("  ERROR: difficulty screen never appeared "
                   "(Go Perform click missed?). Aborting song.")
             self._dump_frame('postclick_go_perform')
@@ -328,16 +361,22 @@ class AlbumRunner:
         # pick difficulty card
         dx, dy = ALBUM_DIFFICULTY_COORDS[self.difficulty]
         self._click_ref(dx, dy)
-        time.sleep(0.3)
+        if self._stop_wait(0.3):
+            return False
 
         # start rhythm minigame; verify we left the diff screen
         self._click_ref(*ALBUM_BEGIN_PERFORMANCE_XY)
+        if self.stop_evt.is_set():
+            return False
         if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
                               timeout=5.0, present=False):
+            if self.stop_evt.is_set():
+                return False
             print("  ERROR: still on difficulty screen after Begin "
                   "Performance click. Aborting song.")
             return False
-        time.sleep(0.8)
+        if self._stop_wait(0.8):
+            return False
 
         # Fire up rhythm detector. Watcher signals end-of-song by clicking
         # the "Select Song" button when the results screen appears.
@@ -428,13 +467,23 @@ class AlbumRunner:
             if viz_thread is not None:
                 viz_thread.join(timeout=2.0)
 
-        time.sleep(2.0)
+        self._stop_wait(2.0)
         return True
 
     def _end_watcher(self, stop_evt):
-        while not stop_evt.is_set():
-            if stop_evt.wait(ALBUM_END_POLL_S):
-                return
+        # `stop_evt` is the local watcher signal (passed by _play_song).
+        # Tick the wait at 0.2s so the watcher reacts to either the
+        # local signal OR the runner's global stop_evt within 200ms,
+        # while the actual Select-Song match still runs only every
+        # ALBUM_END_POLL_S seconds. (Plain stop_evt.wait(5.0) would
+        # ignore self.stop_evt for the full 5s.)
+        while not stop_evt.is_set() and not self.stop_evt.is_set():
+            end = time.time() + ALBUM_END_POLL_S
+            while time.time() < end:
+                if stop_evt.wait(0.2):
+                    return
+                if self.stop_evt.is_set():
+                    return
             res = self._find_select_song()
             if res is not None:
                 _, (cx, cy) = res
@@ -502,6 +551,8 @@ class AlbumRunner:
 
             print("  playing")
             if not self._play_song():
+                if self.stop_evt.is_set():
+                    break
                 print("  aborting album (state machine broke; check coords).")
                 return
 
@@ -521,9 +572,12 @@ class AlbumRunner:
                     print("  clicking Select Song (results screen after pause)")
                     _, (cx, cy) = res
                     self._click_local(cx, cy)
-                    time.sleep(2.0)
+                    if self._stop_wait(2.0):
+                        break
 
             if not self._wait_for_album_page(timeout=60.0):
+                if self.stop_evt.is_set():
+                    break
                 print("  WARN: never returned to album page; stopping")
                 return
 
