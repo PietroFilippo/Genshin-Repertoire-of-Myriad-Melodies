@@ -252,13 +252,10 @@ window.updateStatus = function updateStatus(data) {
     debugCb.disabled = !running;
     if (!running && debugCb.checked) debugCb.checked = false;
 
-    // Pause/Debug rebind buttons follow the same gating.
-    document.querySelectorAll('.hk-row[data-action="pause"] .rebind').forEach((b) => {
-        b.disabled = !running;
-    });
-    document.querySelectorAll('.hk-row[data-action="debug"] .rebind').forEach((b) => {
-        b.disabled = !running;
-    });
+    // Rebind buttons stay enabled regardless of bot state — user can
+    // configure hotkeys without first starting the bot. The hotkeys
+    // themselves are still inert when the bot is off (runtime gate in
+    // ui.py:_hotkey_pause / _hotkey_debug).
 };
 
 function renderKeybinds(kb) {
