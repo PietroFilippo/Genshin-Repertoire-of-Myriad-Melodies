@@ -513,6 +513,24 @@ class BridgeApi:
                 self._opts['mode'] = mode
         return True
 
+    def restart_in_mode(self, mode):
+        """Live mode switch from the JS layer. If the bot is running,
+        stops it and immediately starts a fresh worker in `mode`. If
+        idle, just records the new mode (same as set_mode). Returns True
+        if a worker is running in `mode` after the call."""
+        if mode not in ('standalone', 'album'):
+            return False
+        with self._lock:
+            self._opts['mode'] = mode
+            opts = dict(self._opts)
+        opts.pop('mode', None)
+        if not self._bot.is_running():
+            return True
+        ok = self._bot.restart_in_mode(mode, opts)
+        if not ok:
+            print(f'[ui] restart_in_mode({mode}) failed')
+        return bool(ok)
+
     def set_songs(self, n):
         try:
             n = int(n)

@@ -415,6 +415,9 @@ class BotController:
         self._debug_evt = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
+        # Serializes restart_in_mode against itself so rapid mode-radio
+        # toggles don't interleave a stop+start with another stop+start.
+        self._restart_lock = threading.Lock()
         self._timer_boosted = False
         self.state = self.STATE_IDLE
         self._mode = ''
@@ -480,6 +483,21 @@ class BotController:
         else:
             self._debug_evt.set()
         self._emit({'debug': self._debug_evt.is_set()})
+
+    def restart_in_mode(self, mode, options):
+        """Live mode switch. Stops the running worker (blocking up to 5s
+        for clean exit), then starts a fresh one in `mode`. Returns True
+        on successful start. Used by the UI's mode radio when toggled
+        while the bot is running so the user doesn't have to manually
+        Stop → flip → Start. Serialized via _restart_lock so rapid
+        toggles don't race two stop+start sequences against each other."""
+        with self._restart_lock:
+            if self.is_running():
+                self.stop()
+                t = self._thread
+                if t is not None:
+                    t.join(timeout=5.0)
+            return self.start(mode, options)
 
     def shutdown(self):
         """Final teardown — called on UI close. Stop the bot and wait."""

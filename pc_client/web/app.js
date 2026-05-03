@@ -58,18 +58,51 @@ function modeIsAlbum() {
     return $('input[name="mode"][value="album"]').checked;
 }
 
-function applyModeUi() {
+function applyAlbumDisabledState() {
     const album = modeIsAlbum();
     const card = $('#album-card');
     card.classList.toggle('disabled', !album);
     $$('#album-card input, #album-card select, #album-card button').forEach((el) => {
         el.disabled = !album;
     });
-    callApi('set_mode', album ? 'album' : 'standalone');
+}
+
+function applyModeUi() {
+    applyAlbumDisabledState();
+    callApi('set_mode', modeIsAlbum() ? 'album' : 'standalone');
+}
+
+function onModeRadioChange() {
+    const newMode = modeIsAlbum() ? 'album' : 'standalone';
+    const status = STATE.lastStatus || {};
+    const running = status.state === 'running' || status.state === 'paused';
+    const oldMode = status.mode;
+
+    // Confirm only when leaving album mid-run — that's the case where
+    // the user loses song progress. Standalone has no per-song state to
+    // protect, and switching INTO album from idle/standalone is cheap.
+    if (running && oldMode === 'album' && newMode !== 'album') {
+        const ok = window.confirm(
+            'Switching modes will abort the current album song. Continue?');
+        if (!ok) {
+            // Revert the radio to album without re-triggering this handler.
+            const r = $('input[name="mode"][value="album"]');
+            if (r) r.checked = true;
+            applyAlbumDisabledState();
+            return;
+        }
+    }
+
+    applyAlbumDisabledState();
+    if (running) {
+        callApi('restart_in_mode', newMode);
+    } else {
+        callApi('set_mode', newMode);
+    }
 }
 
 $$('input[name="mode"]').forEach((r) => {
-    r.addEventListener('change', applyModeUi);
+    r.addEventListener('change', onModeRadioChange);
 });
 
 $('#songs').addEventListener('change', () => {
