@@ -345,10 +345,32 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             cv2.setWindowProperty("Vision Context", cv2.WND_PROP_TOPMOST, 1)
             cv2.imshow("Vision Context", canvas)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                if stop_evt is not None:
-                    stop_evt.set()
-                break
+            key = cv2.waitKey(1) & 0xFF
+            # X-button close — cv2 destroys the window; getWindowProperty
+            # returns < 1 once it's gone. Treat the same as 'q'.
+            try:
+                visible = cv2.getWindowProperty(
+                    "Vision Context", cv2.WND_PROP_VISIBLE)
+            except cv2.error:
+                visible = 0
+            user_closed = (key == ord('q')) or (visible < 1)
+
+            if user_closed:
+                if debug_evt is not None:
+                    # UI mode: closing the viz window only turns debug
+                    # off, it does not stop the bot. Clearing debug_evt
+                    # also flips the UI checkbox via the status drain.
+                    debug_evt.clear()
+                    if window_open:
+                        close_window()
+                        window_open = False
+                    # Fall through to top of loop → idle branch.
+                    continue
+                else:
+                    # CLI / no debug toggle — only way out is 'q'.
+                    if stop_evt is not None:
+                        stop_evt.set()
+                    break
 
     if window_open:
         close_window()
