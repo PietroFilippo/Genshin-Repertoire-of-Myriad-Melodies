@@ -35,11 +35,15 @@
                     <span class="radio-mark"></span>
                     <span>Standalone</span>
                 </label>
+                <span class="help" tabindex="0" aria-label="Standalone mode info"
+                      data-help="Runs the rhythm detector indefinitely on whatever song is currently playing. Start it after you've manually opened a song.">?</span>
                 <label class="radio">
                     <input type="radio" name="mode" value="album">
                     <span class="radio-mark"></span>
                     <span>Album</span>
                 </label>
+                <span class="help" tabindex="0" aria-label="Album mode info"
+                      data-help="Auto-plays one country album page (Mondstadt / Liyue / Inazuma / ...) end to end. Open the country album page first, then press Start.">?</span>
             </div>
         </fieldset>
 
@@ -68,17 +72,25 @@
             </div>
         </fieldset>
 
-        <label class="checkbox">
-            <input type="checkbox" id="replay-canorus">
-            <span class="check-mark"></span>
-            <span>Replay songs already at Canorus</span>
-        </label>
+        <div class="row checkbox-row">
+            <label class="checkbox">
+                <input type="checkbox" id="replay-canorus">
+                <span class="check-mark"></span>
+                <span>Replay songs already at Canorus</span>
+            </label>
+            <span class="help" tabindex="0" aria-label="Replay-canorus info"
+                  data-help="When enabled, every song in the album is played even if it's already at Canorus rank. Disabled = skip already-Canorus'd songs to save time.">?</span>
+        </div>
 
-        <label class="checkbox">
-            <input type="checkbox" id="debug">
-            <span class="check-mark"></span>
-            <span>Show debug visualization</span>
-        </label>
+        <div class="row checkbox-row">
+            <label class="checkbox">
+                <input type="checkbox" id="debug">
+                <span class="check-mark"></span>
+                <span>Show debug visualization</span>
+            </label>
+            <span class="help" tabindex="0" aria-label="Debug visualization info"
+                  data-help="Opens an OpenCV preview window showing the rhythm lane, sample dots, blue-channel readouts, FPS, and a live key-press log. Useful for tuning; small CPU cost.">?</span>
+        </div>
 
         <div class="bottom-row">
             <fieldset class="card hotkeys">

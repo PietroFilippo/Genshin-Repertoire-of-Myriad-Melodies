@@ -543,3 +543,85 @@ button {
 ::-webkit-scrollbar-thumb:hover {
     background: #555;
 }
+
+/* --- help tooltips ------------------------------------------------------ */
+
+.help {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-card);
+    color: var(--text-dim);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: help;
+    user-select: none;
+    position: relative;
+    flex-shrink: 0;
+    transition: color 0.12s ease, border-color 0.12s ease;
+}
+
+.help:hover, .help:focus-visible {
+    color: var(--text);
+    border-color: var(--text-dim);
+    outline: 0;
+}
+
+/* Tooltip body — drops below the icon. pointer-events:none means moving
+   onto the tooltip itself doesn't keep it open; natural dismiss when
+   the cursor leaves the icon. */
+.help::after {
+    content: attr(data-help);
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: 240px;
+    padding: 8px 10px;
+    background: var(--bg-card-elev);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 12px;
+    font-weight: normal;
+    line-height: 1.4;
+    white-space: normal;
+    text-align: left;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.15s ease, visibility 0.15s ease;
+    z-index: 100;
+}
+
+/* Caret pointing up at the icon. */
+.help::before {
+    content: '';
+    position: absolute;
+    top: calc(100% + 3px);
+    left: 50%;
+    transform: translateX(-50%);
+    border: 5px solid transparent;
+    border-bottom-color: var(--border-strong);
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.15s ease, visibility 0.15s ease;
+}
+
+.help:hover::after, .help:focus-visible::after,
+.help:hover::before, .help:focus-visible::before {
+    opacity: 1;
+    visibility: visible;
+}
+
+/* Wrap a checkbox + help icon so they sit on one row. */
+.checkbox-row {
+    gap: 8px;
+}
