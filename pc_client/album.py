@@ -67,7 +67,7 @@ ROI_BEGIN_PERFORMANCE = (970, 975, 320, 75)
 class AlbumRunner:
     def __init__(self, replay_canorus=False, difficulty=ALBUM_DIFFICULTY,
                  stop_evt=None, pause_evt=None, debug_evt=None,
-                 status_cb=None):
+                 status_cb=None, mid_song_start=False):
         """
         Args:
             stop_evt: external Event — when set, abort cleanly. UI uses this
@@ -82,11 +82,20 @@ class AlbumRunner:
                 time without restarting the bot.
             status_cb: optional callable(dict) — emits status updates so
                 the UI can mirror state ('state', 'song', 'fps', ...).
+            mid_song_start: when True, the runner assumes a song is
+                already in progress on screen (e.g. user switched from
+                standalone → album mid-song). The first iteration skips
+                the album-page check, the canorus check, and the entire
+                Go Perform → difficulty → Begin Performance click chain
+                — it spins up the detector + end-watcher directly on the
+                song already playing, then proceeds with the normal
+                album loop from song 2 onwards.
         """
         if difficulty not in ALBUM_DIFFICULTY_COORDS:
             raise ValueError(f"unknown difficulty: {difficulty!r}")
         self.replay_canorus = replay_canorus
         self.difficulty = difficulty
+        self.mid_song_start = bool(mid_song_start)
         self.stop_evt = stop_evt if stop_evt is not None else threading.Event()
         self.pause_evt = pause_evt if pause_evt is not None else threading.Event()
         self.debug_evt = debug_evt if debug_evt is not None else threading.Event()
@@ -344,39 +353,47 @@ class AlbumRunner:
                 return False
         return False
 
-    def _play_song(self):
-        # album page → difficulty selection
-        self._click_ref(*ALBUM_GO_PERFORM_XY)
-        if self.stop_evt.is_set():
-            return False
-        if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
-                              timeout=5.0, present=True):
+    def _play_song(self, skip_intro=False):
+        # Intro click chain — album page → difficulty selection → rhythm
+        # minigame. Skipped when the runner was started mid-song (the
+        # song is already on screen, only the detector + end-watcher
+        # need to attach).
+        if not skip_intro:
+            # album page → difficulty selection
+            self._click_ref(*ALBUM_GO_PERFORM_XY)
             if self.stop_evt.is_set():
                 return False
-            print("  ERROR: difficulty screen never appeared "
-                  "(Go Perform click missed?). Aborting song.")
-            self._dump_frame('postclick_go_perform')
-            return False
+            if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
+                                  timeout=5.0, present=True):
+                if self.stop_evt.is_set():
+                    return False
+                print("  ERROR: difficulty screen never appeared "
+                      "(Go Perform click missed?). Aborting song.")
+                self._dump_frame('postclick_go_perform')
+                return False
 
-        # pick difficulty card
-        dx, dy = ALBUM_DIFFICULTY_COORDS[self.difficulty]
-        self._click_ref(dx, dy)
-        if self._stop_wait(0.3):
-            return False
+            # pick difficulty card
+            dx, dy = ALBUM_DIFFICULTY_COORDS[self.difficulty]
+            self._click_ref(dx, dy)
+            if self._stop_wait(0.3):
+                return False
 
-        # start rhythm minigame; verify we left the diff screen
-        self._click_ref(*ALBUM_BEGIN_PERFORMANCE_XY)
-        if self.stop_evt.is_set():
-            return False
-        if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
-                              timeout=5.0, present=False):
+            # start rhythm minigame; verify we left the diff screen
+            self._click_ref(*ALBUM_BEGIN_PERFORMANCE_XY)
             if self.stop_evt.is_set():
                 return False
-            print("  ERROR: still on difficulty screen after Begin "
-                  "Performance click. Aborting song.")
-            return False
-        if self._stop_wait(0.8):
-            return False
+            if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
+                                  timeout=5.0, present=False):
+                if self.stop_evt.is_set():
+                    return False
+                print("  ERROR: still on difficulty screen after Begin "
+                      "Performance click. Aborting song.")
+                return False
+            if self._stop_wait(0.8):
+                return False
+        else:
+            print("  mid-song hand-off — skipping intro, attaching "
+                  "detector to the song already in progress")
 
         # Fire up rhythm detector. Watcher signals end-of-song by clicking
         # the "Select Song" button when the results screen appears.
@@ -518,15 +535,22 @@ class AlbumRunner:
             songs_count = ALBUM_SONG_COUNT
         songs_count = max(1, min(int(songs_count), ALBUM_SONG_COUNT))
 
-        if not self._on_album_page():
-            print("ERROR: not on an album page. Open a country album "
-                  "(Fontaine / Liyue / Mondstadt / ...), NOT the All Albums grid.")
-            self._diagnose_album_page()
-            return
+        # Album-page check + canorus check require the album-page UI to
+        # be on screen. When mid_song_start is set, the user is mid-song
+        # in the rhythm minigame — neither check applies for the first
+        # iteration. Subsequent iterations land on the album page after
+        # _wait_for_album_page so the normal flow takes over.
+        if not self.mid_song_start:
+            if not self._on_album_page():
+                print("ERROR: not on an album page. Open a country album "
+                      "(Fontaine / Liyue / Mondstadt / ...), NOT the All Albums grid.")
+                self._diagnose_album_page()
+                return
 
         mode = "replay-canorus" if self.replay_canorus else "skip-on-canorus"
         print(f"Per-key {KEY_POLL_DELAY_S * 1000:.0f}ms, strip {Y_SAMPLE_OFFSETS}")
-        print(f"Album loop: {songs_count}/{ALBUM_SONG_COUNT} songs, "
+        start_msg = "mid-song hand-off, " if self.mid_song_start else ""
+        print(f"Album loop: {start_msg}{songs_count}/{ALBUM_SONG_COUNT} songs, "
               f"difficulty={self.difficulty}, {mode}")
 
         self._emit({'state': 'running', 'mode': 'album',
@@ -540,9 +564,11 @@ class AlbumRunner:
             if self.stop_evt.is_set():
                 break
 
+            mid_song_iter = (i == 0 and self.mid_song_start)
+
             print(f"\n--- Song {i+1}/{songs_count} ---")
             self._emit({'song': f'{i+1}/{songs_count}'})
-            if not self.replay_canorus:
+            if not self.replay_canorus and not mid_song_iter:
                 frame = self._grab()
                 if self._is_canorus(frame):
                     print("  skip — already canorus")
@@ -550,7 +576,7 @@ class AlbumRunner:
                     continue
 
             print("  playing")
-            if not self._play_song():
+            if not self._play_song(skip_intro=mid_song_iter):
                 if self.stop_evt.is_set():
                     break
                 print("  aborting album (state machine broke; check coords).")

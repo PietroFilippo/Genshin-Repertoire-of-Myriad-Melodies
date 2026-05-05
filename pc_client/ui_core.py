@@ -532,6 +532,7 @@ class BotController:
                 opts = self._mode_options
                 runner = AlbumRunner(replay_canorus=opts.get('replay_canorus', False),
                                      difficulty=opts.get('difficulty', ALBUM_DIFFICULTY),
+                                     mid_song_start=opts.get('mid_song_start', False),
                                      stop_evt=self._stop_evt,
                                      pause_evt=self._pause_evt,
                                      debug_evt=self._debug_evt,

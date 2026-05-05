@@ -524,6 +524,20 @@ class BridgeApi:
             self._opts['mode'] = mode
             opts = dict(self._opts)
         opts.pop('mode', None)
+
+        # Mid-song hand-off: switching from a running standalone session
+        # into album means the user is mid-song in the rhythm minigame
+        # and expects the album runner to keep playing the current song
+        # rather than navigate back to the album page. Tag the new run
+        # so AlbumRunner skips the Go Perform → difficulty → Begin
+        # Performance click chain on iter 0.
+        with self._status_lock:
+            old_mode = self._status.get('mode')
+            old_state = self._status.get('state')
+        if (mode == 'album' and old_mode == 'standalone'
+                and old_state == BotController.STATE_RUNNING):
+            opts['mid_song_start'] = True
+
         if not self._bot.is_running():
             return True
         ok = self._bot.restart_in_mode(mode, opts)
