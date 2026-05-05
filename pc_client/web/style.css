@@ -49,6 +49,7 @@ button {
     height: var(--titlebar-h);
     background: var(--bg);
     -webkit-user-select: none;
+    user-select: none;
 }
 
 .titlebar-drag {
@@ -297,6 +298,7 @@ button {
     padding: 0 8px;
     font-size: 13px;
     -moz-appearance: textfield;
+    appearance: textfield;
 }
 
 .spinbox input::-webkit-outer-spin-button,
