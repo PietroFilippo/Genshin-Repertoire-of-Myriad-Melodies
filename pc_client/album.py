@@ -90,11 +90,23 @@ class AlbumRunner:
                 — it spins up the detector + end-watcher directly on the
                 song already playing, then proceeds with the normal
                 album loop from song 2 onwards.
+            difficulty: one of 'normal' / 'hard' / 'pro' / 'legendary',
+                OR 'all' to run the album once per difficulty in
+                ascending order (normal → hard → pro → legendary, 4×12
+                songs total). Each cycle's canorus check is independent
+                because the canorus pill is per-difficulty in-game.
         """
-        if difficulty not in ALBUM_DIFFICULTY_COORDS:
+        if difficulty == 'all':
+            # Hard-coded order — Genshin's UI presents the cards left to
+            # right in this same sequence, so it matches the player's
+            # mental model.
+            self.difficulties = ['normal', 'hard', 'pro', 'legendary']
+        elif difficulty in ALBUM_DIFFICULTY_COORDS:
+            self.difficulties = [difficulty]
+        else:
             raise ValueError(f"unknown difficulty: {difficulty!r}")
         self.replay_canorus = replay_canorus
-        self.difficulty = difficulty
+        self.difficulty = self.difficulties[0]
         self.mid_song_start = bool(mid_song_start)
         self.stop_evt = stop_evt if stop_evt is not None else threading.Event()
         self.pause_evt = pause_evt if pause_evt is not None else threading.Event()
@@ -549,24 +561,59 @@ class AlbumRunner:
 
         mode = "replay-canorus" if self.replay_canorus else "skip-on-canorus"
         print(f"Per-key {KEY_POLL_DELAY_S * 1000:.0f}ms, strip {Y_SAMPLE_OFFSETS}")
-        start_msg = "mid-song hand-off, " if self.mid_song_start else ""
-        print(f"Album loop: {start_msg}{songs_count}/{ALBUM_SONG_COUNT} songs, "
-              f"difficulty={self.difficulty}, {mode}")
+        diffs = self.difficulties
+        if len(diffs) > 1:
+            print(f"Album loop: ALL difficulties {diffs}, "
+                  f"{songs_count}/{ALBUM_SONG_COUNT} songs each, {mode}")
+        else:
+            start_msg = "mid-song hand-off, " if self.mid_song_start else ""
+            print(f"Album loop: {start_msg}{songs_count}/{ALBUM_SONG_COUNT} songs, "
+                  f"difficulty={diffs[0]}, {mode}")
 
         self._emit({'state': 'running', 'mode': 'album',
                     'song': f'0/{songs_count}'})
 
+        # Outer loop over difficulties. Single-difficulty case loops once.
+        # The 12-song wheel returns to its starting slot after 12
+        # next-song clicks, so each cycle starts on the same song the
+        # previous cycle started on — no manual reset required.
+        for diff_idx, diff in enumerate(diffs):
+            if self.stop_evt.is_set():
+                break
+            self.difficulty = diff
+            if diff_idx > 0:
+                print(f"\n=== Difficulty cycle {diff_idx+1}/{len(diffs)}: "
+                      f"{diff} ===")
+                self._emit({'song': f'0/{songs_count}'})
+
+            # Only the very first cycle's first song can be a mid-song
+            # hand-off; everything past that goes through normal flow.
+            mid_song_first = self.mid_song_start and diff_idx == 0
+
+            if not self._run_one_album(songs_count, mid_song_first):
+                # Returned False = stop fired or unrecoverable state
+                # error. Either way, bail out of the difficulty loop.
+                break
+
+        print("\nAlbum complete" if not self.stop_evt.is_set() else "\nAlbum stopped")
+        self._emit({'state': 'idle', 'fps': 0.0})
+
+    def _run_one_album(self, songs_count, mid_song_first_iter):
+        """Run one full album cycle at `self.difficulty`. Returns True if
+        the cycle completed normally (next difficulty can run); False if
+        stop fired or an unrecoverable state error happened."""
         for i in range(songs_count):
             if self.stop_evt.is_set():
                 print("\nstop requested — exiting album loop")
-                break
+                return False
             self._await_resume()
             if self.stop_evt.is_set():
-                break
+                return False
 
-            mid_song_iter = (i == 0 and self.mid_song_start)
+            mid_song_iter = (i == 0 and mid_song_first_iter)
 
-            print(f"\n--- Song {i+1}/{songs_count} ---")
+            print(f"\n--- Song {i+1}/{songs_count} "
+                  f"[{self.difficulty}] ---")
             self._emit({'song': f'{i+1}/{songs_count}'})
             if not self.replay_canorus and not mid_song_iter:
                 frame = self._grab()
@@ -578,15 +625,15 @@ class AlbumRunner:
             print("  playing")
             if not self._play_song(skip_intro=mid_song_iter):
                 if self.stop_evt.is_set():
-                    break
+                    return False
                 print("  aborting album (state machine broke; check coords).")
-                return
+                return False
 
             # Pause may have fired mid-song — _play_song aborted and we
             # land here. Wait at the boundary before clicking next-song.
             self._await_resume()
             if self.stop_evt.is_set():
-                break
+                return False
 
             # After a mid-song pause the rhythm game may have ended while
             # the bot was idle, leaving the results screen up (the watcher
@@ -599,18 +646,17 @@ class AlbumRunner:
                     _, (cx, cy) = res
                     self._click_local(cx, cy)
                     if self._stop_wait(2.0):
-                        break
+                        return False
 
             if not self._wait_for_album_page(timeout=60.0):
                 if self.stop_evt.is_set():
-                    break
+                    return False
                 print("  WARN: never returned to album page; stopping")
-                return
+                return False
 
             self._next_song()
 
-        print("\nAlbum complete" if not self.stop_evt.is_set() else "\nAlbum stopped")
-        self._emit({'state': 'idle', 'fps': 0.0})
+        return True
 
     def close(self):
         if getattr(self, '_saved_mouse', None) is not None:

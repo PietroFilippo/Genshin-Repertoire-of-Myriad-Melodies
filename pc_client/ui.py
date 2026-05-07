@@ -556,7 +556,9 @@ class BridgeApi:
         return True
 
     def set_difficulty(self, d):
-        if d in ALBUM_DIFFICULTY_COORDS:
+        # 'all' is a meta-value handled by AlbumRunner — runs the album
+        # once per real difficulty in ascending order.
+        if d == 'all' or d in ALBUM_DIFFICULTY_COORDS:
             with self._lock:
                 self._opts['difficulty'] = d
         return True
