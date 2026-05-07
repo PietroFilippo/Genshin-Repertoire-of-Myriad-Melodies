@@ -43,7 +43,7 @@
                     <span>Album</span>
                 </label>
                 <span class="help" tabindex="0" aria-label="Album mode info"
-                      data-help="Auto-plays one country album page (Mondstadt / Liyue / Inazuma / ...) end to end. Open the country album page first, then press Start. Pick a single difficulty, or pick All to run the whole album once per difficulty (Normal → Hard → Pro → Legendary, 4×12 songs). Tip: switching from Standalone → Album mode while a song is already playing skips the menu click-through and continues from the current song. If you want to start from the begining of the album, press the Stop button first, then switch to Album mode and press Start.">?</span>
+                      data-help="Auto-plays one country album page (Mondstadt / Liyue / Inazuma / ...) end to end. Open a country album page first, then press Start. Tip: switching Standalone → Album while a song is already playing picks up from the current song instead of going through the menu — press Stop first if you want to start from song 1. See the ? icons next to Songs and Difficulty for how those interact.">?</span>
             </div>
         </fieldset>
 
@@ -58,6 +58,8 @@
                         <button type="button" class="spinbox-down" data-target="songs">&#x25BC;</button>
                     </div>
                 </div>
+                <span class="help" tabindex="0" aria-label="Songs info"
+                      data-help="How many album song-slots to play before stopping. With one difficulty selected: exactly N songs. With All difficulties: N × 4 plays (each song at every difficulty). At 12 (full album) the song wheel rolls back to song 1 when done; partial runs leave the wheel at the last-played slot.">?</span>
             </div>
             <div class="row row-grid">
                 <label for="difficulty">Difficulty</label>
@@ -70,6 +72,8 @@
                         <option value="all">All (Normal → Legendary)</option>
                     </select>
                 </div>
+                <span class="help" tabindex="0" aria-label="Difficulty info"
+                      data-help="Pick one difficulty (Normal / Hard / Pro / Legendary) to play the album at that difficulty only. Pick All to cycle through every difficulty for the same song before moving to the next — e.g. song 1 Normal → Hard → Pro → Legendary, then song 2 Normal → ... With All, each song's canorus check is per-difficulty (skipped songs only skip the difficulty already at canorus).">?</span>
             </div>
         </fieldset>
 

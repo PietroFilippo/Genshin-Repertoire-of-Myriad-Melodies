@@ -175,7 +175,7 @@ button {
 
 .row-grid {
     display: grid;
-    grid-template-columns: 110px 1fr;
+    grid-template-columns: 110px 1fr auto;
     gap: 12px;
     align-items: center;
 }
@@ -626,4 +626,16 @@ button {
 /* Wrap a checkbox + help icon so they sit on one row. */
 .checkbox-row {
     gap: 8px;
+}
+
+/* Help icons that live at the right edge of a row (.row-grid third
+   column, .checkbox-row trailing slot) need their tooltip anchored to
+   the icon's right edge instead of centered, otherwise the 240px-wide
+   tooltip body overflows past the panel and gets clipped. The caret
+   stays centered on the icon — only the tooltip body shifts left. */
+.row-grid .help::after,
+.checkbox-row .help::after {
+    left: auto;
+    right: 0;
+    transform: none;
 }
