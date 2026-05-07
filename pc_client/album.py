@@ -573,27 +573,19 @@ class AlbumRunner:
         self._emit({'state': 'running', 'mode': 'album',
                     'song': f'0/{songs_count}'})
 
-        # Outer loop over difficulties. Single-difficulty case loops once.
-        # The 12-song wheel returns to its starting slot after 12
-        # next-song clicks, so each cycle starts on the same song the
-        # previous cycle started on — no manual reset required.
-        for diff_idx, diff in enumerate(diffs):
-            if self.stop_evt.is_set():
-                break
-            self.difficulty = diff
-            if diff_idx > 0:
-                print(f"\n=== Difficulty cycle {diff_idx+1}/{len(diffs)}: "
-                      f"{diff} ===")
-                self._emit({'song': f'0/{songs_count}'})
-
-            # Only the very first cycle's first song can be a mid-song
-            # hand-off; everything past that goes through normal flow.
-            mid_song_first = self.mid_song_start and diff_idx == 0
-
-            if not self._run_one_album(songs_count, mid_song_first):
-                # Returned False = stop fired or unrecoverable state
-                # error. Either way, bail out of the difficulty loop.
-                break
+        if len(diffs) == 1:
+            # Single-difficulty: keep the legacy flat loop. Each song
+            # gets one next-song click after it (so 12-song runs cycle
+            # the wheel cleanly; partial runs leave the wheel at the
+            # song-after-the-last-played).
+            self.difficulty = diffs[0]
+            self._run_one_album(songs_count, self.mid_song_start)
+        else:
+            # All-difficulties: iterate song positions in the outer
+            # loop, difficulties in the inner loop. Wheel only advances
+            # between positions, not between difficulties at the same
+            # position, so each song is played once per difficulty.
+            self._run_all_difficulties(songs_count)
 
         print("\nAlbum complete" if not self.stop_evt.is_set() else "\nAlbum stopped")
         self._emit({'state': 'idle', 'fps': 0.0})
@@ -657,6 +649,103 @@ class AlbumRunner:
             self._next_song()
 
         return True
+
+    def _run_all_difficulties(self, songs_count):
+        """Per-position cycle through all configured difficulties.
+
+        Outer loop = song position (1..songs_count). Inner loop =
+        difficulty. The wheel advances ONLY between positions, not
+        between difficulties at the same position — that way each
+        song-slot is played once per difficulty. Click rules:
+
+          - Between difficulties at the same position: no next-song.
+          - Between positions: one next-song click.
+          - After the last position: one extra next-song click ONLY
+            when songs_count == ALBUM_SONG_COUNT (12), which rolls the
+            wheel back to its starting slot. Partial runs leave the
+            wheel at the last-played position.
+
+        Examples:
+          songs_count=1  -> 0 next-song clicks total (stays at song 1
+            for all 4 difficulties).
+          songs_count=12 -> 11 inter-position clicks + 1 final = 12
+            clicks total, wheel cycles back to the starting song.
+
+        Canorus skip is per-difficulty: skipping at one difficulty just
+        moves to the next difficulty for the same position; the wheel
+        does not advance.
+        """
+        diffs = self.difficulties
+
+        for i in range(songs_count):
+            if self.stop_evt.is_set():
+                print("\nstop requested — exiting album loop")
+                return
+            self._await_resume()
+            if self.stop_evt.is_set():
+                return
+
+            for d_idx, diff in enumerate(diffs):
+                if self.stop_evt.is_set():
+                    return
+                self._await_resume()
+                if self.stop_evt.is_set():
+                    return
+
+                self.difficulty = diff
+                mid_song_iter = (i == 0 and d_idx == 0
+                                 and self.mid_song_start)
+
+                print(f"\n--- Song {i+1}/{songs_count} [{diff}] ---")
+                self._emit({'song': f'{i+1}/{songs_count} [{diff}]'})
+
+                if not self.replay_canorus and not mid_song_iter:
+                    frame = self._grab()
+                    if self._is_canorus(frame):
+                        print(f"  skip — already canorus at {diff}")
+                        continue   # next difficulty; do NOT advance wheel
+
+                print("  playing")
+                if not self._play_song(skip_intro=mid_song_iter):
+                    if self.stop_evt.is_set():
+                        return
+                    print("  aborting album (state machine broke; check coords).")
+                    return
+
+                self._await_resume()
+                if self.stop_evt.is_set():
+                    return
+
+                # Mid-song pause may have left the results screen up.
+                if not self._on_album_page():
+                    res = self._find_select_song()
+                    if res is not None:
+                        print("  clicking Select Song (results screen after pause)")
+                        _, (cx, cy) = res
+                        self._click_local(cx, cy)
+                        if self._stop_wait(2.0):
+                            return
+
+                if not self._wait_for_album_page(timeout=60.0):
+                    if self.stop_evt.is_set():
+                        return
+                    print("  WARN: never returned to album page; stopping")
+                    return
+
+                # Intentionally NO _next_song here — next iter of the
+                # difficulty loop plays the same song at the next diff.
+
+            # All difficulties for this position done. Advance wheel to
+            # the next position UNLESS this was the last one.
+            if i < songs_count - 1:
+                self._next_song()
+
+        # Final wheel reset: only when the user ran the full 12-song
+        # album. The 12th next-song click cycles the wheel back to the
+        # starting song slot. Partial runs leave the wheel where it is.
+        if not self.stop_evt.is_set() and songs_count == ALBUM_SONG_COUNT:
+            print("\nrolling wheel back to first song")
+            self._next_song()
 
     def close(self):
         if getattr(self, '_saved_mouse', None) is not None:
