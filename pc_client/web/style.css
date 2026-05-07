@@ -628,13 +628,15 @@ button {
     gap: 8px;
 }
 
-/* Help icons that live at the right edge of a row (.row-grid third
-   column, .checkbox-row trailing slot) need their tooltip anchored to
-   the icon's right edge instead of centered, otherwise the 240px-wide
-   tooltip body overflows past the panel and gets clipped. The caret
-   stays centered on the icon — only the tooltip body shifts left. */
-.row-grid .help::after,
-.checkbox-row .help::after {
+/* Help icons in `.row-grid` sit pinned to the panel's right edge
+   (third grid column = auto). A centered 240px tooltip would overflow
+   off the right side of the panel, so anchor it to the icon's right
+   edge — the tooltip body shifts left while the caret stays centered.
+   `.checkbox-row` icons are NOT at the panel's right edge (they sit
+   right after a short checkbox label) so they keep the default
+   centered tooltip — anchoring them right would clip the tooltip
+   off the panel's LEFT edge instead. */
+.row-grid .help::after {
     left: auto;
     right: 0;
     transform: none;
