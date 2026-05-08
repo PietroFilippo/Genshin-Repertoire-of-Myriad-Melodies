@@ -58,7 +58,70 @@ def _strip_motw_under(root):
 if getattr(sys, 'frozen', False):
     _strip_motw_under(sys._MEIPASS)
 
+import keyboard
+import mouse
+import keyboard._winkeyboard as _kb_winbackend
+import mouse._winmouse as _ms_winbackend
 import webview
+
+
+# --- LL-hook capture ---------------------------------------------------------
+# The `keyboard` + `mouse` packages each install a global low-level hook
+# (WH_KEYBOARD_LL / WH_MOUSE_LL) via SetWindowsHookEx and never expose
+# the handle, so we can't call UnhookWindowsHookEx ourselves. They DO
+# register an atexit cleanup, but:
+#   - mouse passes the right handle, but atexit fires after WebView2 +
+#     Python finish their teardown — i.e. AFTER the user's mouse has
+#     already been laggy for a second.
+#   - keyboard's atexit is buggy (passes the callback object instead of
+#     the HHOOK), so UnhookWindowsHookEx fails silently and the keyboard
+#     hook only goes away when the OS reclaims the dying process.
+#
+# Workaround: monkey-patch SetWindowsHookEx in both backends *before*
+# any hotkey is registered so we capture the HHOOK as the libraries
+# install their hooks. Then in detach() we call UnhookWindowsHookEx
+# directly while the host is still alive, dropping both LL hooks
+# before WebView2's slow shutdown begins. Sub-50 ms vs ~1 s of mouse
+# lag.
+
+_captured_ll_hooks = {'kb': None, 'mouse': None}
+
+
+def _wrap_set_hook(real_setter, slot):
+    def wrapped(*args, **kwargs):
+        handle = real_setter(*args, **kwargs)
+        if handle:
+            _captured_ll_hooks[slot] = handle
+        return handle
+    return wrapped
+
+
+_kb_winbackend.SetWindowsHookEx = _wrap_set_hook(
+    _kb_winbackend.SetWindowsHookEx, 'kb')
+_ms_winbackend.SetWindowsHookEx = _wrap_set_hook(
+    _ms_winbackend.SetWindowsHookEx, 'mouse')
+
+
+def _release_ll_hooks():
+    """Drop the captured WH_KEYBOARD_LL / WH_MOUSE_LL hooks. Returns
+    a (kb_ok, mouse_ok) tuple for diagnostics. Idempotent — second
+    call no-ops."""
+    user32 = ctypes.windll.user32
+    user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+    user32.UnhookWindowsHookEx.restype = ctypes.wintypes.BOOL
+    results = []
+    for slot in ('kb', 'mouse'):
+        h = _captured_ll_hooks.get(slot)
+        if not h:
+            results.append(None)
+            continue
+        try:
+            ok = bool(user32.UnhookWindowsHookEx(h))
+        except Exception:
+            ok = False
+        _captured_ll_hooks[slot] = None
+        results.append(ok)
+    return tuple(results)
 
 import ui_core
 from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
@@ -417,6 +480,10 @@ class BridgeApi:
         self._settings = load_settings()
         self._lock = threading.Lock()
         self._stopping = False
+        # Set to True after detach() runs so the closing+closed event
+        # pair doesn't double-tear-down (closing fires first, closed
+        # follows after the window destroys).
+        self._detached = False
 
         # Live UI form state — kept in sync via the set_* methods so the
         # hotkey worker thread (which can't reach the JS layer) has a
@@ -466,6 +533,14 @@ class BridgeApi:
         self._drain_stop = threading.Event()
         self._drain_thread = None
 
+        # Seed _status with the live macro snapshot — without this the
+        # first drain tick (50 ms after attach) overwrites whatever the
+        # JS init() pulled via get_initial_state with the empty defaults
+        # above, so the Macros tab looks blank until something fires
+        # _emit(). After this seed the drain pushes actual slot info on
+        # tick 1.
+        self._enqueue_status(self._macro.snapshot())
+
     # ---- lifecycle hooks called from main() ----
 
     def attach_window(self, window):
@@ -481,11 +556,35 @@ class BridgeApi:
 
     def detach(self):
         """Tear down on window close. Restore stdio first so any teardown
-        prints land on the original streams."""
+        prints land on the original streams. Idempotent — `closing` and
+        `closed` events both call this and only the first call does
+        work."""
+        if self._detached:
+            return
+        self._detached = True
         sys.stdout = self._orig_stdout
         sys.stderr = self._orig_stderr
         self._stopping = True
         self._drain_stop.set()
+
+        # FIRST: drop the actual Win32 LL hooks via the captured handles.
+        # This is the move that kills the mouse-lag-on-close — once the
+        # WH_MOUSE_LL hook is gone, system mouse events stop routing
+        # through our process, so it doesn't matter how slow the rest
+        # of teardown (WebView2, pythonnet, etc) is.
+        _release_ll_hooks()
+
+        # Then drop subscribers from the keyboard/mouse packages so any
+        # in-flight callbacks don't see torn-down state.
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        try:
+            mouse.unhook_all()
+        except Exception:
+            pass
+
         try:
             self._keybinds.clear_all()
         except Exception:
@@ -990,6 +1089,10 @@ class BridgeApi:
 
 def _on_closed(api):
     api.detach()
+    # Natural Python shutdown follows — the LL hooks were already
+    # unhooked from `closing` (or here, if `closing` didn't fire).
+    # WebView2 + pythonnet take 500-1500 ms to tear down but the
+    # mouse no longer cares because its hook is already gone.
 
 
 def _on_shown(api, icon_path):
@@ -1099,6 +1202,23 @@ def main():
     )
 
     api.attach_window(window)
+    # Hook `closing` (fires before WebView2/Edge starts its own shutdown)
+    # so we can release the keyboard / mouse subscribers + signal threads
+    # to stop while the host browser is still alive. `closed` fires after
+    # the OS has destroyed the window — by then WebView2 has been
+    # tearing down for hundreds of ms, holding its own input hooks.
+    # Doing cleanup early gives the LL hooks a chance to come down
+    # before the slow part starts.
+    def _safe_closing():
+        try:
+            api.detach()
+        except Exception as e:
+            print(f"[ui] detach in closing: {e}")
+    try:
+        window.events.closing += lambda: _safe_closing()
+    except Exception:
+        # Older pywebview without `closing` — fall through to closed.
+        pass
     window.events.closed += lambda: _on_closed(api)
     # Apply the icon on both shown (WPF surface visible) and loaded (page
     # content done). Some pywebview backends fire shown before native is

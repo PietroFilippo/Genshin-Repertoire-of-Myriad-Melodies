@@ -298,11 +298,19 @@ $$('.slot').forEach((btn) => {
             callApi('macro_load_slot', n);
         } else if (macroSlotMode === 'save') {
             const existing = slotNameOf(n);
+            if (occupied) {
+                const label = existing ? `"${existing}"` : 'a saved macro';
+                if (!confirm(
+                    `Slot ${n} already contains ${label}. ` +
+                    `Overwrite with the current macro?`)) {
+                    return;
+                }
+            }
             const promptMsg = occupied
                 ? `Overwrite slot ${n} — name (leave blank for none):`
                 : `Save to slot ${n} — name (leave blank for none):`;
             const name = window.prompt(promptMsg, existing);
-            if (name === null) return;   // cancelled
+            if (name === null) return;   // cancelled at name prompt
             callApi('macro_save_slot', n, name);
         } else if (macroSlotMode === 'rename') {
             if (!occupied) return;
