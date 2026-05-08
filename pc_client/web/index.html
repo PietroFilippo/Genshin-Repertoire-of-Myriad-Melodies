@@ -158,20 +158,21 @@
                 <span class="macro-mode-label">On click:</span>
                 <button type="button" class="macro-mode-btn macro-mode-active" data-mode="load">Load</button>
                 <button type="button" class="macro-mode-btn" data-mode="save">Save</button>
+                <button type="button" class="macro-mode-btn" data-mode="rename">Rename</button>
                 <button type="button" class="macro-mode-btn" data-mode="clear">Clear</button>
                 <span class="help" tabindex="0" aria-label="Slot info"
-                      data-help="Pick a click-mode then tap a slot. Load reads slot N into the current macro buffer. Save writes the current buffer to slot N (overwriting). Clear deletes slot N. Filled slots show in solid color; empty slots are outlined.">?</span>
+                      data-help="Pick a click-mode then tap a slot. Load reads slot N into the current macro buffer (the loaded slot gets a yellow ring). Save prompts for a name and writes the current buffer to slot N. Rename changes a saved slot's name without touching its events. Clear deletes slot N. Filled slots glow accent-blue with their name shown; empty slots are dim and tagged 'empty'.">?</span>
             </div>
             <div class="slot-grid">
-                <button type="button" class="slot" data-slot="1">1</button>
-                <button type="button" class="slot" data-slot="2">2</button>
-                <button type="button" class="slot" data-slot="3">3</button>
-                <button type="button" class="slot" data-slot="4">4</button>
-                <button type="button" class="slot" data-slot="5">5</button>
-                <button type="button" class="slot" data-slot="6">6</button>
-                <button type="button" class="slot" data-slot="7">7</button>
-                <button type="button" class="slot" data-slot="8">8</button>
-                <button type="button" class="slot" data-slot="9">9</button>
+                <button type="button" class="slot" data-slot="1"><span class="slot-num">1</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="2"><span class="slot-num">2</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="3"><span class="slot-num">3</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="4"><span class="slot-num">4</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="5"><span class="slot-num">5</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="6"><span class="slot-num">6</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="7"><span class="slot-num">7</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="8"><span class="slot-num">8</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="9"><span class="slot-num">9</span><span class="slot-name">empty</span></button>
             </div>
             <div class="macro-pending" id="macro-pending"></div>
         </fieldset>

@@ -282,16 +282,35 @@ $$('.macro-mode-btn').forEach((btn) => {
     });
 });
 
+function slotNameOf(n) {
+    const map = (STATE.lastStatus && STATE.lastStatus.macro_slot_names) || {};
+    // pywebview JSONifies dict keys as strings; normalize lookup.
+    return map[n] || map[String(n)] || '';
+}
+
 $$('.slot').forEach((btn) => {
     btn.addEventListener('click', () => {
         const n = parseInt(btn.dataset.slot, 10);
         if (Number.isNaN(n)) return;
+        const occupied = btn.classList.contains('slot-occupied');
         if (macroSlotMode === 'load') {
+            if (!occupied) return;
             callApi('macro_load_slot', n);
         } else if (macroSlotMode === 'save') {
-            callApi('macro_save_slot', n);
+            const existing = slotNameOf(n);
+            const promptMsg = occupied
+                ? `Overwrite slot ${n} — name (leave blank for none):`
+                : `Save to slot ${n} — name (leave blank for none):`;
+            const name = window.prompt(promptMsg, existing);
+            if (name === null) return;   // cancelled
+            callApi('macro_save_slot', n, name);
+        } else if (macroSlotMode === 'rename') {
+            if (!occupied) return;
+            const existing = slotNameOf(n);
+            const name = window.prompt(`Rename slot ${n}:`, existing);
+            if (name === null) return;
+            callApi('macro_rename_slot', n, name);
         } else if (macroSlotMode === 'clear') {
-            const occupied = btn.classList.contains('slot-occupied');
             if (!occupied) return;
             if (confirm(`Clear macro slot ${n}? This cannot be undone.`)) {
                 callApi('macro_clear_slot', n);
@@ -332,22 +351,42 @@ $('#macro-play').addEventListener('click', () => {
 
 $('#macro-stop-play').addEventListener('click', () => callApi('macro_stop'));
 
-function renderMacroSlots(slots) {
+function renderMacroSlots(slots, namesMap, loadedSlot) {
     const occupied = new Set(slots || []);
+    const names = namesMap || {};
+    const loaded = parseInt(loadedSlot, 10) || 0;
     $$('.slot').forEach((btn) => {
         const n = parseInt(btn.dataset.slot, 10);
-        btn.classList.toggle('slot-occupied', occupied.has(n));
+        const isOcc = occupied.has(n);
+        btn.classList.toggle('slot-occupied', isOcc);
+        btn.classList.toggle('slot-loaded', isOcc && n === loaded);
+        const nameEl = btn.querySelector('.slot-name');
+        if (!nameEl) return;
+        if (!isOcc) {
+            nameEl.textContent = 'empty';
+            return;
+        }
+        const name = names[n] || names[String(n)] || '';
+        nameEl.textContent = name || 'saved';
     });
 }
 
-function renderMacroState(macroState, eventCount) {
+function renderMacroState(macroState, eventCount, loadedSlot, slotNames) {
     const statusEl = $('#macro-status');
     const recBtn = $('#macro-record');
     const playBtn = $('#macro-play');
     const stopBtn = $('#macro-stop-play');
     const events = eventCount || 0;
     const stateLabel = macroState || 'idle';
-    statusEl.textContent = `${stateLabel} · ${events} event${events === 1 ? '' : 's'}`;
+    const loaded = parseInt(loadedSlot, 10) || 0;
+    let suffix = '';
+    if (loaded > 0) {
+        const names = slotNames || {};
+        const name = names[loaded] || names[String(loaded)] || '';
+        suffix = name ? ` · slot ${loaded} (${name})` : ` · slot ${loaded}`;
+    }
+    statusEl.textContent =
+        `${stateLabel} · ${events} event${events === 1 ? '' : 's'}${suffix}`;
     statusEl.classList.toggle('macro-status-recording', stateLabel === 'recording');
     statusEl.classList.toggle('macro-status-playing', stateLabel === 'playing');
     recBtn.textContent = stateLabel === 'recording' ? 'Stop Recording' : 'Record';
@@ -412,10 +451,22 @@ window.updateStatus = function updateStatus(data) {
     }
     if ('keybinds' in data) renderKeybinds(data.keybinds);
 
-    if ('macro_state' in data || 'macro_events' in data) {
-        renderMacroState(data.macro_state, data.macro_events);
+    if ('macro_state' in data || 'macro_events' in data
+        || 'macro_loaded' in data || 'macro_slot_names' in data) {
+        renderMacroState(data.macro_state, data.macro_events,
+                         data.macro_loaded, data.macro_slot_names);
     }
-    if ('macro_slots' in data) renderMacroSlots(data.macro_slots);
+    if ('macro_slots' in data || 'macro_slot_names' in data
+        || 'macro_loaded' in data) {
+        // Slot names + loaded indicator may arrive in a later snapshot
+        // than the slot list itself, so always re-render with the most
+        // recent values from STATE.lastStatus rather than just `data`.
+        const last = STATE.lastStatus || {};
+        renderMacroSlots(
+            data.macro_slots || last.macro_slots || [],
+            data.macro_slot_names || last.macro_slot_names || {},
+            data.macro_loaded || last.macro_loaded || 0);
+    }
     if ('macro_pending' in data) renderMacroPending(data.macro_pending);
 
     // Sync debug checkbox without echoing back to Python.
@@ -506,6 +557,8 @@ function init() {
             macro_state: macroSnap.macro_state || 'idle',
             macro_events: macroSnap.macro_events || 0,
             macro_slots: macroSnap.macro_slots || [],
+            macro_slot_names: macroSnap.macro_slot_names || {},
+            macro_loaded: macroSnap.macro_loaded || 0,
             macro_pending: macroSnap.macro_pending || '',
         });
     });

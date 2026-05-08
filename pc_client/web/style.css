@@ -701,30 +701,36 @@ button {
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 2px;
+    gap: 3px;
     background: #181818;
     border: 1px dashed #3a3a3a;
     border-radius: 4px;
     color: #555;
-    padding: 10px 0 8px 0;
+    padding: 10px 4px 8px 4px;
     font-family: 'Cascadia Code', 'Consolas', monospace;
-    font-size: 16px;
-    font-weight: 700;
     opacity: 0.65;
+    overflow: hidden;
     transition: background 0.12s ease, border-color 0.12s ease,
-                color 0.12s ease, opacity 0.12s ease, transform 0.08s ease;
+                color 0.12s ease, opacity 0.12s ease, transform 0.08s ease,
+                box-shadow 0.12s ease;
 }
 
-/* Status tag below the slot number — "empty" vs "saved" makes the
-   state unmistakable even at a glance. */
-.slot::after {
-    content: 'empty';
-    display: block;
+.slot-num {
+    font-size: 16px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+.slot-name {
     font-size: 9px;
     font-weight: 500;
     letter-spacing: 0.5px;
     text-transform: uppercase;
     color: #4a4a4a;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .slot:hover {
@@ -745,10 +751,11 @@ button {
                 inset 0 0 14px rgba(91, 155, 213, 0.10);
 }
 
-.slot.slot-occupied::after {
-    content: 'saved';
+.slot.slot-occupied .slot-name {
     color: var(--accent);
     font-weight: 700;
+    text-transform: none;
+    letter-spacing: 0.2px;
 }
 
 .slot.slot-occupied:hover {
@@ -756,6 +763,19 @@ button {
                 rgba(91, 155, 213, 0.45),
                 rgba(91, 155, 213, 0.28));
     transform: translateY(-1px);
+}
+
+/* Loaded slot — the buffer in memory came from this slot. Yellow ring
+   on top of whatever the occupied state already paints. */
+.slot.slot-loaded {
+    border-color: #f5c25b;
+    box-shadow: 0 0 0 2px rgba(245, 194, 91, 0.55),
+                0 0 10px rgba(245, 194, 91, 0.30),
+                inset 0 0 14px rgba(91, 155, 213, 0.10);
+}
+
+.slot.slot-loaded .slot-num {
+    color: #f5c25b;
 }
 
 .macro-pending {

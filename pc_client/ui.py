@@ -441,6 +441,8 @@ class BridgeApi:
             'macro_state': MacroController.STATE_IDLE,
             'macro_events': 0,
             'macro_slots': [],
+            'macro_slot_names': {},
+            'macro_loaded': 0,
             'macro_pending': '',
         }
 
@@ -669,12 +671,12 @@ class BridgeApi:
     def macro_stop(self):
         return {'ok': bool(self._macro.stop_play())}
 
-    def macro_save_slot(self, n):
+    def macro_save_slot(self, n, name=None):
         try:
             n = int(n)
         except (TypeError, ValueError):
             return {'ok': False, 'reason': 'bad_slot'}
-        return {'ok': bool(self._macro.save_slot(n))}
+        return {'ok': bool(self._macro.save_slot(n, name=name))}
 
     def macro_load_slot(self, n):
         try:
@@ -689,6 +691,13 @@ class BridgeApi:
         except (TypeError, ValueError):
             return {'ok': False, 'reason': 'bad_slot'}
         return {'ok': bool(self._macro.clear_slot(n))}
+
+    def macro_rename_slot(self, n, name):
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return {'ok': False, 'reason': 'bad_slot'}
+        return {'ok': bool(self._macro.rename_slot(n, name))}
 
     def start_stop_force(self):
         """Same as start_stop but stops a running macro first. Called by

@@ -677,6 +677,11 @@ class MacroController:
         self._state = self.STATE_IDLE
         self._events = []
         self._start_ts = 0.0
+        # Slot the current buffer came from (set on load + save). Cleared
+        # when a fresh recording starts or the slot is deleted, so the UI
+        # never shows a stale "loaded: N" indicator pointing at a buffer
+        # that no longer matches the file.
+        self._loaded_slot = None
         self._kb_hook = None
         self._mouse_hook = None
         self._play_thread = None
@@ -709,12 +714,38 @@ class MacroController:
         return [n for n in range(1, 10)
                 if (d / f'macro_{n}.json').exists()]
 
+    def slot_names(self):
+        """Return {slot_n: name} for occupied slots. Names live inside
+        each slot file's `name` field; legacy bare-list files (from any
+        v1 saves before names landed) report '' so the UI shows the
+        generic 'saved' tag instead of a missing-name placeholder."""
+        d = macros_dir()
+        names = {}
+        if not d.exists():
+            return names
+        for n in range(1, 10):
+            p = d / f'macro_{n}.json'
+            if not p.exists():
+                continue
+            try:
+                with p.open('r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    names[n] = (data.get('name') or '').strip()
+                else:
+                    names[n] = ''
+            except Exception:
+                names[n] = ''
+        return names
+
     def snapshot(self):
         """Status fields the UI drain pushes to JS."""
         return {
             'macro_state': self._state,
             'macro_events': len(self._events),
             'macro_slots': self.list_slots(),
+            'macro_slot_names': self.slot_names(),
+            'macro_loaded': self._loaded_slot or 0,
             'macro_pending': self._pending_action or '',
         }
 
@@ -726,6 +757,9 @@ class MacroController:
                 print(f"[macro] cannot record — state is {self._state}")
                 return False
             self._events = []
+            # Fresh recording detaches the buffer from any loaded slot —
+            # the loaded indicator would lie about what's in memory.
+            self._loaded_slot = None
             self._start_ts = time.time()
             self._excluded_kb = {b.lower() for b in excluded_kb if b}
             self._excluded_mouse = {b.lower() for b in excluded_mouse if b}
@@ -828,7 +862,11 @@ class MacroController:
 
     # ---- slots ----
 
-    def save_slot(self, n):
+    def save_slot(self, n, name=None):
+        """Persist the current buffer to slot n. If `name` is None, the
+        existing slot's name is preserved (so a quick re-save doesn't
+        wipe a previously-set name); pass an explicit '' to clear the
+        name."""
         if not (1 <= int(n) <= 9):
             return False
         if self._state != self.STATE_IDLE:
@@ -838,15 +876,27 @@ class MacroController:
             print("[macro] nothing to save — record or load first")
             return False
         d = macros_dir()
+        n_int = int(n)
+        path = d / f'macro_{n_int}.json'
+        if name is None:
+            existing = self.slot_names().get(n_int, '')
+            final_name = existing
+        else:
+            final_name = self._normalize_name(name)
         try:
             d.mkdir(parents=True, exist_ok=True)
-            path = d / f'macro_{int(n)}.json'
+            payload = {'name': final_name, 'events': self._events}
             with path.open('w', encoding='utf-8') as f:
-                json.dump(self._events, f, indent=2)
-            print(f"[macro] saved {len(self._events)} events to slot {n}")
+                json.dump(payload, f, indent=2)
+            label = f' as {final_name!r}' if final_name else ''
+            print(f"[macro] saved {len(self._events)} events to slot "
+                  f"{n_int}{label}")
         except Exception as e:
-            print(f"[macro] save slot {n} failed: {e}")
+            print(f"[macro] save slot {n_int} failed: {e}")
             return False
+        # Buffer now matches slot N on disk — track it as "loaded" so
+        # the UI shows which slot the in-memory macro corresponds to.
+        self._loaded_slot = n_int
         self._emit()
         return True
 
@@ -857,20 +907,35 @@ class MacroController:
             print(f"[macro] cannot load while {self._state}")
             return False
         d = macros_dir()
-        path = d / f'macro_{int(n)}.json'
+        n_int = int(n)
+        path = d / f'macro_{n_int}.json'
         if not path.exists():
-            print(f"[macro] slot {n} is empty")
+            print(f"[macro] slot {n_int} is empty")
             return False
         try:
             with path.open('r', encoding='utf-8') as f:
                 data = json.load(f)
-            if not isinstance(data, list):
-                print(f"[macro] slot {n} malformed")
+            # Two on-disk shapes: legacy bare list (= events only, no
+            # name) or new dict {'name': str, 'events': list}.
+            if isinstance(data, list):
+                events = data
+                name = ''
+            elif isinstance(data, dict):
+                events = data.get('events', [])
+                name = (data.get('name') or '').strip()
+            else:
+                print(f"[macro] slot {n_int} malformed")
                 return False
-            self._events = data
-            print(f"[macro] loaded slot {n} ({len(self._events)} events)")
+            if not isinstance(events, list):
+                print(f"[macro] slot {n_int} malformed events")
+                return False
+            self._events = events
+            self._loaded_slot = n_int
+            label = f' ({name!r})' if name else ''
+            print(f"[macro] loaded slot {n_int}{label} "
+                  f"— {len(self._events)} events")
         except Exception as e:
-            print(f"[macro] load slot {n} failed: {e}")
+            print(f"[macro] load slot {n_int} failed: {e}")
             return False
         self._emit()
         return True
@@ -879,18 +944,69 @@ class MacroController:
         if not (1 <= int(n) <= 9):
             return False
         d = macros_dir()
-        path = d / f'macro_{int(n)}.json'
+        n_int = int(n)
+        path = d / f'macro_{n_int}.json'
         try:
             if path.exists():
                 path.unlink()
-                print(f"[macro] cleared slot {n}")
+                print(f"[macro] cleared slot {n_int}")
             else:
-                print(f"[macro] slot {n} already empty")
+                print(f"[macro] slot {n_int} already empty")
         except Exception as e:
-            print(f"[macro] clear slot {n} failed: {e}")
+            print(f"[macro] clear slot {n_int} failed: {e}")
+            return False
+        # If the cleared slot was the one in memory, drop the loaded tag
+        # — the buffer's events still exist but no longer correspond to
+        # any saved slot.
+        if self._loaded_slot == n_int:
+            self._loaded_slot = None
+        self._emit()
+        return True
+
+    def rename_slot(self, n, name):
+        """Update slot n's name in place. Does not touch events. Refuses
+        on empty slot (nothing to rename)."""
+        if not (1 <= int(n) <= 9):
+            return False
+        d = macros_dir()
+        n_int = int(n)
+        path = d / f'macro_{n_int}.json'
+        if not path.exists():
+            print(f"[macro] cannot rename slot {n_int} — empty")
+            return False
+        try:
+            with path.open('r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                events = data
+            elif isinstance(data, dict):
+                events = data.get('events', [])
+            else:
+                print(f"[macro] slot {n_int} malformed")
+                return False
+            if not isinstance(events, list):
+                print(f"[macro] slot {n_int} malformed events")
+                return False
+            new_name = self._normalize_name(name)
+            payload = {'name': new_name, 'events': events}
+            with path.open('w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2)
+            print(f"[macro] renamed slot {n_int} -> {new_name!r}"
+                  if new_name else f"[macro] cleared name on slot {n_int}")
+        except Exception as e:
+            print(f"[macro] rename slot {n_int} failed: {e}")
             return False
         self._emit()
         return True
+
+    @staticmethod
+    def _normalize_name(name):
+        """Strip whitespace + cap length so a runaway paste can't bloat
+        a slot file. 80 chars is enough for human-readable labels and
+        keeps the slot button from blowing out in the UI."""
+        if name is None:
+            return ''
+        return str(name).strip()[:80]
 
     # ---- save/load slot picker (driven by hotkeys) ----
 
