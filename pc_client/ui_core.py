@@ -311,6 +311,40 @@ def is_allowed_game_only():
     return proc in _GAME_EXE_NAMES
 
 
+def focus_game_window():
+    """Bring Genshin to the foreground. Used by UI buttons that fire
+    HID input into the game (macro Play) so the user doesn't have to
+    alt-tab between clicking and the keys arriving. Returns the focused
+    HWND, or 0 if the window wasn't found.
+
+    Three-step dance because Win32 fights us on each step:
+      1. ShowWindow(SW_RESTORE) — un-minimize.
+      2. BringWindowToTop — raise Z-order (cosmetic without focus).
+      3. SetForegroundWindow — actual focus. Windows blocks this from
+         background processes; the UI is the foreground app at the
+         moment the user clicks, so the call is allowed. If it still
+         returns 0 (some shell states refuse), fall back to the
+         undocumented SwitchToThisWindow which the alt-tab dialog uses
+         and which has fewer restrictions."""
+    user32 = ctypes.windll.user32
+    SW_RESTORE = 9
+    for title in GAME_WINDOW_TITLE:
+        hwnd = user32.FindWindowW(None, title)
+        if not hwnd:
+            continue
+        try:
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.BringWindowToTop(hwnd)
+            ok = user32.SetForegroundWindow(hwnd)
+            if not ok and hasattr(user32, 'SwitchToThisWindow'):
+                user32.SwitchToThisWindow(hwnd, True)
+        except Exception as e:
+            print(f"[ui] focus_game_window error: {e}")
+        return hwnd
+    return 0
+
+
 # --- keybind manager --------------------------------------------------------
 
 class KeybindManager:

@@ -69,9 +69,9 @@ from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
                      ACTION_MACRO_STOP, ACTION_PAUSE, ACTION_START_STOP,
                      BOT_ACTIONS, BotController, KeybindManager,
                      MACRO_ACTIONS, MacroController, QueueWriter,
-                     UI_WINDOW_TITLE, is_admin, is_frozen,
-                     js_event_to_hotkey, load_settings, save_settings,
-                     warn_if_not_admin)
+                     UI_WINDOW_TITLE, focus_game_window, is_admin,
+                     is_frozen, js_event_to_hotkey, load_settings,
+                     save_settings, warn_if_not_admin)
 
 
 def _resource_dir():
@@ -666,6 +666,13 @@ class BridgeApi:
             if not force:
                 return {'ok': False, 'reason': 'bot_running'}
             self._stop_bot_blocking()
+        # UI-button entry — user is in the UI, not the game. Pull
+        # Genshin to the foreground so HID keystrokes from playback
+        # land in the game, not the UI / desktop. Brief sleep covers
+        # the Win11 window-switch animation; without it the first
+        # event in a t≈0 macro can land on the UI window.
+        focus_game_window()
+        time.sleep(0.05)
         return {'ok': bool(self._macro.play())}
 
     def macro_stop(self):
