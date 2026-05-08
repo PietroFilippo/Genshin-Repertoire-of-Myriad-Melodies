@@ -142,7 +142,18 @@ $$('.spinbox-up, .spinbox-down').forEach((btn) => {
 
 // --- start/stop/pause ------------------------------------------------------
 
-$('#btn-start').addEventListener('click', () => callApi('start_stop'));
+$('#btn-start').addEventListener('click', () => {
+    // If a macro is busy and the bot is currently idle, this click would
+    // start the bot. Confirm so the user knows the macro will be killed.
+    if (!botIsRunning() && macroIsBusy()) {
+        const action = (STATE.lastStatus || {}).macro_state;
+        const verb = action === 'recording' ? 'recording' : 'macro playback';
+        if (!confirm(`A macro is ${verb}. Stop it and start the bot?`)) return;
+        callApi('start_stop_force');
+        return;
+    }
+    callApi('start_stop');
+});
 $('#btn-pause').addEventListener('click', () => callApi('pause'));
 
 // --- hotkey rebind ---------------------------------------------------------
@@ -153,27 +164,46 @@ $$('.hk-row').forEach((row) => {
     btn.addEventListener('click', () => beginCapture(action));
 });
 
+function captureMsgFor(action) {
+    // Each card has its own capture message line — find it via the row.
+    const row = document.querySelector(`.hk-row[data-action="${action}"]`);
+    if (!row) return null;
+    const card = row.closest('.card');
+    return card ? card.querySelector('.hk-capture-msg') : null;
+}
+
 function beginCapture(action) {
     if (STATE.capturing) return;
     STATE.capturing = action;
     const row = document.querySelector(`.hk-row[data-action="${action}"]`);
     row.querySelector('.rebind').textContent = '…';
-    $('#capture-msg').textContent = `Press a key to bind ${labelFor(action)} (Esc to cancel)…`;
+    const msg = captureMsgFor(action);
+    if (msg) {
+        msg.textContent =
+            `Press a key or mouse button to bind ${labelFor(action)} (Esc to cancel)…`;
+    }
 }
 
 function endCapture() {
     if (!STATE.capturing) return;
-    const row = document.querySelector(`.hk-row[data-action="${STATE.capturing}"]`);
+    const action = STATE.capturing;
+    const row = document.querySelector(`.hk-row[data-action="${action}"]`);
     if (row) row.querySelector('.rebind').textContent = 'Rebind';
+    const msg = captureMsgFor(action);
+    if (msg) msg.textContent = '';
     STATE.capturing = null;
-    $('#capture-msg').textContent = '';
 }
 
 function labelFor(action) {
     return ({
-        start_stop: 'Start/Stop',
-        pause: 'Pause/Resume',
-        debug: 'Toggle Debug',
+        start_stop:   'Start/Stop',
+        pause:        'Pause/Resume',
+        debug:        'Toggle Debug',
+        macro_record: 'Record/Stop',
+        macro_play:   'Play Macro',
+        macro_stop:   'Stop Playback',
+        macro_save:   'Save Slot',
+        macro_load:   'Load Slot',
     })[action] || action;
 }
 
@@ -211,6 +241,131 @@ window.addEventListener('keydown', (ev) => {
         ev.preventDefault();
     }
 }, true);
+
+// Mouse-button capture for hotkey rebind. Browser button index → mouse
+// package name: 0=left, 1=middle, 2=right, 3=x (back), 4=x2 (forward).
+// Edge/Chromium fires button 3 / 4 for the side buttons; if a mouse
+// doesn't expose them, the user can still rebind via keyboard.
+const _BROWSER_BUTTON_TO_NAME = ['left', 'middle', 'right', 'x', 'x2'];
+window.addEventListener('mousedown', (ev) => {
+    if (!STATE.capturing) return;
+    // Don't swallow clicks on the rebind button itself — the click that
+    // started capture also bubbles a mousedown here. Detect via the
+    // active capturing row's button.
+    const row = document.querySelector(
+        `.hk-row[data-action="${STATE.capturing}"]`);
+    if (row && ev.target.closest('.rebind') === row.querySelector('.rebind')) {
+        return;
+    }
+    const name = _BROWSER_BUTTON_TO_NAME[ev.button];
+    if (!name) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    callApi('rebind', STATE.capturing, { mouseButton: name })
+        .then(() => endCapture());
+}, true);
+// Also block contextmenu while capturing so right-click capture doesn't
+// pop the native menu.
+window.addEventListener('contextmenu', (ev) => {
+    if (STATE.capturing) ev.preventDefault();
+}, true);
+
+// --- macros panel ----------------------------------------------------------
+
+let macroSlotMode = 'load';   // 'load' | 'save' | 'clear'
+
+$$('.macro-mode-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        macroSlotMode = btn.dataset.mode;
+        $$('.macro-mode-btn').forEach((b) =>
+            b.classList.toggle('macro-mode-active', b === btn));
+    });
+});
+
+$$('.slot').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        const n = parseInt(btn.dataset.slot, 10);
+        if (Number.isNaN(n)) return;
+        if (macroSlotMode === 'load') {
+            callApi('macro_load_slot', n);
+        } else if (macroSlotMode === 'save') {
+            callApi('macro_save_slot', n);
+        } else if (macroSlotMode === 'clear') {
+            const occupied = btn.classList.contains('slot-occupied');
+            if (!occupied) return;
+            if (confirm(`Clear macro slot ${n}? This cannot be undone.`)) {
+                callApi('macro_clear_slot', n);
+            }
+        }
+    });
+});
+
+function botIsRunning() {
+    const s = STATE.lastStatus || {};
+    return s.state === 'running' || s.state === 'paused';
+}
+
+function macroIsBusy() {
+    const s = STATE.lastStatus || {};
+    return s.macro_state === 'recording' || s.macro_state === 'playing';
+}
+
+$('#macro-record').addEventListener('click', () => {
+    callApi('macro_toggle_record', false).then((res) => {
+        if (res && res.ok === false && res.reason === 'bot_running') {
+            if (confirm('The bot is running. Stop it and start recording?')) {
+                callApi('macro_toggle_record', true);
+            }
+        }
+    });
+});
+
+$('#macro-play').addEventListener('click', () => {
+    callApi('macro_play', false).then((res) => {
+        if (res && res.ok === false && res.reason === 'bot_running') {
+            if (confirm('The bot is running. Stop it and play the macro?')) {
+                callApi('macro_play', true);
+            }
+        }
+    });
+});
+
+$('#macro-stop-play').addEventListener('click', () => callApi('macro_stop'));
+
+function renderMacroSlots(slots) {
+    const occupied = new Set(slots || []);
+    $$('.slot').forEach((btn) => {
+        const n = parseInt(btn.dataset.slot, 10);
+        btn.classList.toggle('slot-occupied', occupied.has(n));
+    });
+}
+
+function renderMacroState(macroState, eventCount) {
+    const statusEl = $('#macro-status');
+    const recBtn = $('#macro-record');
+    const playBtn = $('#macro-play');
+    const stopBtn = $('#macro-stop-play');
+    const events = eventCount || 0;
+    const stateLabel = macroState || 'idle';
+    statusEl.textContent = `${stateLabel} · ${events} event${events === 1 ? '' : 's'}`;
+    statusEl.classList.toggle('macro-status-recording', stateLabel === 'recording');
+    statusEl.classList.toggle('macro-status-playing', stateLabel === 'playing');
+    recBtn.textContent = stateLabel === 'recording' ? 'Stop Recording' : 'Record';
+    recBtn.disabled = stateLabel === 'playing';
+    playBtn.disabled = stateLabel !== 'idle' || events === 0;
+    stopBtn.disabled = stateLabel !== 'playing';
+}
+
+function renderMacroPending(pending) {
+    const el = $('#macro-pending');
+    if (pending === 'save') {
+        el.textContent = 'Save: press 1-9 inside Genshin to choose a slot (Esc to cancel)';
+    } else if (pending === 'load') {
+        el.textContent = 'Load: press 1-9 inside Genshin to choose a slot (Esc to cancel)';
+    } else {
+        el.textContent = '';
+    }
+}
 
 // --- log pane --------------------------------------------------------------
 
@@ -257,6 +412,12 @@ window.updateStatus = function updateStatus(data) {
     }
     if ('keybinds' in data) renderKeybinds(data.keybinds);
 
+    if ('macro_state' in data || 'macro_events' in data) {
+        renderMacroState(data.macro_state, data.macro_events);
+    }
+    if ('macro_slots' in data) renderMacroSlots(data.macro_slots);
+    if ('macro_pending' in data) renderMacroPending(data.macro_pending);
+
     // Sync debug checkbox without echoing back to Python.
     if ('debug' in data) {
         const cb = $('#debug');
@@ -291,11 +452,26 @@ window.updateStatus = function updateStatus(data) {
     // ui.py:_hotkey_pause / _hotkey_debug).
 };
 
+const _MOUSE_DISPLAY = {
+    left: 'Left Click', right: 'Right Click', middle: 'Middle Click',
+    x: 'Mouse 4', x2: 'Mouse 5',
+};
+
+function displayBinding(binding) {
+    if (!binding) return '<unset>';
+    const m = /^mouse:(.+)$/i.exec(binding);
+    if (m) {
+        const name = m[1].toLowerCase();
+        return _MOUSE_DISPLAY[name] || `Mouse ${m[1]}`;
+    }
+    return binding;
+}
+
 function renderKeybinds(kb) {
     Object.entries(kb || {}).forEach(([action, hotkey]) => {
         const row = document.querySelector(`.hk-row[data-action="${action}"]`);
         if (!row) return;
-        row.querySelector('.hk-binding').textContent = hotkey || '<unset>';
+        row.querySelector('.hk-binding').textContent = displayBinding(hotkey);
     });
 }
 
@@ -316,7 +492,10 @@ function init() {
         if (typeof s.debug === 'boolean') $('#debug').checked = s.debug;
         if (s.keybinds) renderKeybinds(s.keybinds);
         applyModeUi();
-        // Initial status payload.
+        // Initial status payload — fold macro snapshot in so the
+        // Macros tab renders correctly without waiting for the first
+        // drain tick.
+        const macroSnap = s.macro || {};
         window.updateStatus({
             state: 'idle',
             song: '',
@@ -324,6 +503,10 @@ function init() {
             debug: !!s.debug,
             admin: !!s.admin,
             keybinds: s.keybinds || {},
+            macro_state: macroSnap.macro_state || 'idle',
+            macro_events: macroSnap.macro_events || 0,
+            macro_slots: macroSnap.macro_slots || [],
+            macro_pending: macroSnap.macro_pending || '',
         });
     });
 }

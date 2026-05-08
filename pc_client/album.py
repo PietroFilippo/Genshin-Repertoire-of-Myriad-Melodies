@@ -67,7 +67,7 @@ ROI_BEGIN_PERFORMANCE = (970, 975, 320, 75)
 class AlbumRunner:
     def __init__(self, replay_canorus=False, difficulty=ALBUM_DIFFICULTY,
                  stop_evt=None, pause_evt=None, debug_evt=None,
-                 status_cb=None, mid_song_start=False):
+                 status_cb=None, mid_song_start=False, controller=None):
         """
         Args:
             stop_evt: external Event — when set, abort cleanly. UI uses this
@@ -161,7 +161,12 @@ class AlbumRunner:
                 self.tpl[k] = cv2.resize(t, (nw, nh),
                                          interpolation=cv2.INTER_LINEAR)
 
-        self.controller = ArduinoHIDController()
+        if controller is not None:
+            self.controller = controller
+            self._owns_controller = False
+        else:
+            self.controller = ArduinoHIDController()
+            self._owns_controller = True
 
         print(f"Album: {self.region['width']}x{self.region['height']} @ "
               f"({self.region['left']},{self.region['top']}), "
@@ -755,10 +760,11 @@ class AlbumRunner:
             except Exception as e:
                 print(f"[warn] restore EPP: {e}")
             self._saved_mouse = None
-        try:
-            self.controller.close()
-        except Exception:
-            pass
+        if getattr(self, '_owns_controller', True):
+            try:
+                self.controller.close()
+            except Exception:
+                pass
 
 
 SPI_GETMOUSE = 0x0003

@@ -22,6 +22,7 @@
     <!-- Tab strip -->
     <nav class="tabs">
         <button class="tab tab-active" data-tab="main">Main</button>
+        <button class="tab" data-tab="macros">Macros</button>
         <button class="tab" data-tab="logs">Logs</button>
     </nav>
 
@@ -115,7 +116,7 @@
                     <span class="hk-binding">—</span>
                     <button type="button" class="rebind">Rebind</button>
                 </div>
-                <div class="hk-capture-msg" id="capture-msg"></div>
+                <div class="hk-capture-msg"></div>
             </fieldset>
 
             <fieldset class="card status">
@@ -135,6 +136,75 @@
                 </div>
             </fieldset>
         </div>
+    </section>
+
+    <!-- Macros tab -->
+    <section class="panel" data-panel="macros">
+        <fieldset class="card">
+            <legend>Macro</legend>
+            <div class="row macro-controls-row">
+                <button type="button" id="macro-record" class="btn-primary">Record</button>
+                <button type="button" id="macro-play" class="btn-secondary">Play</button>
+                <button type="button" id="macro-stop-play" class="btn-secondary" disabled>Stop</button>
+                <span class="macro-status" id="macro-status">idle &middot; 0 events</span>
+                <span class="help" tabindex="0" aria-label="Macro info"
+                      data-help="Record a sequence of keyboard + mouse actions inside Genshin and play it back via the Arduino. Recording captures input only while Genshin is focused; alt-tabbing to another app pauses capture. Hotkeys for record / play / stop / save / load also fire only inside the game.">?</span>
+            </div>
+        </fieldset>
+
+        <fieldset class="card">
+            <legend>Slots</legend>
+            <div class="row macro-mode-row">
+                <span class="macro-mode-label">On click:</span>
+                <button type="button" class="macro-mode-btn macro-mode-active" data-mode="load">Load</button>
+                <button type="button" class="macro-mode-btn" data-mode="save">Save</button>
+                <button type="button" class="macro-mode-btn" data-mode="clear">Clear</button>
+                <span class="help" tabindex="0" aria-label="Slot info"
+                      data-help="Pick a click-mode then tap a slot. Load reads slot N into the current macro buffer. Save writes the current buffer to slot N (overwriting). Clear deletes slot N. Filled slots show in solid color; empty slots are outlined.">?</span>
+            </div>
+            <div class="slot-grid">
+                <button type="button" class="slot" data-slot="1">1</button>
+                <button type="button" class="slot" data-slot="2">2</button>
+                <button type="button" class="slot" data-slot="3">3</button>
+                <button type="button" class="slot" data-slot="4">4</button>
+                <button type="button" class="slot" data-slot="5">5</button>
+                <button type="button" class="slot" data-slot="6">6</button>
+                <button type="button" class="slot" data-slot="7">7</button>
+                <button type="button" class="slot" data-slot="8">8</button>
+                <button type="button" class="slot" data-slot="9">9</button>
+            </div>
+            <div class="macro-pending" id="macro-pending"></div>
+        </fieldset>
+
+        <fieldset class="card hotkeys">
+            <legend>Macro Hotkeys</legend>
+            <div class="hk-row" data-action="macro_record">
+                <span class="hk-label">Record / Stop</span>
+                <span class="hk-binding">&mdash;</span>
+                <button type="button" class="rebind">Rebind</button>
+            </div>
+            <div class="hk-row" data-action="macro_play">
+                <span class="hk-label">Play</span>
+                <span class="hk-binding">&mdash;</span>
+                <button type="button" class="rebind">Rebind</button>
+            </div>
+            <div class="hk-row" data-action="macro_stop">
+                <span class="hk-label">Stop Playback</span>
+                <span class="hk-binding">&mdash;</span>
+                <button type="button" class="rebind">Rebind</button>
+            </div>
+            <div class="hk-row" data-action="macro_save">
+                <span class="hk-label">Save (1-9)</span>
+                <span class="hk-binding">&mdash;</span>
+                <button type="button" class="rebind">Rebind</button>
+            </div>
+            <div class="hk-row" data-action="macro_load">
+                <span class="hk-label">Load (1-9)</span>
+                <span class="hk-binding">&mdash;</span>
+                <button type="button" class="rebind">Rebind</button>
+            </div>
+            <div class="hk-capture-msg"></div>
+        </fieldset>
     </section>
 
     <!-- Logs tab -->

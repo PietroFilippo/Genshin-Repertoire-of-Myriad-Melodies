@@ -628,6 +628,143 @@ button {
     gap: 8px;
 }
 
+/* --- macros panel ------------------------------------------------------- */
+
+.macro-controls-row {
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.macro-controls-row button {
+    min-width: 90px;
+}
+
+.macro-status {
+    margin-left: auto;
+    color: var(--text-dim);
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 12px;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-card);
+}
+
+.macro-status-recording {
+    color: var(--danger);
+    border-color: var(--danger);
+}
+
+.macro-status-playing {
+    color: var(--success);
+    border-color: var(--success);
+}
+
+.macro-mode-row {
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.macro-mode-label {
+    color: var(--text-dim);
+    margin-right: 4px;
+}
+
+.macro-mode-btn {
+    background: var(--bg-card);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    color: var(--text-dim);
+    padding: 4px 14px;
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.macro-mode-btn:hover {
+    background: var(--bg-card-elev);
+    color: var(--text);
+}
+
+.macro-mode-btn.macro-mode-active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #0d1116;
+}
+
+.slot-grid {
+    display: grid;
+    grid-template-columns: repeat(9, 1fr);
+    gap: 6px;
+}
+
+.slot {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    background: #181818;
+    border: 1px dashed #3a3a3a;
+    border-radius: 4px;
+    color: #555;
+    padding: 10px 0 8px 0;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 16px;
+    font-weight: 700;
+    opacity: 0.65;
+    transition: background 0.12s ease, border-color 0.12s ease,
+                color 0.12s ease, opacity 0.12s ease, transform 0.08s ease;
+}
+
+/* Status tag below the slot number — "empty" vs "saved" makes the
+   state unmistakable even at a glance. */
+.slot::after {
+    content: 'empty';
+    display: block;
+    font-size: 9px;
+    font-weight: 500;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: #4a4a4a;
+}
+
+.slot:hover {
+    background: var(--bg-card-elev);
+    border-color: var(--text-dim);
+    color: var(--text-dim);
+    opacity: 0.85;
+}
+
+.slot.slot-occupied {
+    border: 1.5px solid var(--accent);
+    background: linear-gradient(180deg,
+                rgba(91, 155, 213, 0.32),
+                rgba(91, 155, 213, 0.18));
+    color: #ffffff;
+    opacity: 1;
+    box-shadow: 0 0 0 1px rgba(91, 155, 213, 0.20),
+                inset 0 0 14px rgba(91, 155, 213, 0.10);
+}
+
+.slot.slot-occupied::after {
+    content: 'saved';
+    color: var(--accent);
+    font-weight: 700;
+}
+
+.slot.slot-occupied:hover {
+    background: linear-gradient(180deg,
+                rgba(91, 155, 213, 0.45),
+                rgba(91, 155, 213, 0.28));
+    transform: translateY(-1px);
+}
+
+.macro-pending {
+    margin-top: 8px;
+    color: var(--accent);
+    font-size: 12px;
+    min-height: 14px;
+}
+
 /* Help icons in `.row-grid` sit pinned to the panel's right edge
    (third grid column = auto). A centered 240px tooltip would overflow
    off the right side of the panel, so anchor it to the icon's right
@@ -636,7 +773,9 @@ button {
    right after a short checkbox label) so they keep the default
    centered tooltip — anchoring them right would clip the tooltip
    off the panel's LEFT edge instead. */
-.row-grid .help::after {
+.row-grid .help::after,
+.macro-controls-row .help::after,
+.macro-mode-row .help::after {
     left: auto;
     right: 0;
     transform: none;

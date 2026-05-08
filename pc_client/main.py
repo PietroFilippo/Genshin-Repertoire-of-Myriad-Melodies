@@ -400,13 +400,19 @@ def set_dpi_aware():
         print(f"[warn] SetProcessDPIAware failed: {e}")
 
 
-def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None):
+def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
+                   controller=None):
     """Reusable standalone-mode entrypoint for the UI. Blocks until
     stop_evt is set. Caller handles DPI/timer setup.
 
     If pause_evt is provided and gets set, the detector is stopped
     (releasing all keys) and the function idles until pause_evt is
-    cleared. On resume a fresh detector is spun up."""
+    cleared. On resume a fresh detector is spun up.
+
+    `controller` lets the UI inject a long-lived ArduinoHIDController
+    shared across bot runs + the macro tool (only one process can hold
+    the COM port). When None (CLI path), a fresh controller is created
+    here and closed on exit."""
     detected = auto_detect(stop_evt=stop_evt)
     if detected is None:
         # Either game window unavailable, or stop fired during the
@@ -418,7 +424,9 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None):
         print("ERROR: lost game window after auto-detect.")
         return
 
-    controller = ArduinoHIDController()
+    own_controller = controller is None
+    if own_controller:
+        controller = ArduinoHIDController()
 
     fps_cb = None
     if status_cb:
@@ -464,7 +472,8 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None):
             print("[standalone] resumed")
             # Loop back to spin up a fresh detector.
     finally:
-        controller.close()
+        if own_controller:
+            controller.close()
         if status_cb:
             status_cb({'state': 'idle', 'fps': 0.0})
 

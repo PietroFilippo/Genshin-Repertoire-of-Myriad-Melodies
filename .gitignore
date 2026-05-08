@@ -38,4 +38,5 @@ Thumbs.db
 # Macro tool: user recordings and hotkey overrides (not source)
 pc_client/macro.json
 pc_client/macro_*.json
+pc_client/macros/
 pc_client/ui_settings.json

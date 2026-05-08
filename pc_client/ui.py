@@ -63,8 +63,12 @@ import webview
 import ui_core
 from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
                     ALBUM_SONG_COUNT)
-from ui_core import (ACTION_DEBUG, ACTION_PAUSE, ACTION_START_STOP,
-                     BotController, KeybindManager, QueueWriter,
+from controller import ArduinoHIDController
+from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
+                     ACTION_MACRO_RECORD, ACTION_MACRO_SAVE,
+                     ACTION_MACRO_STOP, ACTION_PAUSE, ACTION_START_STOP,
+                     BOT_ACTIONS, BotController, KeybindManager,
+                     MACRO_ACTIONS, MacroController, QueueWriter,
                      UI_WINDOW_TITLE, is_admin, is_frozen,
                      js_event_to_hotkey, load_settings, save_settings,
                      warn_if_not_admin)
@@ -434,13 +438,28 @@ class BridgeApi:
             'debug': False,
             'admin': is_admin(),
             'keybinds': dict(self._settings['keybinds']),
+            'macro_state': MacroController.STATE_IDLE,
+            'macro_events': 0,
+            'macro_slots': [],
+            'macro_pending': '',
         }
 
         self._log_queue = queue.Queue(maxsize=LOG_QUEUE_SIZE)
         self._orig_stdout = sys.stdout
         self._orig_stderr = sys.stderr
 
-        self._bot = BotController(self._enqueue_status)
+        # Single Arduino instance shared across the bot worker and the
+        # macro tool — only one process can hold the COM port. Lazy-built
+        # on first use so launching the UI without a board still loads
+        # the page (errors surface in the log when the user clicks
+        # Start / Record).
+        self._arduino = None
+        self._arduino_lock = threading.Lock()
+
+        self._bot = BotController(self._enqueue_status,
+                                  controller_provider=self._get_arduino)
+        self._macro = MacroController(controller_provider=self._get_arduino,
+                                      on_status=self._enqueue_status)
         self._keybinds = KeybindManager(self._ui_hwnd)
         self._drain_stop = threading.Event()
         self._drain_thread = None
@@ -470,9 +489,23 @@ class BridgeApi:
         except Exception:
             pass
         try:
+            self._macro.shutdown()
+        except Exception as e:
+            print(f"[ui] macro shutdown error: {e}")
+        try:
             self._bot.shutdown()
         except Exception as e:
             print(f"[ui] bot shutdown error: {e}")
+        # Close the shared Arduino last — both bot + macro have stopped
+        # by now so no more writes are coming.
+        with self._arduino_lock:
+            ard = self._arduino
+            self._arduino = None
+        if ard is not None:
+            try:
+                ard.close()
+            except Exception as e:
+                print(f"[ui] arduino close error: {e}")
 
     # ---- JS-callable methods ----
 
@@ -483,12 +516,20 @@ class BridgeApi:
                 'admin': is_admin(),
                 'keybinds': dict(self._settings['keybinds']),
                 'difficulties': list(ALBUM_DIFFICULTY_COORDS),
+                'macro': self._macro.snapshot(),
             }
 
     def start_stop(self):
         if self._bot.is_running():
             self._bot.stop()
             return True
+        if self._macro.is_busy():
+            # Hotkey path arrives here — JS path uses start_stop_force
+            # after a confirm prompt. Refuse so we never run the bot
+            # concurrently with a macro on the same Arduino.
+            print('[ui] macro is active — stop it first '
+                  '(or use the UI Start button to confirm)')
+            return False
         with self._lock:
             opts = dict(self._opts)
         mode = opts.pop('mode', 'standalone')
@@ -603,6 +644,79 @@ class BridgeApi:
             pass
         return True
 
+    # ---- macro (called from the Macros tab) ----
+
+    def macro_toggle_record(self, force=False):
+        """Start or stop recording. If the bot is running, refuse unless
+        `force` is set — JS prompts the user with window.confirm and
+        re-calls with force=True."""
+        if self._bot.is_running():
+            if not force:
+                return {'ok': False, 'reason': 'bot_running'}
+            self._stop_bot_blocking()
+        excluded_kb, excluded_mouse = self._macro_excluded_bindings()
+        ok = self._macro.toggle_record(excluded_kb=excluded_kb,
+                                       excluded_mouse=excluded_mouse)
+        return {'ok': bool(ok)}
+
+    def macro_play(self, force=False):
+        if self._bot.is_running():
+            if not force:
+                return {'ok': False, 'reason': 'bot_running'}
+            self._stop_bot_blocking()
+        return {'ok': bool(self._macro.play())}
+
+    def macro_stop(self):
+        return {'ok': bool(self._macro.stop_play())}
+
+    def macro_save_slot(self, n):
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return {'ok': False, 'reason': 'bad_slot'}
+        return {'ok': bool(self._macro.save_slot(n))}
+
+    def macro_load_slot(self, n):
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return {'ok': False, 'reason': 'bad_slot'}
+        return {'ok': bool(self._macro.load_slot(n))}
+
+    def macro_clear_slot(self, n):
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return {'ok': False, 'reason': 'bad_slot'}
+        return {'ok': bool(self._macro.clear_slot(n))}
+
+    def start_stop_force(self):
+        """Same as start_stop but stops a running macro first. Called by
+        JS after the user confirms the cross-mode prompt."""
+        if self._macro.is_busy():
+            self._stop_macro_blocking()
+        return self.start_stop()
+
+    def _stop_bot_blocking(self):
+        """Synchronously stop the bot worker — bounded wait so a stuck
+        worker doesn't freeze the UI thread. 5s matches BotController's
+        own shutdown join timeout."""
+        if not self._bot.is_running():
+            return
+        self._bot.stop()
+        t = self._bot._thread
+        if t is not None:
+            t.join(timeout=5.0)
+
+    def _stop_macro_blocking(self):
+        if self._macro.state() == MacroController.STATE_RECORDING:
+            self._macro.stop_record()
+        elif self._macro.state() == MacroController.STATE_PLAYING:
+            self._macro.stop_play()
+            t = self._macro._play_thread
+            if t is not None:
+                t.join(timeout=2.0)
+
     def minimize(self):
         if self._window is not None:
             try:
@@ -680,12 +794,25 @@ class BridgeApi:
     def _install_keybinds(self):
         self._keybinds.clear_all()
         kb = self._settings['keybinds']
+        # Bot hotkeys — fire when Genshin or UI is focused.
         self._keybinds.set(ACTION_START_STOP, kb.get(ACTION_START_STOP),
-                           self._hotkey_start_stop)
+                           self._hotkey_start_stop, scope='app')
         self._keybinds.set(ACTION_PAUSE, kb.get(ACTION_PAUSE),
-                           self._hotkey_pause)
+                           self._hotkey_pause, scope='app')
         self._keybinds.set(ACTION_DEBUG, kb.get(ACTION_DEBUG),
-                           self._hotkey_debug)
+                           self._hotkey_debug, scope='app')
+        # Macro hotkeys — strict Genshin-only gate (per spec). Won't
+        # fire from the UI window itself; user clicks the buttons there.
+        self._keybinds.set(ACTION_MACRO_RECORD, kb.get(ACTION_MACRO_RECORD),
+                           self._hotkey_macro_record, scope='game')
+        self._keybinds.set(ACTION_MACRO_PLAY, kb.get(ACTION_MACRO_PLAY),
+                           self._hotkey_macro_play, scope='game')
+        self._keybinds.set(ACTION_MACRO_STOP, kb.get(ACTION_MACRO_STOP),
+                           self._hotkey_macro_stop, scope='game')
+        self._keybinds.set(ACTION_MACRO_SAVE, kb.get(ACTION_MACRO_SAVE),
+                           self._hotkey_macro_save, scope='game')
+        self._keybinds.set(ACTION_MACRO_LOAD, kb.get(ACTION_MACRO_LOAD),
+                           self._hotkey_macro_load, scope='game')
 
     # Hotkey callbacks run on the keyboard package's listener thread.
     # They only mutate threading.Events / BotController state (already
@@ -703,6 +830,77 @@ class BridgeApi:
         self._log_hotkey('debug')
         if self._bot.is_running():
             self._bot.toggle_debug()
+
+    # Macro hotkeys can't pop a confirmation dialog (no JS in this
+    # thread), so cross-mode conflicts are refused with a log line. The
+    # user can still trigger via UI buttons, which DO confirm.
+    def _hotkey_macro_record(self):
+        self._log_hotkey('macro_record')
+        if self._bot.is_running():
+            print('[macro] bot is running — stop bot first '
+                  '(or use the UI button to confirm)')
+            return
+        excluded = self._macro_excluded_bindings()
+        self._macro.toggle_record(excluded_kb=excluded[0],
+                                  excluded_mouse=excluded[1])
+
+    def _hotkey_macro_play(self):
+        self._log_hotkey('macro_play')
+        if self._bot.is_running():
+            print('[macro] bot is running — stop bot first '
+                  '(or use the UI button to confirm)')
+            return
+        self._macro.play()
+
+    def _hotkey_macro_stop(self):
+        self._log_hotkey('macro_stop')
+        self._macro.stop_play()
+
+    def _hotkey_macro_save(self):
+        self._log_hotkey('macro_save')
+        self._macro.begin_save_pending()
+
+    def _hotkey_macro_load(self):
+        self._log_hotkey('macro_load')
+        self._macro.begin_load_pending()
+
+    def _macro_excluded_bindings(self):
+        """Split current keybindings into (keyboard_names, mouse_buttons).
+        Used so the macro hooks don't capture the very keys that control
+        them (record-toggle, save, etc.). Modifier-combos like 'ctrl+y'
+        are skipped — pressing bare 'y' won't trigger them, so the user
+        can still record 'y' if they want."""
+        kb_names = set()
+        mouse_btns = set()
+        for binding in self._keybinds.get_bindings().values():
+            if not binding:
+                continue
+            b = binding.lower()
+            if b.startswith('mouse:'):
+                mouse_btns.add(b.split(':', 1)[1])
+            elif '+' not in b:
+                kb_names.add(b)
+        return kb_names, mouse_btns
+
+    def _get_arduino(self):
+        """Lazy-build the shared Arduino. Returns the controller or None
+        on init failure. ArduinoHIDController.__init__ calls sys.exit on
+        port-not-found, so we trap SystemExit too — UI keeps running so
+        the user can fix wiring and try again. Failures don't latch:
+        the next caller retries from scratch (port may have been
+        transiently busy from a prior bot session resetting the
+        Leonardo)."""
+        with self._arduino_lock:
+            if self._arduino is not None:
+                return self._arduino
+            try:
+                self._arduino = ArduinoHIDController()
+            except SystemExit:
+                print('[ui] Arduino init failed — board not detected. '
+                      'Check connection and try again.')
+            except Exception as e:
+                print(f'[ui] Arduino init error: {e}')
+            return self._arduino
 
     def _log_hotkey(self, action):
         """Diagnostic — prints arrival timestamp + bot state. Enabled with

@@ -113,10 +113,18 @@ MACRO_HOTKEYS = {
 
 # === UI hotkeys (ui.py) ===
 # Defaults loaded when no ui_settings.json override is present. Names follow
-# the `keyboard` package convention ('f8', 'ctrl+shift+a', etc.). Hotkeys are
-# gated by foreground-window: they only fire while Genshin Impact is focused.
+# the `keyboard` package convention ('f8', 'ctrl+shift+a', etc.); mouse
+# buttons use the 'mouse:<btn>' prefix where <btn> is one of left / right /
+# middle / x / x2. Bot hotkeys (start_stop / pause / debug) fire when either
+# Genshin or the UI is focused. Macro hotkeys fire only when Genshin is
+# focused — the macro tool also captures input only inside the game.
 UI_KEYBINDS_DEFAULT = {
     'start_stop': 'f8',   # toggle bot run / stop
     'pause':      'f9',   # pause / resume (releases keys, halts album clicker)
     'debug':      'f10',  # toggle OpenCV viz window in real time
+    'macro_record': 'y',         # toggle record / stop-record
+    'macro_play':   'mouse:x',   # start playback (idempotent while playing)
+    'macro_stop':   'mouse:x2',  # stop playback
+    'macro_save':   'u',         # arms 1-9 slot picker (4s) for save
+    'macro_load':   'f11',       # arms 1-9 slot picker (4s) for load
 }
