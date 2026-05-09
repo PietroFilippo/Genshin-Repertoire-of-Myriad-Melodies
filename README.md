@@ -2,15 +2,16 @@
 
 Automates Genshin Impact's **Repertoire of Myriad Melodies** rhythm minigame. A Python host watches the screen for falling notes and streams keystrokes to an Arduino Leonardo, which emits them as USB HID input the game accepts.
 
-Two modes:
+Two rhythm modes plus a built-in macro tool:
 - **Standalone** — runs the rhythm detector indefinitely. Start it on any song; stop it whenever.
 - **Album** — auto-plays an entire country album page (12 songs) at a chosen difficulty, with optional skip-on-Canorus.
+- **Macros** — separate UI tab to record arbitrary keyboard + mouse sequences in-game and replay them through the same Arduino. 9 named save slots, inline event editor, auto-focus to the game on Play.
 
 ---
 
 ## Why an Arduino?
 
-Mainly becauseI had an Arduino sitting around and wanted a project to use it for, plus an excuse to actually learn the platform end-to-end (firmware, HID, serial). The rhythm-bot use case fit perfectly.
+Mainly because I had an Arduino sitting around and wanted a project to use it for, plus an excuse to actually learn the platform end-to-end (firmware, HID, serial). The rhythm-bot use case fit perfectly.
 
 Also, Genshin Impact's anti-cheat (mhyprot) ignores software-synthesized input — `SetCursorPos`, `SendInput`, and similar Windows APIs do nothing inside the game window. Real USB HID hardware gets through, so the Arduino acts as a hardware keyboard/mouse the bot drives over a serial link.
 
@@ -53,7 +54,7 @@ In Genshin's main menu, open the rhythm minigame ("Repertoire of Myriad Melodies
 2. Extract anywhere.
 3. Double-click `Genshin Rhythm Bot.exe`. Accept the UAC prompt.
 
-User settings (rebound hotkeys) persist in `%APPDATA%\GenshinRhythmBot\ui_settings.json`.
+User settings (rebound hotkeys) persist in `%APPDATA%\GenshinRhythmBot\ui_settings.json`. Saved macros live in `%APPDATA%\GenshinRhythmBot\macros\macro_<n>.json` (frozen build) or `pc_client/macros/` (dev).
 
 **Option B — From source**
 
@@ -101,15 +102,30 @@ Launch the bot, switch focus to Genshin, then either click **Start** in the UI o
 
 You can switch modes mid-run - the bot stops the current worker and starts a fresh one in the new mode. Switching out of Album mid-song asks for confirmation first because the current song progress is lost.
 
+### Macros tab
+
+Separate tab for recording/playing arbitrary input sequences through the Arduino. Use cases: any repetitive in-game routine the bot doesn't natively cover (commission turn-ins, shop dialogue mashing, fishing-cast loops, ...).
+
+- **Record** captures every key press / mouse click while Genshin is the foreground window — alt-tabbing pauses capture. Stop with the same hotkey or button.
+- **Play** focuses Genshin first (the bot already had focus, the macro tool didn't), waits 250 ms for the window switch, then streams events through HID with their original timing.
+- **Slots 1-9** hold named saves. Click-mode toggle: `Load` reads a slot into the buffer, `Save` writes the buffer (prompts for a name; confirms before overwriting), `Rename` changes a slot's name in place, `Clear` deletes a slot. The slot whose macro is currently in memory gets a yellow ring.
+- **Events editor** (card under hotkeys) — Show/hide toggles a table of every event in the current macro buffer. Edit time / device / key / event-type inline, `+ Add` a row, `×` delete a row. `Save` validates + sorts in Python and (if a slot is loaded) writes back to it in the same click. `Discard` reloads from the buffer.
+- Bot mode and macro mode are mutually exclusive on the Arduino — starting one while the other is running prompts to stop the other first.
+
 ### Default hotkeys
 
 | Action | Key |
 |---|---|
-| Start / Stop | `F8` |
-| Pause / Resume | `F9` |
+| Bot start / stop | `F8` |
+| Bot pause / resume | `F9` |
 | Toggle debug viz | `F10` |
+| Macro record / stop | `Y` |
+| Macro play | `Mouse 4` |
+| Macro stop playback | `Mouse 5` |
+| Macro save (1-9 picker) | `U` |
+| Macro load (1-9 picker) | `F11` |
 
-Hotkeys only fire while the **game window** or the **bot UI** is in the foreground. Rebind from the UI (you don't need to start the bot first).
+Bot hotkeys fire while the **game window or the bot UI** is in the foreground. Macro hotkeys are stricter: **Genshin only**, so the macro tool can't accidentally arm/record while you're typing in another app. Rebind any of them from the UI (you don't need to start the bot first); rebind capture also accepts mouse buttons (left / right / middle / mouse 4 / mouse 5).
 
 ### Debug visualization
 
@@ -187,7 +203,7 @@ pc_client/
   controller.py             Arduino serial wrapper
   config.py                 All tunable knobs
   calibrate.py              One-frame calibration overlay
-  macro_tool.py             Standalone macro recorder (CLI only)
+  macro_tool.py             Standalone macro recorder (CLI only — UI has its own integrated macro tool)
   assets/                   Icon + 1080p UI templates for album mode
   web/                      HTML/CSS/JS for the UI
 ```
