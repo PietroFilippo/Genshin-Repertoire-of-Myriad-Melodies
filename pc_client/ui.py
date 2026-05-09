@@ -568,6 +568,19 @@ class BridgeApi:
         self._stopping = True
         self._drain_stop.set()
 
+        # Wait for the drain thread to actually exit before pywebview
+        # gets to dispose WebView2. Otherwise the drain's next 50 ms tick
+        # fires evaluate_js into a disposed control and pywebview logs
+        # `[pywebview] Error occurred in script ... ObjectDisposedException`
+        # (the throw itself is swallowed by _push's bare except, but the
+        # log line is emitted from inside pywebview before that). One
+        # tick is 50 ms; 500 ms is generous.
+        if self._drain_thread is not None:
+            try:
+                self._drain_thread.join(timeout=0.5)
+            except Exception:
+                pass
+
         # FIRST: drop the actual Win32 LL hooks via the captured handles.
         # This is the move that kills the mouse-lag-on-close — once the
         # WH_MOUSE_LL hook is gone, system mouse events stop routing
