@@ -206,6 +206,34 @@
             </div>
             <div class="hk-capture-msg"></div>
         </fieldset>
+
+        <fieldset class="card" id="events-card">
+            <legend>Events <span class="evt-count" id="evt-count">(0)</span></legend>
+            <div class="row evt-toolbar">
+                <button type="button" id="evt-toggle" class="btn-secondary">Show</button>
+                <button type="button" id="evt-add" class="btn-secondary" disabled>+ Add</button>
+                <button type="button" id="evt-discard" class="btn-secondary" disabled>Discard</button>
+                <button type="button" id="evt-save" class="btn-primary" disabled>Save</button>
+                <span class="evt-dirty-tag" id="evt-dirty-tag"></span>
+                <span class="help" tabindex="0" aria-label="Events info"
+                      data-help="Inspect and edit the events in the current macro buffer. Each row is a single key/mouse press or release at a given time. Edit time / device / key / event_type inline. Save replaces the buffer and (if a slot is currently loaded) writes back to that slot. Discard reverts your edits to the on-disk buffer. Times are seconds from the start of the macro and are sorted on Save.">?</span>
+            </div>
+            <div class="evt-list-wrapper" id="evt-list-wrapper" hidden>
+                <table class="evt-table">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Time (s)</th>
+                            <th>Device</th>
+                            <th>Key</th>
+                            <th>Event</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="evt-tbody"></tbody>
+                </table>
+            </div>
+        </fieldset>
     </section>
 
     <!-- Logs tab -->

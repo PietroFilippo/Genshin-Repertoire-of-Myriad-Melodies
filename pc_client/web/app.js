@@ -379,7 +379,7 @@ function renderMacroSlots(slots, namesMap, loadedSlot) {
     });
 }
 
-function renderMacroState(macroState, eventCount, loadedSlot, slotNames) {
+function renderMacroState(macroState, eventCount, loadedSlot, slotNames, dirty) {
     const statusEl = $('#macro-status');
     const recBtn = $('#macro-record');
     const playBtn = $('#macro-play');
@@ -387,14 +387,24 @@ function renderMacroState(macroState, eventCount, loadedSlot, slotNames) {
     const events = eventCount || 0;
     const stateLabel = macroState || 'idle';
     const loaded = parseInt(loadedSlot, 10) || 0;
+    const isDirty = !!dirty;
     let suffix = '';
     if (loaded > 0) {
         const names = slotNames || {};
         const name = names[loaded] || names[String(loaded)] || '';
-        suffix = name ? ` · slot ${loaded} (${name})` : ` · slot ${loaded}`;
+        const tag = isDirty ? '*' : '';
+        suffix = name
+            ? ` · slot ${loaded}${tag} (${name})`
+            : ` · slot ${loaded}${tag}`;
+    } else if (isDirty && events > 0) {
+        suffix = ' · unsaved';
     }
-    statusEl.textContent =
+    const fullText =
         `${stateLabel} · ${events} event${events === 1 ? '' : 's'}${suffix}`;
+    statusEl.textContent = fullText;
+    // CSS truncates long slot names with ellipsis; mirror the full
+    // string on `title` so hover still reveals what got cut.
+    statusEl.title = fullText;
     statusEl.classList.toggle('macro-status-recording', stateLabel === 'recording');
     statusEl.classList.toggle('macro-status-playing', stateLabel === 'playing');
     recBtn.textContent = stateLabel === 'recording' ? 'Stop Recording' : 'Record';
@@ -412,6 +422,163 @@ function renderMacroPending(pending) {
     } else {
         el.textContent = '';
     }
+}
+
+// --- events editor ---------------------------------------------------------
+
+const evtState = {
+    visible: false,
+    working: [],         // local edit copy
+    jsDirty: false,      // local edits not yet pushed to Python
+    lastFetchedCount: 0, // events count at the moment we last fetched
+};
+
+function escapeAttr(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    })[c]);
+}
+
+function renderEventsTable() {
+    const tbody = $('#evt-tbody');
+    tbody.innerHTML = '';
+    evtState.working.forEach((ev, i) => {
+        const t = (typeof ev.time === 'number' ? ev.time : 0).toFixed(3);
+        const dev = (ev.device || 'keyboard').toLowerCase();
+        const evt = (ev.event_type || 'down').toLowerCase();
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td class="evt-idx">${i + 1}</td>
+            <td><input type="number" step="0.001" min="0" value="${t}" data-field="time"></td>
+            <td>
+                <select data-field="device">
+                    <option value="keyboard"${dev === 'keyboard' ? ' selected' : ''}>keyboard</option>
+                    <option value="mouse"${dev === 'mouse' ? ' selected' : ''}>mouse</option>
+                </select>
+            </td>
+            <td><input type="text" value="${escapeAttr(ev.key || '')}" data-field="key" spellcheck="false"></td>
+            <td>
+                <select data-field="event_type">
+                    <option value="down"${evt === 'down' ? ' selected' : ''}>down</option>
+                    <option value="up"${evt === 'up' ? ' selected' : ''}>up</option>
+                </select>
+            </td>
+            <td><button type="button" class="evt-del" title="Delete row">&times;</button></td>
+        `;
+        tr.querySelectorAll('[data-field]').forEach((el) => {
+            el.addEventListener('input', () => {
+                const field = el.dataset.field;
+                let val = el.value;
+                if (field === 'time') val = parseFloat(val) || 0;
+                evtState.working[i][field] = val;
+                evtState.jsDirty = true;
+                updateEvtButtons();
+            });
+        });
+        tr.querySelector('.evt-del').addEventListener('click', () => {
+            evtState.working.splice(i, 1);
+            evtState.jsDirty = true;
+            renderEventsTable();
+            updateEvtButtons();
+        });
+        tbody.appendChild(tr);
+    });
+    $('#evt-count').textContent = `(${evtState.working.length})`;
+}
+
+function updateEvtButtons() {
+    const visible = evtState.visible;
+    $('#evt-add').disabled = !visible;
+    $('#evt-save').disabled = !visible || !evtState.jsDirty;
+    $('#evt-discard').disabled = !visible || !evtState.jsDirty;
+    const tag = $('#evt-dirty-tag');
+    tag.textContent = (visible && evtState.jsDirty) ? 'unsaved edits' : '';
+}
+
+function fetchAndShowEvents() {
+    return callApi('macro_get_events').then((events) => {
+        evtState.working = Array.isArray(events) ? events : [];
+        evtState.lastFetchedCount = evtState.working.length;
+        evtState.jsDirty = false;
+        renderEventsTable();
+        updateEvtButtons();
+    });
+}
+
+$('#evt-toggle').addEventListener('click', () => {
+    if (evtState.visible) {
+        if (evtState.jsDirty
+            && !confirm('Discard your unsaved event edits?')) {
+            return;
+        }
+        evtState.visible = false;
+        evtState.jsDirty = false;
+        evtState.working = [];
+        $('#evt-list-wrapper').hidden = true;
+        $('#evt-toggle').textContent = 'Show';
+        updateEvtButtons();
+    } else {
+        evtState.visible = true;
+        $('#evt-list-wrapper').hidden = false;
+        $('#evt-toggle').textContent = 'Hide';
+        fetchAndShowEvents();
+    }
+});
+
+$('#evt-add').addEventListener('click', () => {
+    const lastT = evtState.working.length
+        ? (parseFloat(evtState.working[evtState.working.length - 1].time) || 0)
+        : 0;
+    evtState.working.push({
+        time: +(lastT + 0.05).toFixed(3),
+        device: 'keyboard',
+        key: 'a',
+        event_type: 'down',
+    });
+    evtState.jsDirty = true;
+    renderEventsTable();
+    updateEvtButtons();
+});
+
+$('#evt-discard').addEventListener('click', () => {
+    if (!confirm('Discard your edits and reload from the buffer?')) return;
+    fetchAndShowEvents();
+});
+
+$('#evt-save').addEventListener('click', () => {
+    // Coerce types one more time before sending — the inputs may have
+    // produced strings even after our `input` handler ran.
+    const sanitized = evtState.working.map((ev) => ({
+        time: parseFloat(ev.time) || 0,
+        device: (ev.device || 'keyboard').toLowerCase(),
+        key: String(ev.key || '').trim().toLowerCase(),
+        event_type: (ev.event_type || 'down').toLowerCase(),
+    }));
+    callApi('macro_set_events', sanitized).then((res) => {
+        if (!res || res.ok === false) {
+            alert('Could not apply edits — see the log for details.');
+            return;
+        }
+        // If a slot is currently loaded, persist back to it so the
+        // user doesn't have to hop over to the slot grid for a
+        // round-trip Save.
+        const loaded = (STATE.lastStatus || {}).macro_loaded || 0;
+        if (loaded > 0) {
+            const name = slotNameOf(loaded);
+            callApi('macro_save_slot', loaded, name);
+        }
+        evtState.jsDirty = false;
+        // Refresh the working copy from Python so any sort/cleanup
+        // applied in set_events shows up in the table.
+        fetchAndShowEvents();
+    });
+});
+
+function maybeAutoRefreshEditor(eventsCount) {
+    if (!evtState.visible) return;
+    if (eventsCount === evtState.lastFetchedCount) return;
+    if (evtState.jsDirty) return;   // user has local edits, leave alone
+    fetchAndShowEvents();
 }
 
 // --- log pane --------------------------------------------------------------
@@ -460,9 +627,17 @@ window.updateStatus = function updateStatus(data) {
     if ('keybinds' in data) renderKeybinds(data.keybinds);
 
     if ('macro_state' in data || 'macro_events' in data
-        || 'macro_loaded' in data || 'macro_slot_names' in data) {
+        || 'macro_loaded' in data || 'macro_slot_names' in data
+        || 'macro_dirty' in data) {
         renderMacroState(data.macro_state, data.macro_events,
-                         data.macro_loaded, data.macro_slot_names);
+                         data.macro_loaded, data.macro_slot_names,
+                         data.macro_dirty);
+    }
+    if ('macro_events' in data) {
+        // Buffer changed externally (record finished, slot loaded,
+        // edits applied) — pull a fresh copy into the editor unless
+        // the user has unsaved local changes.
+        maybeAutoRefreshEditor(data.macro_events);
     }
     if ('macro_slots' in data || 'macro_slot_names' in data
         || 'macro_loaded' in data) {
@@ -567,6 +742,7 @@ function init() {
             macro_slots: macroSnap.macro_slots || [],
             macro_slot_names: macroSnap.macro_slot_names || {},
             macro_loaded: macroSnap.macro_loaded || 0,
+            macro_dirty: !!macroSnap.macro_dirty,
             macro_pending: macroSnap.macro_pending || '',
         });
     });

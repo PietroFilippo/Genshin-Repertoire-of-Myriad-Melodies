@@ -510,6 +510,7 @@ class BridgeApi:
             'macro_slots': [],
             'macro_slot_names': {},
             'macro_loaded': 0,
+            'macro_dirty': False,
             'macro_pending': '',
         }
 
@@ -804,6 +805,16 @@ class BridgeApi:
         except (TypeError, ValueError):
             return {'ok': False, 'reason': 'bad_slot'}
         return {'ok': bool(self._macro.rename_slot(n, name))}
+
+    def macro_get_events(self):
+        """Returns the buffer for the events editor. Each event is
+        {time, device, key, event_type}."""
+        return self._macro.get_events()
+
+    def macro_set_events(self, events):
+        """Replace the buffer with a JS-edited list. Returns ok=False
+        when the macro is busy (recording / playing)."""
+        return {'ok': bool(self._macro.set_events(events))}
 
     def start_stop_force(self):
         """Same as start_stop but stops a running macro first. Called by

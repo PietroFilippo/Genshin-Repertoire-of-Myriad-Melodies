@@ -648,6 +648,16 @@ button {
     border: 1px solid var(--border);
     border-radius: 4px;
     background: var(--bg-card);
+    /* Cap the pill width so a long slot name doesn't push the help icon
+       off-panel (and break the tooltip-anchor math below). The full
+       string is mirrored to the `title` attribute by JS, so hover still
+       reveals truncated names. */
+    display: inline-block;
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
 }
 
 .macro-status-recording {
@@ -785,6 +795,145 @@ button {
     min-height: 14px;
 }
 
+/* --- events editor ------------------------------------------------------ */
+
+.evt-toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.evt-count {
+    color: var(--text-dim);
+    font-weight: 400;
+    font-size: 12px;
+    margin-left: 4px;
+}
+
+.evt-dirty-tag {
+    color: #f5c25b;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-left: 4px;
+}
+
+.evt-list-wrapper {
+    margin-top: 10px;
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-card);
+}
+
+.evt-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 12px;
+}
+
+.evt-table thead {
+    position: sticky;
+    top: 0;
+    background: var(--bg-card-elev);
+    z-index: 1;
+}
+
+.evt-table th {
+    text-align: left;
+    padding: 6px 8px;
+    color: var(--text-dim);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+}
+
+.evt-table td {
+    padding: 3px 6px;
+    border-bottom: 1px solid #2a2a2a;
+}
+
+.evt-table tr:last-child td {
+    border-bottom: 0;
+}
+
+.evt-table tr:hover {
+    background: #1f1f1f;
+}
+
+.evt-idx {
+    color: var(--text-mute);
+    width: 36px;
+    text-align: right;
+}
+
+.evt-table input[type="number"],
+.evt-table input[type="text"],
+.evt-table select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 2px 6px;
+    width: 100%;
+    box-sizing: border-box;
+    -webkit-appearance: none;
+    appearance: none;
+}
+
+.evt-table input[type="number"] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+    width: 100px;
+}
+
+.evt-table input[type="number"]::-webkit-outer-spin-button,
+.evt-table input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.evt-table input:focus,
+.evt-table select:focus {
+    border-color: var(--accent);
+    outline: 0;
+}
+
+.evt-table select {
+    padding-right: 18px;
+    background-image:
+        linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+        linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+    background-position:
+        calc(100% - 10px) calc(50% - 1px),
+        calc(100% - 6px) calc(50% - 1px);
+    background-size: 4px 4px, 4px 4px;
+    background-repeat: no-repeat;
+}
+
+.evt-del {
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    border-radius: 3px;
+    color: var(--text-dim);
+    width: 24px;
+    height: 22px;
+    line-height: 1;
+    padding: 0;
+    font-size: 14px;
+}
+
+.evt-del:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+}
+
 /* Help icons in `.row-grid` sit pinned to the panel's right edge
    (third grid column = auto). A centered 240px tooltip would overflow
    off the right side of the panel, so anchor it to the icon's right
@@ -795,7 +944,8 @@ button {
    off the panel's LEFT edge instead. */
 .row-grid .help::after,
 .macro-controls-row .help::after,
-.macro-mode-row .help::after {
+.macro-mode-row .help::after,
+.evt-toolbar .help::after {
     left: auto;
     right: 0;
     transform: none;

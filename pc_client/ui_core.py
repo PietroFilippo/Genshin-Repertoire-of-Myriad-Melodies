@@ -716,6 +716,11 @@ class MacroController:
         # never shows a stale "loaded: N" indicator pointing at a buffer
         # that no longer matches the file.
         self._loaded_slot = None
+        # True when the buffer differs from the slot it was loaded from
+        # (set on edit / record, cleared on load / save). Surfaces in the
+        # UI as a "modified" tag so the user knows the slot ring color
+        # doesn't reflect what's in memory.
+        self._dirty = False
         self._kb_hook = None
         self._mouse_hook = None
         self._play_thread = None
@@ -780,8 +785,62 @@ class MacroController:
             'macro_slots': self.list_slots(),
             'macro_slot_names': self.slot_names(),
             'macro_loaded': self._loaded_slot or 0,
+            'macro_dirty': self._dirty,
             'macro_pending': self._pending_action or '',
         }
+
+    def get_events(self):
+        """Copy of the buffer for the JS event editor. Each event is
+        shallow-copied so JS edits to one don't smear into our state."""
+        return [dict(ev) for ev in self._events]
+
+    def set_events(self, events):
+        """Replace the buffer with a JS-edited list. Validates each
+        entry — bad fields drop the event with a log line so a hand-
+        edited slot can't crash playback. Sorted by `time` so out-of-
+        order edits don't jumble playback ordering."""
+        if self._state != self.STATE_IDLE:
+            print(f"[macro] cannot edit events while {self._state}")
+            return False
+        if not isinstance(events, list):
+            print("[macro] set_events: payload must be a list")
+            return False
+        cleaned = []
+        for i, ev in enumerate(events):
+            if not isinstance(ev, dict):
+                print(f"[macro] dropped event {i}: not an object")
+                continue
+            try:
+                t = float(ev.get('time', 0.0))
+            except (TypeError, ValueError):
+                print(f"[macro] dropped event {i}: bad time")
+                continue
+            if t < 0:
+                t = 0.0
+            device = (ev.get('device') or '').lower()
+            if device not in ('keyboard', 'mouse'):
+                print(f"[macro] dropped event {i}: bad device {device!r}")
+                continue
+            key = str(ev.get('key') or '').strip().lower()
+            if not key:
+                print(f"[macro] dropped event {i}: empty key")
+                continue
+            etype = (ev.get('event_type') or '').lower()
+            if etype not in ('down', 'up', 'double'):
+                print(f"[macro] dropped event {i}: bad event_type {etype!r}")
+                continue
+            cleaned.append({
+                'time': t,
+                'device': device,
+                'key': key,
+                'event_type': etype,
+            })
+        cleaned.sort(key=lambda e: e['time'])
+        self._events = cleaned
+        self._dirty = True
+        print(f"[macro] events replaced — {len(cleaned)} valid")
+        self._emit()
+        return True
 
     # ---- record ----
 
@@ -794,6 +853,9 @@ class MacroController:
             # Fresh recording detaches the buffer from any loaded slot —
             # the loaded indicator would lie about what's in memory.
             self._loaded_slot = None
+            # Buffer is empty until first event arrives — not "modified"
+            # in the sense of "differs from a saved slot".
+            self._dirty = False
             self._start_ts = time.time()
             self._excluded_kb = {b.lower() for b in excluded_kb if b}
             self._excluded_mouse = {b.lower() for b in excluded_mouse if b}
@@ -815,6 +877,9 @@ class MacroController:
                 return False
             self._unhook()
             self._state = self.STATE_IDLE
+            # If we captured anything, the buffer is now "unsaved-new" —
+            # use the dirty flag so the UI shows it as modified content.
+            self._dirty = bool(self._events)
         print(f"[macro] stopped recording — {len(self._events)} events")
         self._emit()
         return True
@@ -931,6 +996,7 @@ class MacroController:
         # Buffer now matches slot N on disk — track it as "loaded" so
         # the UI shows which slot the in-memory macro corresponds to.
         self._loaded_slot = n_int
+        self._dirty = False
         self._emit()
         return True
 
@@ -965,6 +1031,7 @@ class MacroController:
                 return False
             self._events = events
             self._loaded_slot = n_int
+            self._dirty = False
             label = f' ({name!r})' if name else ''
             print(f"[macro] loaded slot {n_int}{label} "
                   f"— {len(self._events)} events")
