@@ -13,15 +13,39 @@ Two rhythm modes plus a built-in macro tool:
 
 Mainly because I had an Arduino sitting around and wanted a project to use it for, plus an excuse to actually learn the platform end-to-end (firmware, HID, serial). The rhythm-bot use case fit perfectly.
 
-Also, Genshin Impact's anti-cheat (mhyprot) ignores software-synthesized input — `SetCursorPos`, `SendInput`, and similar Windows APIs do nothing inside the game window. Real USB HID hardware gets through, so the Arduino acts as a hardware keyboard/mouse the bot drives over a serial link.
+But because the game accepts SendInput-style input fine, a **software-only mode** was also added as a parallel option that needs no hardware at all.
+
+Pick whichever fits, you can switch at any time from the **Input** dropdown in the Main tab.
+
+### Backend trade-offs
+
+| Aspect | Arduino HID | Software (Win32 SendInput) |
+|---|---|---|
+| Hardware required | Leonardo + USB cable | None |
+| Setup | Flash sketch, plug in board, find COM port | Just install the bot |
+| Rhythm minigame keys (`a s d j k l`) | Works | Works |
+| Album-mode menu clicks | Works (closed-loop HID convergence, ~75 ms per click target) | Works (single absolute `mouse_event` call, ~instant) |
+| In-combat camera / aim / clicks | Works (what the Arduino was originally for) | **Blocked by anti-cheat** — synthetic mouse moves don't drive the in-game camera |
+| Macro recording (capture) | Same — uses Win32 hooks regardless of backend | Same |
+| Macro playback — keyboard | Works, fully external to Python | Works, but synthetic events are also seen by our own keyboard listener, so binding a UI hotkey to a key the macro itself uses can re-fire that hotkey during playback. The Arduino backend doesn't have this issue because events come from outside the Python process. |
+| Macro playback — mouse buttons | Works | Works |
+| Latency | +1 USB serial round-trip per command (sub-ms but real) | Sub-ms, in-process |
+| Reliability if Genshin tightens menu-input filtering | Hardware HID still goes through | Would break |
+| Portability | Tied to a specific COM port; needs the board | Pure software, runs anywhere admin keyboard hooks work |
+
+Short version:
+
+- **Rhythm bot (Standalone / Album) + macros that only drive menus or rhythm-minigame keys**: software mode is fine and simpler.
+- **Macros that need anything inside combat** (camera turns, aim, attack clicks): stay on the Arduino backend.
+- **Belt-and-suspenders against future anti-cheat changes**: Arduino backend has the safer ceiling — real HID is the hardest path to detect.
 
 ---
 
 ## Requirements
 
 ### Hardware
-- **Arduino Leonardo** (or any ATmega32u4 board: Pro Micro, Beetle, etc.). Regular Unos cannot do HID.
-- USB cable to connect the board to the PC.
+- **Arduino Leonardo** *(only if you want the Arduino backend)* — or any ATmega32u4 board (Pro Micro, Beetle, etc.). Regular Unos cannot do HID. **Software mode requires no hardware.**
+- USB cable to connect the board to the PC (Arduino backend only).
 
 ### Software
 - Windows 10 or 11.
@@ -33,7 +57,11 @@ Also, Genshin Impact's anti-cheat (mhyprot) ignores software-synthesized input �
 
 ## Setup
 
-### 1. Flash the Arduino
+### 1. Flash the Arduino *(skip if you'll use software mode)*
+
+If you only plan to use **software** input mode (set the Input dropdown to "Software (Win32 SendInput)" in the UI), skip this step entirely — no hardware is involved.
+
+If you want the Arduino backend:
 
 1. Open `arduino/rhythm_controller/rhythm_controller.ino` in the Arduino IDE.
 2. Select **Tools → Board → Arduino Leonardo** (or your specific ATmega32u4 board).
@@ -161,7 +189,7 @@ You're not running as administrator. Genshin's anti-cheat blocks keyboard hooks 
 Re-check that the **Hu Tao theme** is equipped on the rhythm minigame. The water/blue default theme will never work with this detector. Run `calibrate.py` and check the per-column blue readouts — they should be ≥230 when no note is present. If not, check if you're using the hard notes modifier, if so, try bumping the in-game note speed to 2x-3x.
 
 **`Failed to connect to Arduino on COMx`.**
-Verify the board is plugged in and the sketch is flashed. If multiple boards are connected, set `SERIAL_PORT` explicitly in `pc_client/config.py` instead of relying on auto-detect.
+Verify the board is plugged in and the sketch is flashed. If multiple boards are connected, set `SERIAL_PORT` explicitly in `pc_client/config.py` instead of relying on auto-detect. Or switch the **Input** dropdown to **Software (Win32 SendInput)** to skip the hardware path entirely.
 
 **`pythonnet` / WinForms error on `.exe` first launch.**
 The bundled `.exe` strips Mark-of-the-Web from its DLLs on first launch (downloaded zips inherit MOTW, which the .NET CLR refuses to load assemblies from). If you see a CLR error on the very first run, try running the `.exe` once more — the strip happens before the second launch.
@@ -200,7 +228,8 @@ pc_client/
   main.py                   Standalone-mode engine + CLI
   album.py                  Album auto-runner + CLI
   detector.py               Per-key pixel-polling rhythm detector
-  controller.py             Arduino serial wrapper
+  controller.py             Arduino serial wrapper (Arduino backend)
+  software_input.py         Win32 SendInput / mouse_event wrapper (software backend)
   config.py                 All tunable knobs
   calibrate.py              One-frame calibration overlay
   macro_tool.py             Standalone macro recorder (CLI only — UI has its own integrated macro tool)
