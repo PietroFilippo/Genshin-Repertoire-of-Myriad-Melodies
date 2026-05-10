@@ -78,18 +78,31 @@
                       data-help="How many album song-slots to play before stopping. With one difficulty selected: exactly N songs. With All difficulties: N × 4 plays (each song at every difficulty). At 12 (full album) the song wheel rolls back to song 1 when done; partial runs leave the wheel at the last-played slot.">?</span>
             </div>
             <div class="row row-grid">
-                <label for="difficulty">Difficulty</label>
-                <div class="select-wrapper">
-                    <select id="difficulty">
-                        <option value="normal">Normal</option>
-                        <option value="hard">Hard</option>
-                        <option value="pro">Pro</option>
-                        <option value="legendary" selected>Legendary</option>
-                        <option value="all">All (Normal → Legendary)</option>
-                    </select>
+                <label>Difficulty</label>
+                <div class="diff-checks">
+                    <label class="checkbox compact">
+                        <input type="checkbox" name="difficulty" value="normal">
+                        <span class="check-mark"></span>
+                        <span>Normal</span>
+                    </label>
+                    <label class="checkbox compact">
+                        <input type="checkbox" name="difficulty" value="hard">
+                        <span class="check-mark"></span>
+                        <span>Hard</span>
+                    </label>
+                    <label class="checkbox compact">
+                        <input type="checkbox" name="difficulty" value="pro">
+                        <span class="check-mark"></span>
+                        <span>Pro</span>
+                    </label>
+                    <label class="checkbox compact">
+                        <input type="checkbox" name="difficulty" value="legendary" checked>
+                        <span class="check-mark"></span>
+                        <span>Legendary</span>
+                    </label>
                 </div>
                 <span class="help" tabindex="0" aria-label="Difficulty info"
-                      data-help="Pick one difficulty (Normal / Hard / Pro / Legendary) to play the album at that difficulty only. Pick All to cycle through every difficulty for the same song before moving to the next — e.g. song 1 Normal → Hard → Pro → Legendary, then song 2 Normal → ... With All, each song's canorus check is per-difficulty (skipped songs only skip the difficulty already at canorus).">?</span>
+                      data-help="Tick any subset of difficulties. With one checked, the album runs that difficulty straight through (classic single-pass). With multiple checked, each song-slot is played once per chosen difficulty before the wheel advances to the next song — e.g. Normal + Hard checked, song 1 Normal → song 1 Hard → song 2 Normal → song 2 Hard → ... At least one must stay checked. Each cycle's canorus skip is per-difficulty.">?</span>
             </div>
         </fieldset>
 

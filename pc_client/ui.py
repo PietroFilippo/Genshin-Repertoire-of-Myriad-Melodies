@@ -487,11 +487,15 @@ class BridgeApi:
 
         # Live UI form state — kept in sync via the set_* methods so the
         # hotkey worker thread (which can't reach the JS layer) has a
-        # snapshot to feed into BotController.start.
+        # snapshot to feed into BotController.start. `difficulty` is
+        # always stored as a list of one or more difficulty names; a
+        # single-element list reproduces the old single-difficulty
+        # flat loop, multi-element triggers the per-position interleave
+        # in AlbumRunner.
         self._opts = {
             'mode': 'standalone',
             'songs': ALBUM_SONG_COUNT,
-            'difficulty': ALBUM_DIFFICULTY,
+            'difficulty': [ALBUM_DIFFICULTY],
             'replay_canorus': False,
             'debug': False,
         }
@@ -714,11 +718,30 @@ class BridgeApi:
         return True
 
     def set_difficulty(self, d):
-        # 'all' is a meta-value handled by AlbumRunner — runs the album
-        # once per real difficulty in ascending order.
-        if d == 'all' or d in ALBUM_DIFFICULTY_COORDS:
-            with self._lock:
-                self._opts['difficulty'] = d
+        """Accept a list of difficulty names (any non-empty subset of
+        normal/hard/pro/legendary) — the JS multi-checkbox path. Also
+        accepts back-compat shapes: 'all' (expanded to the full
+        4-element list) or a single difficulty string. Empty / fully-
+        invalid input is rejected so the user can't end up with no
+        difficulty selected."""
+        order = list(ALBUM_DIFFICULTY_COORDS)
+        if isinstance(d, (list, tuple)):
+            chosen = [x for x in d if isinstance(x, str)
+                      and x in ALBUM_DIFFICULTY_COORDS]
+            if not chosen:
+                return False
+            # Canonicalize ordering so [legendary, normal] and
+            # [normal, legendary] produce the same playback sequence.
+            seen = set(chosen)
+            normalized = [name for name in order if name in seen]
+        elif d == 'all':
+            normalized = list(order)
+        elif isinstance(d, str) and d in ALBUM_DIFFICULTY_COORDS:
+            normalized = [d]
+        else:
+            return False
+        with self._lock:
+            self._opts['difficulty'] = normalized
         return True
 
     def set_replay_canorus(self, v):

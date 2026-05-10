@@ -110,8 +110,38 @@ $('#songs').addEventListener('change', () => {
     if (!Number.isNaN(v)) callApi('set_songs', v);
 });
 
-$('#difficulty').addEventListener('change', () => {
-    callApi('set_difficulty', $('#difficulty').value);
+function selectedDifficulties() {
+    return Array.from($$('input[name="difficulty"]:checked'))
+        .map((cb) => cb.value);
+}
+
+function applyDifficultiesToCheckboxes(value) {
+    // Accept either an array of names, the literal string 'all', or a
+    // single difficulty name — JS init may receive any of those
+    // depending on how the setting was saved.
+    const all = ['normal', 'hard', 'pro', 'legendary'];
+    let wanted;
+    if (Array.isArray(value)) wanted = value;
+    else if (value === 'all') wanted = all;
+    else if (typeof value === 'string' && all.includes(value)) wanted = [value];
+    else return;
+    const wantedSet = new Set(wanted);
+    $$('input[name="difficulty"]').forEach((cb) => {
+        cb.checked = wantedSet.has(cb.value);
+    });
+}
+
+$$('input[name="difficulty"]').forEach((cb) => {
+    cb.addEventListener('change', () => {
+        const chosen = selectedDifficulties();
+        if (chosen.length === 0) {
+            // Refuse to leave the user in a no-difficulty state — re-
+            // check the box they just unchecked.
+            cb.checked = true;
+            return;
+        }
+        callApi('set_difficulty', chosen);
+    });
 });
 
 $('#replay-canorus').addEventListener('change', () => {
@@ -758,7 +788,7 @@ function init() {
             if (r) r.checked = true;
         }
         if (typeof s.songs === 'number') $('#songs').value = s.songs;
-        if (s.difficulty) $('#difficulty').value = s.difficulty;
+        if (s.difficulty !== undefined) applyDifficultiesToCheckboxes(s.difficulty);
         if (typeof s.replay_canorus === 'boolean') $('#replay-canorus').checked = s.replay_canorus;
         if (typeof s.debug === 'boolean') $('#debug').checked = s.debug;
         if (s.input_backend) $('#input-backend').value = s.input_backend;

@@ -90,17 +90,37 @@ class AlbumRunner:
                 — it spins up the detector + end-watcher directly on the
                 song already playing, then proceeds with the normal
                 album loop from song 2 onwards.
-            difficulty: one of 'normal' / 'hard' / 'pro' / 'legendary',
-                OR 'all' to run the album once per difficulty in
-                ascending order (normal → hard → pro → legendary, 4×12
-                songs total). Each cycle's canorus check is independent
-                because the canorus pill is per-difficulty in-game.
+            difficulty: one of 'normal' / 'hard' / 'pro' / 'legendary'
+                (single-difficulty run, classic flat loop), OR a list/
+                tuple of any subset of those (per-position cycle through
+                the chosen subset — the wheel only advances between
+                positions, so each song-slot is played once per chosen
+                difficulty), OR the literal string 'all' which is a
+                shortcut for the full 4-element list. The list path is
+                what the UI sends after multi-checkbox selection;
+                single-string + 'all' are kept for CLI back-compat. The
+                runner reorders the user's selection into canonical
+                normal → hard → pro → legendary order regardless of
+                checkbox click order. Each cycle's canorus check is
+                independent because the canorus pill is per-difficulty
+                in-game.
         """
-        if difficulty == 'all':
-            # Hard-coded order — Genshin's UI presents the cards left to
-            # right in this same sequence, so it matches the player's
-            # mental model.
-            self.difficulties = ['normal', 'hard', 'pro', 'legendary']
+        # Canonical card order — Genshin's UI presents the cards left
+        # to right in this sequence, and each cycle plays a song at
+        # increasing difficulty so the player's mental model stays
+        # intact regardless of which subset the user picked.
+        _ORDER = ('normal', 'hard', 'pro', 'legendary')
+        if isinstance(difficulty, (list, tuple, set, frozenset)):
+            chosen = {
+                d.lower() for d in difficulty
+                if isinstance(d, str) and d.lower() in ALBUM_DIFFICULTY_COORDS
+            }
+            if not chosen:
+                raise ValueError(
+                    f"no valid difficulties in: {difficulty!r}")
+            self.difficulties = [d for d in _ORDER if d in chosen]
+        elif difficulty == 'all':
+            self.difficulties = list(_ORDER)
         elif difficulty in ALBUM_DIFFICULTY_COORDS:
             self.difficulties = [difficulty]
         else:

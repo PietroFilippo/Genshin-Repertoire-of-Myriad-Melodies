@@ -628,6 +628,21 @@ button {
     gap: 8px;
 }
 
+/* Difficulty multi-select — 4 inline checkboxes inside the album
+   options card. `.compact` shrinks vertical padding so the row
+   matches the height of the songs spinbox above it. */
+.diff-checks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    align-items: center;
+}
+
+.checkbox.compact {
+    padding: 2px 0;
+    gap: 6px;
+}
+
 /* --- macros panel ------------------------------------------------------- */
 
 .macro-controls-row {
