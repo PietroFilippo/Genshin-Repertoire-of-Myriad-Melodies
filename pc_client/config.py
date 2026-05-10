@@ -9,13 +9,16 @@ SERIAL_PORT = None
 # Ensure this matches the arduino sketch setup
 BAUD_RATE = 115200
 
-# Default input backend. 'arduino' uses ArduinoHIDController (real USB HID
-# via the Leonardo). 'software' uses SoftwareInputController which
-# synthesizes input via Win32 SendInput / mouse_event — no hardware
-# required, but synthetic input doesn't drive Genshin's combat anti-cheat
-# paths (rhythm minigame + menus are fine, see software_input.py header).
-# The UI persists this per-user in ui_settings.json; this is the fallback.
-INPUT_BACKEND_DEFAULT = 'arduino'
+# Default input backend for first-launch / unset settings. 'software' uses
+# SoftwareInputController which synthesizes input via Win32 SendInput /
+# mouse_event — no hardware required, works for rhythm minigame + menu
+# clicks (the only combat path it can't drive is in-combat camera/aim,
+# blocked by anti-cheat). 'arduino' uses ArduinoHIDController (real USB
+# HID via the Leonardo) and is the right pick for users who want combat
+# macros or already have the board wired up. The UI persists this per-user
+# in ui_settings.json — existing users keep whatever they last selected;
+# only fresh installs see this default.
+INPUT_BACKEND_DEFAULT = 'software'
 
 # Gameplay config
 # The keys assigned to the 6 columns from left to right

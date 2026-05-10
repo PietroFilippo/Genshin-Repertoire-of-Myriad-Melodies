@@ -29,6 +29,21 @@
     <!-- Main tab -->
     <section class="panel panel-active" data-panel="main">
         <fieldset class="card">
+            <legend>Input backend</legend>
+            <div class="row row-grid">
+                <label for="input-backend">Mode</label>
+                <div class="select-wrapper">
+                    <select id="input-backend">
+                        <option value="software">Software (Win32 SendInput)</option>
+                        <option value="arduino">Arduino HID (hardware)</option>
+                    </select>
+                </div>
+                <span class="help" tabindex="0" aria-label="Input backend info"
+                      data-help="Applies to everything that injects input into the game — rhythm bot, album auto-clicker, and macro playback. Software mode (default) uses Win32 SendInput / mouse_event — no hardware, works for the rhythm minigame, album navigation, and menu-driven macros. Arduino mode drives a Leonardo over USB serial; real HID hardware so it also works for combat input that the anti-cheat blocks for synthetic input. Switching while bot or macro is running prompts to stop them first.">?</span>
+            </div>
+        </fieldset>
+
+        <fieldset class="card">
             <legend>Mode</legend>
             <div class="row">
                 <label class="radio">
@@ -45,17 +60,6 @@
                 </label>
                 <span class="help" tabindex="0" aria-label="Album mode info"
                       data-help="Auto-plays one country album page (Mondstadt / Liyue / Inazuma / ...) end to end. Open a country album page first, then press Start. Tip: switching Standalone → Album while a song is already playing picks up from the current song instead of going through the menu — press Stop first if you want to start from song 1. See the ? icons next to Songs and Difficulty for how those interact.">?</span>
-            </div>
-            <div class="row row-grid">
-                <label for="input-backend">Input</label>
-                <div class="select-wrapper">
-                    <select id="input-backend">
-                        <option value="arduino">Arduino HID (hardware)</option>
-                        <option value="software">Software (Win32 SendInput)</option>
-                    </select>
-                </div>
-                <span class="help" tabindex="0" aria-label="Input backend info"
-                      data-help="Arduino mode drives a Leonardo over USB serial — real HID hardware, works for everything including in-combat input that anti-cheat blocks. Software mode uses Win32 SendInput / mouse_event with no hardware needed; works for the rhythm minigame and album navigation but doesn't drive in-game combat through anti-cheat. Switching while bot or macro is running prompts to stop them first.">?</span>
             </div>
         </fieldset>
 
