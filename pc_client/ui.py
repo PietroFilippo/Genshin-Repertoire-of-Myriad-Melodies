@@ -126,7 +126,6 @@ def _release_ll_hooks():
 import ui_core
 from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
                     ALBUM_SONG_COUNT)
-from controller import ArduinoHIDController
 from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
                      ACTION_MACRO_RECORD, ACTION_MACRO_SAVE,
                      ACTION_MACRO_STOP, ACTION_PAUSE, ACTION_START_STOP,
@@ -134,7 +133,8 @@ from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
                      MACRO_ACTIONS, MacroController, QueueWriter,
                      UI_WINDOW_TITLE, focus_game_window, is_admin,
                      is_frozen, js_event_to_hotkey, load_settings,
-                     save_settings, warn_if_not_admin)
+                     make_input_backend, save_settings,
+                     warn_if_not_admin)
 
 
 def _resource_dir():
@@ -512,6 +512,7 @@ class BridgeApi:
             'macro_loaded': 0,
             'macro_dirty': False,
             'macro_pending': '',
+            'input_backend': self._settings.get('input_backend', 'arduino'),
         }
 
         self._log_queue = queue.Queue(maxsize=LOG_QUEUE_SIZE)
@@ -632,6 +633,7 @@ class BridgeApi:
                 'keybinds': dict(self._settings['keybinds']),
                 'difficulties': list(ALBUM_DIFFICULTY_COORDS),
                 'macro': self._macro.snapshot(),
+                'input_backend': self._settings.get('input_backend', 'arduino'),
             }
 
     def start_stop(self):
@@ -818,6 +820,42 @@ class BridgeApi:
         except (TypeError, ValueError):
             return {'ok': False, 'reason': 'bad_slot'}
         return {'ok': bool(self._macro.rename_slot(n, name))}
+
+    # ---- input backend selector ----
+
+    def set_input_backend(self, name, force=False):
+        """Switch the active input backend. 'arduino' (real USB HID via
+        the Leonardo) or 'software' (Win32 SendInput / mouse_event, no
+        hardware). Refuses while bot or macro is busy unless `force` is
+        set — JS prompts the user on conflict and re-calls with
+        force=True. Closes the current backend so its COM port / hooks
+        come down before the next caller lazy-builds the new one."""
+        name = (name or '').lower()
+        if name not in ('arduino', 'software'):
+            return {'ok': False, 'reason': 'bad_backend'}
+        with self._lock:
+            current = self._settings.get('input_backend', 'arduino')
+        if name == current:
+            return {'ok': True, 'reason': 'unchanged'}
+        if self._bot.is_running() or self._macro.is_busy():
+            if not force:
+                return {'ok': False, 'reason': 'busy'}
+            self._stop_bot_blocking()
+            self._stop_macro_blocking()
+        with self._arduino_lock:
+            ard = self._arduino
+            self._arduino = None
+        if ard is not None:
+            try:
+                ard.close()
+            except Exception as e:
+                print(f"[ui] backend close error during switch: {e}")
+        with self._lock:
+            self._settings['input_backend'] = name
+            save_settings(self._settings)
+        self._enqueue_status({'input_backend': name})
+        print(f"[ui] input backend set to {name!r}")
+        return {'ok': True}
 
     def macro_get_events(self):
         """Returns the buffer for the events editor. Each event is
@@ -1022,23 +1060,26 @@ class BridgeApi:
         return kb_names, mouse_btns
 
     def _get_arduino(self):
-        """Lazy-build the shared Arduino. Returns the controller or None
-        on init failure. ArduinoHIDController.__init__ calls sys.exit on
-        port-not-found, so we trap SystemExit too — UI keeps running so
-        the user can fix wiring and try again. Failures don't latch:
-        the next caller retries from scratch (port may have been
-        transiently busy from a prior bot session resetting the
-        Leonardo)."""
+        """Lazy-build the chosen input backend (Arduino HID or
+        software SendInput, per `_settings['input_backend']`). Returns
+        the controller or None on init failure. The Arduino backend
+        calls `sys.exit` on port-not-found so we trap SystemExit too —
+        UI keeps running so the user can fix wiring or switch to the
+        software backend. Failures don't latch: the next caller retries
+        from scratch."""
         with self._arduino_lock:
             if self._arduino is not None:
                 return self._arduino
+            with self._lock:
+                backend = self._settings.get('input_backend', 'arduino')
             try:
-                self._arduino = ArduinoHIDController()
+                self._arduino = make_input_backend(backend)
             except SystemExit:
-                print('[ui] Arduino init failed — board not detected. '
-                      'Check connection and try again.')
+                print(f'[ui] {backend} backend init failed — '
+                      'check connection and try again, or switch to '
+                      'the other backend in the UI.')
             except Exception as e:
-                print(f'[ui] Arduino init error: {e}')
+                print(f'[ui] {backend} backend init error: {e}')
             return self._arduino
 
     def _log_hotkey(self, action):

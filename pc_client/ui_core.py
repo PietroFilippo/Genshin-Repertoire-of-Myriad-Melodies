@@ -26,7 +26,7 @@ import mouse
 import main as bot_main
 from album import AlbumRunner
 from config import (ALBUM_DIFFICULTY, ALBUM_SONG_COUNT, GAME_WINDOW_TITLE,
-                    KEYS, UI_KEYBINDS_DEFAULT)
+                    INPUT_BACKEND_DEFAULT, KEYS, UI_KEYBINDS_DEFAULT)
 
 
 UI_WINDOW_TITLE = 'Genshin Rhythm Bot'
@@ -157,21 +157,52 @@ def macros_dir():
 
 # --- settings persistence ---------------------------------------------------
 
+_VALID_BACKENDS = ('arduino', 'software')
+
+
+def _normalize_backend(name):
+    name = (name or '').strip().lower()
+    return name if name in _VALID_BACKENDS else INPUT_BACKEND_DEFAULT
+
+
 def load_settings():
-    """Load UI settings (currently just keybinds). Falls back to config
+    """Load UI settings (keybinds + input_backend). Falls back to config
     defaults on missing file or parse errors."""
     p = settings_path()
     if not p.exists():
-        return {'keybinds': dict(UI_KEYBINDS_DEFAULT)}
+        return {
+            'keybinds': dict(UI_KEYBINDS_DEFAULT),
+            'input_backend': INPUT_BACKEND_DEFAULT,
+        }
     try:
         with p.open('r', encoding='utf-8') as fh:
             data = json.load(fh)
         kb = dict(UI_KEYBINDS_DEFAULT)
         kb.update(data.get('keybinds', {}))
-        return {'keybinds': kb}
+        backend = _normalize_backend(data.get('input_backend'))
+        return {'keybinds': kb, 'input_backend': backend}
     except Exception as e:
         print(f"[ui] failed to load settings: {e} — using defaults")
-        return {'keybinds': dict(UI_KEYBINDS_DEFAULT)}
+        return {
+            'keybinds': dict(UI_KEYBINDS_DEFAULT),
+            'input_backend': INPUT_BACKEND_DEFAULT,
+        }
+
+
+def make_input_backend(name):
+    """Factory: build the chosen input backend. 'arduino' (default)
+    uses real USB HID via the Leonardo; 'software' uses Win32
+    SendInput / mouse_event — no hardware, but no combat anti-cheat
+    bypass either (see `software_input.py` header). Imports are
+    inside the function so a missing pyserial / missing keyboard /
+    missing mouse package only breaks the backend that needs it,
+    not the whole UI."""
+    backend = _normalize_backend(name)
+    if backend == 'software':
+        from software_input import SoftwareInputController
+        return SoftwareInputController()
+    from controller import ArduinoHIDController
+    return ArduinoHIDController()
 
 
 def save_settings(settings):

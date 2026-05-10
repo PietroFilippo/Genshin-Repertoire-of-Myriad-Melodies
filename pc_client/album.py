@@ -210,25 +210,14 @@ class AlbumRunner:
                 int(ref_w * self.scale_x), int(ref_h * self.scale_y))
 
     def _move_cursor_to(self, target_x, target_y, max_iters=15, tol=2):
-        """Iteratively move the cursor to (target_x, target_y) via Arduino
-        HID relative moves. Genshin's anti-cheat ignores SetCursorPos and
-        SendInput-style cursor moves entirely — only real HID hardware
-        deltas update the in-game cursor. We close the loop with
-        GetCursorPos to compensate for Windows pointer-precision scaling
-        (HID mickeys != screen pixels at non-default settings)."""
-        pt = ctypes.wintypes.POINT()
-        for _ in range(max_iters):
-            if self.stop_evt.is_set():
-                return False
-            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-            dx = target_x - pt.x
-            dy = target_y - pt.y
-            if abs(dx) <= tol and abs(dy) <= tol:
-                return True
-            self.controller.mouse_move(dx, dy)
-            if self._stop_wait(0.04):
-                return False
-        return False
+        """Thin shim — the actual move logic lives on the controller so
+        each backend can pick its own strategy: the Arduino backend
+        does iterative HID convergence (EPP-aware), the software
+        backend (`SoftwareInputController`) does a single
+        `mouse_event` absolute jump."""
+        return self.controller.move_to(int(target_x), int(target_y),
+                                       stop_evt=self.stop_evt,
+                                       max_iters=max_iters, tol=tol)
 
     def _click_screen(self, sx, sy):
         converged = self._move_cursor_to(int(sx), int(sy))

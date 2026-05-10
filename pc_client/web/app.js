@@ -118,6 +118,36 @@ $('#replay-canorus').addEventListener('change', () => {
     callApi('set_replay_canorus', $('#replay-canorus').checked);
 });
 
+// --- input backend selector ------------------------------------------------
+
+function currentBackend() {
+    return (STATE.lastStatus || {}).input_backend
+        || $('#input-backend').value
+        || 'arduino';
+}
+
+$('#input-backend').addEventListener('change', () => {
+    const desired = $('#input-backend').value;
+    const current = currentBackend();
+    if (desired === current) return;
+    const trySwitch = (force) => callApi('set_input_backend', desired, !!force);
+    trySwitch(false).then((res) => {
+        if (res && res.ok === false && res.reason === 'busy') {
+            const ok = confirm(
+                'Bot or macro is currently running. Stop them and switch '
+                + 'to ' + desired + '?');
+            if (!ok) {
+                // Revert dropdown without re-firing change.
+                $('#input-backend').value = current;
+                return;
+            }
+            trySwitch(true);
+        } else if (res && res.ok === false) {
+            $('#input-backend').value = current;
+        }
+    });
+});
+
 $('#debug').addEventListener('change', () => {
     callApi('set_debug', $('#debug').checked);
 });
@@ -626,6 +656,13 @@ window.updateStatus = function updateStatus(data) {
     }
     if ('keybinds' in data) renderKeybinds(data.keybinds);
 
+    if ('input_backend' in data) {
+        const sel = $('#input-backend');
+        if (sel && sel.value !== data.input_backend) {
+            sel.value = data.input_backend;
+        }
+    }
+
     if ('macro_state' in data || 'macro_events' in data
         || 'macro_loaded' in data || 'macro_slot_names' in data
         || 'macro_dirty' in data) {
@@ -724,6 +761,7 @@ function init() {
         if (s.difficulty) $('#difficulty').value = s.difficulty;
         if (typeof s.replay_canorus === 'boolean') $('#replay-canorus').checked = s.replay_canorus;
         if (typeof s.debug === 'boolean') $('#debug').checked = s.debug;
+        if (s.input_backend) $('#input-backend').value = s.input_backend;
         if (s.keybinds) renderKeybinds(s.keybinds);
         applyModeUi();
         // Initial status payload — fold macro snapshot in so the
@@ -744,6 +782,7 @@ function init() {
             macro_loaded: macroSnap.macro_loaded || 0,
             macro_dirty: !!macroSnap.macro_dirty,
             macro_pending: macroSnap.macro_pending || '',
+            input_backend: s.input_backend || 'arduino',
         });
     });
 }

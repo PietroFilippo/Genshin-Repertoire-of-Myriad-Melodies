@@ -1,4 +1,6 @@
 # pc_client/controller.py
+import ctypes
+import ctypes.wintypes
 import serial
 from serial.tools import list_ports
 import time
@@ -143,6 +145,38 @@ class ArduinoHIDController:
         Arduino's hardware-style relative move. The sketch chunks deltas
         larger than ±127 into multiple HID reports."""
         self._send_command(f"P:{int(dx)}:{int(dy)}")
+
+    def move_to(self, x, y, stop_evt=None, max_iters=15, tol=2):
+        """Closed-loop absolute move to screen-pixel (x, y). Genshin's
+        anti-cheat ignores SetCursorPos and synthetic SendInput-style
+        cursor moves, so we drive the cursor with real HID relative
+        deltas and check via GetCursorPos until it lands within `tol`
+        pixels (axis-wise) of the target. Iterating compensates for
+        Windows pointer-precision (Enhance Pointer Precision) which
+        makes a single delta over- or under-shoot — usually converges
+        in 1-2 iters with EPP off (AlbumRunner disables it for the
+        run). Sleep between iters is 40 ms — long enough that the
+        Arduino round-trip + cursor update is observable on the next
+        GetCursorPos. Returns True on convergence, False on stop_evt
+        or running out of iterations."""
+        user32 = ctypes.windll.user32
+        pt = ctypes.wintypes.POINT()
+        for _ in range(max_iters):
+            if stop_evt is not None and stop_evt.is_set():
+                return False
+            user32.GetCursorPos(ctypes.byref(pt))
+            dx = int(x) - pt.x
+            dy = int(y) - pt.y
+            if abs(dx) <= tol and abs(dy) <= tol:
+                return True
+            self.mouse_move(dx, dy)
+            # Cancellable wait — stop_evt.wait returns True if set.
+            if stop_evt is not None:
+                if stop_evt.wait(0.04):
+                    return False
+            else:
+                time.sleep(0.04)
+        return False
 
     def close(self):
         if self.ser and self.ser.is_open:
