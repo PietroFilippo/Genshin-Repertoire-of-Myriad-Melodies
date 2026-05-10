@@ -124,9 +124,15 @@ Launch the bot, switch focus to Genshin, then either click **Start** in the UI o
 ### Modes
 
 - **Standalone** - starts the rhythm detector, runs until you stop it. Use it on any song you've manually started.
-- **Album** - clicks through one country album page (Mondstadt, Liyue, Inazuma, Fontaine, ...) for you. Pick a difficulty + song count and choose whether to replay songs already at Canorus rank.
+- **Album** - clicks through one country album page (Mondstadt, Liyue, Inazuma, Fontaine, ...) for you. Pick any subset of difficulties via the four checkboxes (at least one must stay checked) + song count and choose whether to replay songs already at Canorus rank.
 
   Open the country album page (not the All Albums grid), then press Start.
+
+  **Difficulty subset behavior:**
+  - **One checked** — classic single-difficulty run, plays each song once at that difficulty (12 songs total at default song count).
+  - **Two or three checked** — each song-slot is played once per chosen difficulty before the wheel advances. Example: Normal + Hard checked → song 1 Normal → song 1 Hard → song 2 Normal → song 2 Hard → ... Order is always normal → hard → pro → legendary regardless of click order.
+  - **All four checked** — equivalent to an "All" option (4 × 12 = 48 plays at default song count).
+  - Canorus skip is always per-difficulty: a song already at Canorus on Normal is skipped just for that pass; the same song still plays on Hard if Hard is selected and not yet Canorus there.
 
 You can switch modes mid-run - the bot stops the current worker and starts a fresh one in the new mode. Switching out of Album mid-song asks for confirmation first because the current song progress is lost.
 
