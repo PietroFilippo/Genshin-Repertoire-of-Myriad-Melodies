@@ -13,7 +13,7 @@ Two rhythm modes plus a built-in macro tool:
 
 Mainly because I had an Arduino sitting around and wanted a project to use it for, plus an excuse to actually learn the platform end-to-end (firmware, HID, serial). The rhythm-bot use case fit perfectly.
 
-But because the game accepts SendInput-style input fine, a **software-only mode** was also added as a parallel option that needs no hardware at all.
+But because the game accepts SendInput-style input fine for the rhythm minigame and menus, a **software-only mode** was also added as a parallel option that needs no hardware at all. You only need the Arduino if you want the extra ceiling it gives (combat input, hardware-HID resilience).
 
 Pick whichever fits, you can switch at any time from the **Input** dropdown in the Main tab.
 
@@ -57,11 +57,11 @@ Short version:
 
 ## Setup
 
-### 1. Flash the Arduino *(skip if you'll use software mode)*
+### 1. Flash the Arduino *(optional — software mode is the default)*
 
-If you only plan to use **software** input mode (set the Input dropdown to "Software (Win32 SendInput)" in the UI), skip this step entirely — no hardware is involved.
+The bot ships with the **software** input backend selected by default; you don't need to flash anything to get the rhythm bot, album auto-clicker, or menu-driven macros working.
 
-If you want the Arduino backend:
+Flash the Leonardo only if you want the Arduino backend (combat-input macros, or hardware-HID resilience):
 
 1. Open `arduino/rhythm_controller/rhythm_controller.ino` in the Arduino IDE.
 2. Select **Tools → Board → Arduino Leonardo** (or your specific ATmega32u4 board).
