@@ -5,11 +5,13 @@ import json
 import threading
 import sys
 import os
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import KEYS, MACRO_HOTKEYS as _DEFAULT_HOTKEYS
 from controller import ArduinoHIDController
+from macro_engine import MacroEngine
 
 # Logical action names — single source of truth for what bindings the
 # tool needs. ACTIONS (defined later) maps these to handler callables.
@@ -20,14 +22,14 @@ ACTION_NAMES = ('record', 'play', 'stop', 'save', 'load', 'exit')
 # the in-tool config flow writes back to that file.
 HOTKEYS = dict(_DEFAULT_HOTKEYS)
 
-# === Macro state ===
-recording = False
-playing = False
-macro_events = []
-start_time = 0.0
-
+# Shared event buffer + auto-repeat / playback logic. CLI owns the
+# "is a playback worker running" flag — the engine doesn't track it
+# because playback is just a (cancellable) method call.
+_engine = MacroEngine()
 arduino = None
 _exit_event = threading.Event()
+_playing = False
+_stop_play_evt = threading.Event()
 
 # Resolved from HOTKEYS in main() — used to filter macro control
 # keys/buttons during recording so they are not captured as macro events.
@@ -63,15 +65,15 @@ def _display(binding):
 
 
 def _slot_path(n):
-    return os.path.join(os.path.dirname(__file__), f'macro_{n}.json')
+    return Path(__file__).parent / f'macro_{n}.json'
 
 
 def _legacy_path():
-    return os.path.join(os.path.dirname(__file__), 'macro.json')
+    return Path(__file__).parent / 'macro.json'
 
 
 def _slot_exists(n):
-    return os.path.exists(_slot_path(n))
+    return _slot_path(n).exists()
 
 
 def _list_slots():
@@ -80,16 +82,16 @@ def _list_slots():
 
 # === Hotkey override file ===
 def _overrides_path():
-    return os.path.join(os.path.dirname(__file__), 'macro_hotkeys.json')
+    return Path(__file__).parent / 'macro_hotkeys.json'
 
 
 def _load_overrides():
     """Layer macro_hotkeys.json on top of the defaults in config.py."""
     path = _overrides_path()
-    if not os.path.exists(path):
+    if not path.exists():
         return
     try:
-        with open(path) as f:
+        with path.open() as f:
             data = json.load(f)
     except Exception as e:
         print(f"[WARN] Failed to load hotkey overrides: {e}")
@@ -100,15 +102,15 @@ def _load_overrides():
         v = data.get(action)
         if isinstance(v, str) and v:
             HOTKEYS[action] = v
-    print(f"[MACRO] Loaded hotkey overrides from {os.path.basename(path)}")
+    print(f"[MACRO] Loaded hotkey overrides from {path.name}")
 
 
 def _save_overrides():
     path = _overrides_path()
     try:
-        with open(path, 'w') as f:
+        with path.open('w') as f:
             json.dump(HOTKEYS, f, indent=4)
-        print(f"[MACRO] Saved hotkeys to {os.path.basename(path)}")
+        print(f"[MACRO] Saved hotkeys to {path.name}")
     except Exception as e:
         print(f"[ERROR] Failed to save overrides: {e}")
 
@@ -183,131 +185,85 @@ def _run_config_flow():
 
 # === Recording hooks ===
 def on_key_event(event):
-    global recording, macro_events, start_time
-    if not recording:
-        return
-
     name = event.name.lower() if event.name else ''
     if name in _KB_HOTKEY_NAMES:
         return
-
-    if event.event_type == 'down' and macro_events:
-        last = next((e for e in reversed(macro_events)
-                     if e['device'] == 'keyboard' and e['key'] == name), None)
-        if last and last['event_type'] == 'down':
-            return
-
-    macro_events.append({
-        'time': time.time() - start_time,
-        'device': 'keyboard',
-        'key': name,
-        'event_type': event.event_type,
-    })
+    # Engine silently drops events when not recording, so the hook can
+    # be wired unconditionally. Auto-repeat suppression + timestamp
+    # delta happen inside the engine.
+    _engine.record_keyboard(name, event.event_type)
 
 
 def on_mouse_event(event):
-    global recording, macro_events, start_time
     if not isinstance(event, mouse.ButtonEvent):
         return
 
     btn = event.button.lower()
 
+    # Mouse-hotkey dispatch — runs regardless of record state so a
+    # mouse button bound to (say) Play actually fires playback. This
+    # callback is the only place mouse hotkeys are routed; the
+    # `keyboard` package's add_hotkey doesn't handle them.
     if event.event_type in ('down', 'double'):
         for action_name, fn in ACTIONS.items():
             binding = HOTKEYS.get(action_name)
             if binding and _is_mouse(binding) and _mouse_button(binding) == btn:
                 fn()
 
-    if not recording:
-        return
     if btn in _MOUSE_HOTKEY_BUTTONS:
         return
-
-    ev_type = 'down' if event.event_type == 'double' else event.event_type
-    macro_events.append({
-        'time': time.time() - start_time,
-        'device': 'mouse',
-        'key': btn,
-        'event_type': ev_type,
-    })
+    _engine.record_mouse(btn, event.event_type)
 
 
 # === Playback ===
 def play_macro():
-    global playing, arduino
-    if playing or not macro_events:
-        return
-
-    playing = True
+    global _playing
     print("\n[MACRO] Playing macro...")
-
-    start_play_time = time.time()
-
-    for event in macro_events:
-        if not playing:
-            break
-        target_time = start_play_time + event['time']
-        sleep_time = target_time - time.time()
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-
-        if event.get('device', 'keyboard') == 'keyboard':
-            if event['event_type'] == 'down':
-                arduino.key_down(event['key'])
-            elif event['event_type'] == 'up':
-                arduino.key_up(event['key'])
-        elif event.get('device') == 'mouse':
-            if event['event_type'] in ('down', 'double'):
-                arduino.mouse_down(event['key'])
-            elif event['event_type'] == 'up':
-                arduino.mouse_up(event['key'])
-
-    for k in KEYS:
-        arduino.key_up(k)
-    arduino.mouse_up('left')
-    arduino.mouse_up('right')
-
-    playing = False
-    print("[MACRO] Playback finished.")
-    print_menu()
+    try:
+        _engine.play(arduino, stop_evt=_stop_play_evt, rhythm_keys=KEYS)
+    finally:
+        _playing = False
+        print("[MACRO] Playback finished.")
+        print_menu()
 
 
 def toggle_recording():
-    global recording, macro_events, start_time
-    if playing:
+    if _playing:
         print("\n[ERROR] Cannot record while playing.")
         return
 
-    if recording:
-        recording = False
-        print(f"\n[MACRO] Stopped recording. Recorded {len(macro_events)} events.")
+    if _engine.is_recording():
+        _engine.end_record()
+        print(f"\n[MACRO] Stopped recording. "
+              f"Recorded {_engine.event_count()} events.")
         print_menu()
     else:
-        macro_events = []
-        start_time = time.time()
-        recording = True
-        print(f"\n[MACRO] 🔴 Started recording... Press {_display(HOTKEYS['record'])} to stop.")
+        _engine.begin_record()
+        print(f"\n[MACRO] 🔴 Started recording... "
+              f"Press {_display(HOTKEYS['record'])} to stop.")
 
 
 def start_playback():
     """Idempotent — a press while a macro is already running is a no-op,
     so the play key can be spammed safely without cancelling the run.
     """
-    if recording:
+    global _playing
+    if _engine.is_recording():
         print("\n[ERROR] Cannot play while recording.")
         return
-    if playing:
+    if _playing:
         return
-    if not macro_events:
+    if _engine.event_count() == 0:
         print("\n[ERROR] No macro recorded to play.")
         return
+    _playing = True
+    _stop_play_evt.clear()
     threading.Thread(target=play_macro, daemon=True).start()
 
 
 def stop_playback():
-    global playing
-    if playing:
-        playing = False
+    if _playing:
+        _stop_play_evt.set()
         print("\n[MACRO] ⏹️ Playback stopped.")
 
 
@@ -315,39 +271,39 @@ def stop_playback():
 def _save_slot(slot):
     path = _slot_path(slot)
     try:
-        with open(path, 'w') as f:
-            json.dump(macro_events, f, indent=4)
-        print(f"\n[MACRO] 💾 Saved to slot {slot} -> {os.path.basename(path)}")
+        _engine.save(path)
+        _engine.mark_saved(slot)
+        print(f"\n[MACRO] 💾 Saved to slot {slot} -> {path.name}")
     except Exception as e:
         print(f"\n[ERROR] Failed to save slot {slot}: {e}")
     print_menu()
 
 
 def _load_slot(slot):
-    global macro_events
     path = _slot_path(slot)
-    if not os.path.exists(path):
-        if slot == 1 and os.path.exists(_legacy_path()):
-            path = _legacy_path()
+    if not path.exists():
+        legacy = _legacy_path()
+        if slot == 1 and legacy.exists():
+            path = legacy
         else:
             print(f"\n[ERROR] Slot {slot} is empty.")
             print_menu()
             return
 
     try:
-        with open(path, 'r') as f:
-            macro_events = json.load(f)
-        print(f"\n[MACRO] 📂 Loaded slot {slot} ({len(macro_events)} events from {os.path.basename(path)})")
+        _engine.load(path, slot=slot)
+        print(f"\n[MACRO] 📂 Loaded slot {slot} "
+              f"({_engine.event_count()} events from {path.name})")
     except Exception as e:
         print(f"\n[ERROR] Failed to load slot {slot}: {e}")
     print_menu()
 
 
 def _begin_save():
-    if recording or playing:
+    if _engine.is_recording() or _playing:
         print("\n[ERROR] Cannot save while recording or playing.")
         return
-    if not macro_events:
+    if _engine.event_count() == 0:
         print("\n[ERROR] No macro to save.")
         return
     occupied = _list_slots()
@@ -359,11 +315,11 @@ def _begin_save():
 
 
 def _begin_load():
-    if recording or playing:
+    if _engine.is_recording() or _playing:
         print("\n[ERROR] Cannot load while recording or playing.")
         return
     occupied = _list_slots()
-    legacy = os.path.exists(_legacy_path())
+    legacy = _legacy_path().exists()
     if not occupied and not legacy:
         print("\n[ERROR] No saved slots.")
         return
@@ -480,7 +436,7 @@ def print_menu():
     occupied = _list_slots()
     if occupied:
         print(f"Saved slots    : {', '.join(map(str, occupied))}")
-    elif os.path.exists(_legacy_path()):
+    elif _legacy_path().exists():
         print("Saved slots    : 1 (legacy macro.json)")
     print("------------------")
 

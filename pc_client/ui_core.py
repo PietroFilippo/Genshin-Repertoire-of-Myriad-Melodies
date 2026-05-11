@@ -26,6 +26,7 @@ import mouse
 from album import AlbumRunner
 from config import (ALBUM_DIFFICULTY, ALBUM_SONG_COUNT, GAME_WINDOW_TITLE,
                     INPUT_BACKEND_DEFAULT, KEYS, UI_KEYBINDS_DEFAULT)
+from macro_engine import MacroEngine
 from standalone_runner import run_standalone
 from system_setup import boost_timer, restore_timer, set_dpi_aware
 
@@ -741,18 +742,11 @@ class MacroController:
         self._on_status = on_status
         self._lock = threading.Lock()
         self._state = self.STATE_IDLE
-        self._events = []
-        self._start_ts = 0.0
-        # Slot the current buffer came from (set on load + save). Cleared
-        # when a fresh recording starts or the slot is deleted, so the UI
-        # never shows a stale "loaded: N" indicator pointing at a buffer
-        # that no longer matches the file.
-        self._loaded_slot = None
-        # True when the buffer differs from the slot it was loaded from
-        # (set on edit / record, cleared on load / save). Surfaces in the
-        # UI as a "modified" tag so the user knows the slot ring color
-        # doesn't reflect what's in memory.
-        self._dirty = False
+        # Event buffer + auto-repeat suppression + playback timing live
+        # in MacroEngine. We own the state machine, hooks, foreground
+        # gating, slot-picker, and exclusion filter — see macro_engine.py
+        # for the contract split.
+        self._engine = MacroEngine()
         self._kb_hook = None
         self._mouse_hook = None
         self._play_thread = None
@@ -799,12 +793,8 @@ class MacroController:
             if not p.exists():
                 continue
             try:
-                with p.open('r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    names[n] = (data.get('name') or '').strip()
-                else:
-                    names[n] = ''
+                _events, name = MacroEngine.read(p)
+                names[n] = name
             except Exception:
                 names[n] = ''
         return names
@@ -813,63 +803,29 @@ class MacroController:
         """Status fields the UI drain pushes to JS."""
         return {
             'macro_state': self._state,
-            'macro_events': len(self._events),
+            'macro_events': self._engine.event_count(),
             'macro_slots': self.list_slots(),
             'macro_slot_names': self.slot_names(),
-            'macro_loaded': self._loaded_slot or 0,
-            'macro_dirty': self._dirty,
+            'macro_loaded': self._engine.loaded_slot() or 0,
+            'macro_dirty': self._engine.is_dirty(),
             'macro_pending': self._pending_action or '',
         }
 
     def get_events(self):
         """Copy of the buffer for the JS event editor. Each event is
         shallow-copied so JS edits to one don't smear into our state."""
-        return [dict(ev) for ev in self._events]
+        return [dict(ev) for ev in self._engine.events]
 
     def set_events(self, events):
-        """Replace the buffer with a JS-edited list. Validates each
-        entry — bad fields drop the event with a log line so a hand-
-        edited slot can't crash playback. Sorted by `time` so out-of-
-        order edits don't jumble playback ordering."""
+        """Replace the buffer with a JS-edited list. Engine handles
+        per-event validation + sort; we just gate on idle state."""
         if self._state != self.STATE_IDLE:
             print(f"[macro] cannot edit events while {self._state}")
             return False
-        if not isinstance(events, list):
+        cleaned = self._engine.replace_events(events)
+        if cleaned is None:
             print("[macro] set_events: payload must be a list")
             return False
-        cleaned = []
-        for i, ev in enumerate(events):
-            if not isinstance(ev, dict):
-                print(f"[macro] dropped event {i}: not an object")
-                continue
-            try:
-                t = float(ev.get('time', 0.0))
-            except (TypeError, ValueError):
-                print(f"[macro] dropped event {i}: bad time")
-                continue
-            if t < 0:
-                t = 0.0
-            device = (ev.get('device') or '').lower()
-            if device not in ('keyboard', 'mouse'):
-                print(f"[macro] dropped event {i}: bad device {device!r}")
-                continue
-            key = str(ev.get('key') or '').strip().lower()
-            if not key:
-                print(f"[macro] dropped event {i}: empty key")
-                continue
-            etype = (ev.get('event_type') or '').lower()
-            if etype not in ('down', 'up', 'double'):
-                print(f"[macro] dropped event {i}: bad event_type {etype!r}")
-                continue
-            cleaned.append({
-                'time': t,
-                'device': device,
-                'key': key,
-                'event_type': etype,
-            })
-        cleaned.sort(key=lambda e: e['time'])
-        self._events = cleaned
-        self._dirty = True
         print(f"[macro] events replaced — {len(cleaned)} valid")
         self._emit()
         return True
@@ -881,14 +837,6 @@ class MacroController:
             if self._state != self.STATE_IDLE:
                 print(f"[macro] cannot record — state is {self._state}")
                 return False
-            self._events = []
-            # Fresh recording detaches the buffer from any loaded slot —
-            # the loaded indicator would lie about what's in memory.
-            self._loaded_slot = None
-            # Buffer is empty until first event arrives — not "modified"
-            # in the sense of "differs from a saved slot".
-            self._dirty = False
-            self._start_ts = time.time()
             self._excluded_kb = {b.lower() for b in excluded_kb if b}
             self._excluded_mouse = {b.lower() for b in excluded_mouse if b}
             try:
@@ -898,6 +846,9 @@ class MacroController:
                 print(f"[macro] hook install failed: {e}")
                 self._unhook()
                 return False
+            # Engine clears the buffer, resets the start timestamp, and
+            # detaches loaded-slot — see MacroEngine.begin_record.
+            self._engine.begin_record()
             self._state = self.STATE_RECORDING
         print(f"[macro] recording started (capture only inside Genshin)")
         self._emit()
@@ -908,11 +859,10 @@ class MacroController:
             if self._state != self.STATE_RECORDING:
                 return False
             self._unhook()
+            # Engine marks the buffer dirty if anything was captured.
+            self._engine.end_record()
             self._state = self.STATE_IDLE
-            # If we captured anything, the buffer is now "unsaved-new" —
-            # use the dirty flag so the UI shows it as modified content.
-            self._dirty = bool(self._events)
-        print(f"[macro] stopped recording — {len(self._events)} events")
+        print(f"[macro] stopped recording — {self._engine.event_count()} events")
         self._emit()
         return True
 
@@ -931,7 +881,7 @@ class MacroController:
             if self._state != self.STATE_IDLE:
                 print(f"[macro] cannot play — state is {self._state}")
                 return False
-            if not self._events:
+            if self._engine.event_count() == 0:
                 print("[macro] no macro recorded / loaded")
                 return False
             controller = self._resolve_controller()
@@ -954,35 +904,12 @@ class MacroController:
         return True
 
     def _play_run(self, controller):
-        print(f"[macro] playing {len(self._events)} events")
-        start = time.time()
+        print(f"[macro] playing {self._engine.event_count()} events")
         try:
-            for ev in self._events:
-                if self._stop_play_evt.is_set():
-                    break
-                target = start + ev.get('time', 0.0)
-                wait = target - time.time()
-                if wait > 0 and self._stop_play_evt.wait(wait):
-                    break
-                device = ev.get('device', 'keyboard')
-                etype = ev.get('event_type')
-                key = ev.get('key', '')
-                if device == 'keyboard':
-                    if etype == 'down':
-                        controller.key_down(key)
-                    elif etype == 'up':
-                        controller.key_up(key)
-                elif device == 'mouse':
-                    if etype in ('down', 'double'):
-                        controller.mouse_down(key)
-                    elif etype == 'up':
-                        controller.mouse_up(key)
-            # Belt-and-suspenders: release every rhythm key + L/R mouse so
-            # an interrupted macro doesn't leave a key stuck down in-game.
-            for k in KEYS:
-                controller.key_up(k)
-            controller.mouse_up('left')
-            controller.mouse_up('right')
+            # Engine iterates events, sleeps cancellably, dispatches to
+            # the controller, and sweeps rhythm keys + L/R mouse on exit.
+            self._engine.play(controller, stop_evt=self._stop_play_evt,
+                              rhythm_keys=KEYS)
         except Exception as e:
             print(f"[macro] playback error: {e}")
         finally:
@@ -1003,32 +930,24 @@ class MacroController:
         if self._state != self.STATE_IDLE:
             print(f"[macro] cannot save while {self._state}")
             return False
-        if not self._events:
+        if self._engine.event_count() == 0:
             print("[macro] nothing to save — record or load first")
             return False
-        d = macros_dir()
         n_int = int(n)
-        path = d / f'macro_{n_int}.json'
+        path = macros_dir() / f'macro_{n_int}.json'
         if name is None:
-            existing = self.slot_names().get(n_int, '')
-            final_name = existing
+            final_name = self.slot_names().get(n_int, '')
         else:
             final_name = self._normalize_name(name)
         try:
-            d.mkdir(parents=True, exist_ok=True)
-            payload = {'name': final_name, 'events': self._events}
-            with path.open('w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=2)
+            self._engine.save(path, name=final_name)
+            self._engine.mark_saved(n_int)
             label = f' as {final_name!r}' if final_name else ''
-            print(f"[macro] saved {len(self._events)} events to slot "
-                  f"{n_int}{label}")
+            print(f"[macro] saved {self._engine.event_count()} events "
+                  f"to slot {n_int}{label}")
         except Exception as e:
             print(f"[macro] save slot {n_int} failed: {e}")
             return False
-        # Buffer now matches slot N on disk — track it as "loaded" so
-        # the UI shows which slot the in-memory macro corresponds to.
-        self._loaded_slot = n_int
-        self._dirty = False
         self._emit()
         return True
 
@@ -1038,35 +957,19 @@ class MacroController:
         if self._state != self.STATE_IDLE:
             print(f"[macro] cannot load while {self._state}")
             return False
-        d = macros_dir()
         n_int = int(n)
-        path = d / f'macro_{n_int}.json'
+        path = macros_dir() / f'macro_{n_int}.json'
         if not path.exists():
             print(f"[macro] slot {n_int} is empty")
             return False
         try:
-            with path.open('r', encoding='utf-8') as f:
-                data = json.load(f)
-            # Two on-disk shapes: legacy bare list (= events only, no
-            # name) or new dict {'name': str, 'events': list}.
-            if isinstance(data, list):
-                events = data
-                name = ''
-            elif isinstance(data, dict):
-                events = data.get('events', [])
-                name = (data.get('name') or '').strip()
-            else:
-                print(f"[macro] slot {n_int} malformed")
-                return False
-            if not isinstance(events, list):
-                print(f"[macro] slot {n_int} malformed events")
-                return False
-            self._events = events
-            self._loaded_slot = n_int
-            self._dirty = False
+            name = self._engine.load(path, slot=n_int)
             label = f' ({name!r})' if name else ''
             print(f"[macro] loaded slot {n_int}{label} "
-                  f"— {len(self._events)} events")
+                  f"— {self._engine.event_count()} events")
+        except ValueError as e:
+            print(f"[macro] slot {n_int} malformed: {e}")
+            return False
         except Exception as e:
             print(f"[macro] load slot {n_int} failed: {e}")
             return False
@@ -1076,9 +979,8 @@ class MacroController:
     def clear_slot(self, n):
         if not (1 <= int(n) <= 9):
             return False
-        d = macros_dir()
         n_int = int(n)
-        path = d / f'macro_{n_int}.json'
+        path = macros_dir() / f'macro_{n_int}.json'
         try:
             if path.exists():
                 path.unlink()
@@ -1091,8 +993,7 @@ class MacroController:
         # If the cleared slot was the one in memory, drop the loaded tag
         # — the buffer's events still exist but no longer correspond to
         # any saved slot.
-        if self._loaded_slot == n_int:
-            self._loaded_slot = None
+        self._engine.detach_slot(n_int)
         self._emit()
         return True
 
@@ -1101,22 +1002,13 @@ class MacroController:
         on empty slot (nothing to rename)."""
         if not (1 <= int(n) <= 9):
             return False
-        d = macros_dir()
         n_int = int(n)
-        path = d / f'macro_{n_int}.json'
+        path = macros_dir() / f'macro_{n_int}.json'
         if not path.exists():
             print(f"[macro] cannot rename slot {n_int} — empty")
             return False
         try:
-            with path.open('r', encoding='utf-8') as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                events = data
-            elif isinstance(data, dict):
-                events = data.get('events', [])
-            else:
-                print(f"[macro] slot {n_int} malformed")
-                return False
+            events, _old_name = MacroEngine.read(path)
             if not isinstance(events, list):
                 print(f"[macro] slot {n_int} malformed events")
                 return False
@@ -1150,7 +1042,7 @@ class MacroController:
         if self._state != self.STATE_IDLE:
             print(f"[macro] cannot save while {self._state}")
             return False
-        if not self._events:
+        if self._engine.event_count() == 0:
             print("[macro] nothing to save")
             return False
         self._set_pending('save')
@@ -1285,22 +1177,8 @@ class MacroController:
         name = (event.name or '').lower() if event.name else ''
         if not name or name in self._excluded_kb:
             return
-        # Suppress repeat 'down' events — keyboard sends one per OS auto-
-        # repeat tick which would balloon the event list and replay as
-        # rapid-fire taps.
-        if event.event_type == 'down' and self._events:
-            for prior in reversed(self._events):
-                if prior['device'] != 'keyboard' or prior['key'] != name:
-                    continue
-                if prior['event_type'] == 'down':
-                    return
-                break
-        self._events.append({
-            'time': time.time() - self._start_ts,
-            'device': 'keyboard',
-            'key': name,
-            'event_type': event.event_type,
-        })
+        # Engine applies the auto-repeat suppression rule + timestamp.
+        self._engine.record_keyboard(name, event.event_type)
 
     def _on_mouse_event(self, event):
         if self._state != self.STATE_RECORDING:
@@ -1312,13 +1190,7 @@ class MacroController:
         btn = (event.button or '').lower()
         if not btn or btn in self._excluded_mouse:
             return
-        ev_type = 'down' if event.event_type == 'double' else event.event_type
-        self._events.append({
-            'time': time.time() - self._start_ts,
-            'device': 'mouse',
-            'key': btn,
-            'event_type': ev_type,
-        })
+        self._engine.record_mouse(btn, event.event_type)
 
     def _emit(self):
         try:
