@@ -11,8 +11,7 @@ import numpy as np
 import time
 import sys
 
-# Reuse the auto-detection logic from main
-from main import find_game_window, get_game_geometry, auto_detect
+from game_window import find_game_window, get_game_geometry, auto_detect
 from config import KEYS, REF_COLUMN_X, REF_HIT_LINE_Y, PIXEL_THRESHOLD
 
 

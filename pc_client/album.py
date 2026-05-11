@@ -37,7 +37,8 @@ from config import (ALBUM_BEGIN_PERFORMANCE_XY, ALBUM_DIFFICULTY,
                     Y_SAMPLE_OFFSETS)
 from controller import ArduinoHIDController
 from detector import NoteDetector
-from main import find_game_window, get_game_geometry
+from game_window import find_game_window, get_game_geometry
+from standalone_runner import run_visualization
 
 
 # 1080p reference ROIs (search bounding boxes), derived from screenshots
@@ -437,7 +438,6 @@ class AlbumRunner:
             vs = threading.Event()
             if self.debug_evt is None:
                 return None, vs
-            from main import run_visualization
             cap = {'top': self.region['top'], 'left': self.region['left'],
                    'width': self.region['width'],
                    'height': self.region['height']}

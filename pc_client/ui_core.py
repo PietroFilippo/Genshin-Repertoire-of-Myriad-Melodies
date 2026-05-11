@@ -23,10 +23,11 @@ from pathlib import Path
 import keyboard
 import mouse
 
-import main as bot_main
 from album import AlbumRunner
 from config import (ALBUM_DIFFICULTY, ALBUM_SONG_COUNT, GAME_WINDOW_TITLE,
                     INPUT_BACKEND_DEFAULT, KEYS, UI_KEYBINDS_DEFAULT)
+from standalone_runner import run_standalone
+from system_setup import boost_timer, restore_timer, set_dpi_aware
 
 
 UI_WINDOW_TITLE = 'Genshin Rhythm Bot'
@@ -662,7 +663,7 @@ class BotController:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
         if self._timer_boosted:
-            bot_main.restore_timer()
+            restore_timer()
             self._timer_boosted = False
 
     def _emit(self, update):
@@ -674,9 +675,9 @@ class BotController:
     def _ensure_system_setup(self):
         """One-time DPI + timer boost. Idempotent across runs because
         timeBeginPeriod/EndPeriod are reference-counted by the OS."""
-        bot_main.set_dpi_aware()
+        set_dpi_aware()
         if not self._timer_boosted:
-            self._timer_boosted = bot_main.boost_timer()
+            self._timer_boosted = boost_timer()
 
     def _run(self):
         try:
@@ -689,10 +690,10 @@ class BotController:
                     print(f"[ui] controller_provider failed: {e}")
                     ctrl = None
             if self._mode == 'standalone':
-                bot_main.run_standalone(self._stop_evt, self._debug_evt,
-                                        status_cb=self._emit,
-                                        pause_evt=self._pause_evt,
-                                        controller=ctrl)
+                run_standalone(self._stop_evt, self._debug_evt,
+                               status_cb=self._emit,
+                               pause_evt=self._pause_evt,
+                               controller=ctrl)
             elif self._mode == 'album':
                 opts = self._mode_options
                 runner = AlbumRunner(replay_canorus=opts.get('replay_canorus', False),
