@@ -230,15 +230,21 @@ arduino/
   rhythm_controller/        Serial → HID firmware (Leonardo)
 pc_client/
   ui.py                     PyWebView front-end (.exe entrypoint)
-  ui_core.py                BotController, KeybindManager, settings
-  main.py                   Standalone-mode engine + CLI
-  album.py                  Album auto-runner + CLI
+  ui_core.py                BotController, MacroController, KeybindManager, settings
+  main.py                   Standalone-mode CLI entrypoint
+  standalone_runner.py      Rhythm-runner orchestrator (NoteDetector + viz)
+  album.py                  Album cycle orchestrator + CLI
+  song_player.py            Per-song state machine (intro click chain + detector + end-watcher + pause/resume)
+  screen_watcher.py         UI automation (grab, template match, click, cancellable waits)
   detector.py               Per-key pixel-polling rhythm detector
+  game_window.py            Genshin window detection + 1080p coord scaling
+  system_setup.py           Process-wide DPI awareness + 1ms multimedia timer
   controller.py             Arduino serial wrapper (Arduino backend)
   software_input.py         Win32 SendInput / mouse_event wrapper (software backend)
+  macro_engine.py           Shared macro core (event buffer, auto-repeat, playback, slot I/O)
+  macro_tool.py             Standalone CLI macro recorder
   config.py                 All tunable knobs
   calibrate.py              One-frame calibration overlay
-  macro_tool.py             Standalone macro recorder (CLI only — UI has its own integrated macro tool)
   assets/                   Icon + 1080p UI templates for album mode
   web/                      HTML/CSS/JS for the UI
 ```
