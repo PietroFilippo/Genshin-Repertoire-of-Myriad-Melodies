@@ -19,15 +19,12 @@ Run from inside a country album page (NOT the All Albums grid):
 """
 import argparse
 import ctypes
-import ctypes.wintypes
 import sys
 import threading
 import time
 from pathlib import Path
 
 import cv2
-import mss
-import numpy as np
 
 from config import (ALBUM_BEGIN_PERFORMANCE_XY, ALBUM_DIFFICULTY,
                     ALBUM_DIFFICULTY_COORDS, ALBUM_END_POLL_S,
@@ -38,6 +35,7 @@ from config import (ALBUM_BEGIN_PERFORMANCE_XY, ALBUM_DIFFICULTY,
 from controller import ArduinoHIDController
 from detector import NoteDetector
 from game_window import find_game_window, get_game_geometry
+from screen_watcher import ScreenWatcher
 from standalone_runner import run_visualization
 
 
@@ -146,8 +144,9 @@ class AlbumRunner:
 
         # Disable Enhance Pointer Precision (EPP) for the run. EPP applies
         # a velocity-dependent gain curve so a single HID burst of N
-        # mickeys travels 1.5x-3.5x N pixels, which makes _move_cursor_to
-        # overshoot wildly and pinball off the screen edges. Linear
+        # mickeys travels 1.5x-3.5x N pixels, which makes the Arduino
+        # backend's iterative move_to overshoot wildly and pinball off
+        # the screen edges. Linear
         # (accel=0) gives a constant mickey:pixel ratio that converges in
         # 1-2 iters. Saved here and restored in close() so this works the
         # same whether the CLI or the UI is driving the runner — the CLI
@@ -162,11 +161,6 @@ class AlbumRunner:
         # Game enforces 16:9, so scale_x ~= scale_y. Use scale_x for
         # template resampling (single scalar AssetScale, mirroring BGI).
         self.scale = self.scale_x
-        # mss handles are thread-local in mss>=6: each thread that calls
-        # grab() needs its own mss.mss() or it dies with
-        # `_thread._local has no attribute 'srcdc'`. Lazily create one per
-        # thread via threading.local().
-        self._sct_local = threading.local()
 
         assets_dir = Path(__file__).parent / 'assets' / '1920x1080'
         self.tpl = {
@@ -189,6 +183,15 @@ class AlbumRunner:
             self.controller = ArduinoHIDController()
             self._owns_controller = True
 
+        # Screen automation — grab + scaling + template match + clicks +
+        # waits. Templates dict passed by reference; we keep self.tpl
+        # for _diagnose_album_page's raw matchTemplate call (which
+        # needs the score even below threshold).
+        self.watcher = ScreenWatcher(
+            region=self.region, scale_x=self.scale_x, scale_y=self.scale_y,
+            controller=self.controller, stop_evt=self.stop_evt,
+            templates=self.tpl, match_threshold=ALBUM_MATCH_THRESHOLD)
+
         print(f"Album: {self.region['width']}x{self.region['height']} @ "
               f"({self.region['left']},{self.region['top']}), "
               f"scale {self.scale_x:.3f}x{self.scale_y:.3f}, "
@@ -201,120 +204,42 @@ class AlbumRunner:
             raise RuntimeError(f"failed to load template: {path}")
         return img
 
-    def _stop_wait(self, secs):
-        """Cancellable sleep. Blocks up to `secs` and returns True if
-        `stop_evt` fired during the wait. Use everywhere a plain
-        `time.sleep` would otherwise stall the album loop after the user
-        hits Stop — the worst offenders (post-click waits, long template
-        polls) used to hold the worker thread for tens of seconds before
-        noticing stop_evt."""
-        if secs <= 0:
-            return self.stop_evt.is_set()
-        return self.stop_evt.wait(secs)
-
-    # --- screen / coord helpers --------------------------------------------
-
-    def _grab(self):
-        sct = getattr(self._sct_local, 'sct', None)
-        if sct is None:
-            sct = mss.mss()
-            self._sct_local.sct = sct
-        shot = sct.grab(self.region)
-        return np.ascontiguousarray(np.array(shot)[:, :, :3])
-
-    def _ref_to_screen(self, x, y):
-        return (int(x * self.scale_x) + self.region['left'],
-                int(y * self.scale_y) + self.region['top'])
-
-    def _ref_rect_to_local(self, ref_x, ref_y, ref_w, ref_h):
-        return (int(ref_x * self.scale_x), int(ref_y * self.scale_y),
-                int(ref_w * self.scale_x), int(ref_h * self.scale_y))
-
-    def _move_cursor_to(self, target_x, target_y, max_iters=15, tol=2):
-        """Thin shim — the actual move logic lives on the controller so
-        each backend can pick its own strategy: the Arduino backend
-        does iterative HID convergence (EPP-aware), the software
-        backend (`SoftwareInputController`) does a single
-        `mouse_event` absolute jump."""
-        return self.controller.move_to(int(target_x), int(target_y),
-                                       stop_evt=self.stop_evt,
-                                       max_iters=max_iters, tol=tol)
-
-    def _click_screen(self, sx, sy):
-        converged = self._move_cursor_to(int(sx), int(sy))
-        if self.stop_evt.is_set():
-            return
-        pt = ctypes.wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-        print(f"    click target=({int(sx)},{int(sy)}), "
-              f"final=({pt.x},{pt.y}), converged={converged}")
-        # Longer hover + click hold than synthetic clicks need; some games
-        # debounce sub-100ms presses or treat them as "tap-cancel". Sleeps
-        # are cancellable; if stop fires after mouse_down we still issue
-        # mouse_up so the Arduino doesn't end the run with the button held.
-        if self._stop_wait(0.15):
-            return
-        self.controller.mouse_down('left')
-        self._stop_wait(0.10)
-        self.controller.mouse_up('left')
-        self._stop_wait(0.15)
-
-    def _click_ref(self, ref_x, ref_y):
-        self._click_screen(*self._ref_to_screen(ref_x, ref_y))
-
-    def _click_local(self, lx, ly):
-        self._click_screen(lx + self.region['left'],
-                           ly + self.region['top'])
-
-    # --- template matching --------------------------------------------------
-
-    def _match(self, frame, tpl, roi=None, threshold=None):
-        """Best-match within roi (or full frame). Returns (score, (cx,cy)) or None.
-        cx,cy are in capture-region (local) coords."""
-        if threshold is None:
-            threshold = ALBUM_MATCH_THRESHOLD
-        if roi is None:
-            haystack = frame
-            ox, oy = 0, 0
-        else:
-            x, y, w, h = roi
-            x = max(0, x)
-            y = max(0, y)
-            x2 = min(frame.shape[1], x + w)
-            y2 = min(frame.shape[0], y + h)
-            haystack = frame[y:y2, x:x2]
-            ox, oy = x, y
-        if (haystack.shape[0] < tpl.shape[0]
-                or haystack.shape[1] < tpl.shape[1]):
-            return None
-        result = cv2.matchTemplate(haystack, tpl, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        if max_val < threshold:
-            return None
-        cx = ox + max_loc[0] + tpl.shape[1] // 2
-        cy = oy + max_loc[1] + tpl.shape[0] // 2
-        return float(max_val), (cx, cy)
-
-    # --- state checks -------------------------------------------------------
+    # --- state checks (album-specific shortcuts over self.watcher.match) ---
 
     def _on_album_page(self, frame=None):
         if frame is None:
-            frame = self._grab()
-        roi = self._ref_rect_to_local(*ROI_GO_PERFORM)
-        return self._match(frame, self.tpl['go_perform'], roi=roi) is not None
+            frame = self.watcher.grab()
+        roi = self.watcher.ref_rect_to_local(*ROI_GO_PERFORM)
+        return self.watcher.match(frame, 'go_perform', roi=roi) is not None
+
+    def _is_canorus(self, frame=None):
+        if frame is None:
+            frame = self.watcher.grab()
+        roi = self.watcher.ref_rect_to_local(*ROI_CANORUS[self.difficulty])
+        return self.watcher.match(frame, 'canorus', roi=roi) is not None
+
+    def _find_select_song(self, frame=None):
+        if frame is None:
+            frame = self.watcher.grab()
+        roi = self.watcher.ref_rect_to_local(*ROI_SELECT_SONG)
+        return self.watcher.match(frame, 'select_song', roi=roi)
+
+    # --- diagnostics --------------------------------------------------------
 
     def _dump_frame(self, tag):
         """Save current frame to disk so the user can see what was on
         screen when something went wrong."""
         out = Path(__file__).parent / f'_album_debug_{tag}.png'
-        cv2.imwrite(str(out), self._grab())
+        self.watcher.dump_frame(out)
         print(f"  diag: dumped {out.name}")
 
     def _diagnose_album_page(self):
         """On entry-check fail: print best score and dump frame + ROI to
-        disk so the user can verify ROI placement / template suitability."""
-        frame = self._grab()
-        x, y, w, h = self._ref_rect_to_local(*ROI_GO_PERFORM)
+        disk so the user can verify ROI placement / template suitability.
+        Bypasses watcher.match because we need the raw score even below
+        threshold; watcher.match filters those out by design."""
+        frame = self.watcher.grab()
+        x, y, w, h = self.watcher.ref_rect_to_local(*ROI_GO_PERFORM)
         haystack = frame[y:y + h, x:x + w]
         tpl = self.tpl['go_perform']
         if haystack.shape[0] < tpl.shape[0] or haystack.shape[1] < tpl.shape[1]:
@@ -331,40 +256,11 @@ class AlbumRunner:
         cv2.imwrite(str(out_roi), haystack)
         print(f"  diag: dumped {out_full.name} and {out_roi.name}")
 
-    def _is_canorus(self, frame=None):
-        if frame is None:
-            frame = self._grab()
-        roi = self._ref_rect_to_local(*ROI_CANORUS[self.difficulty])
-        return self._match(frame, self.tpl['canorus'], roi=roi) is not None
-
-    def _find_select_song(self, frame=None):
-        if frame is None:
-            frame = self._grab()
-        roi = self._ref_rect_to_local(*ROI_SELECT_SONG)
-        return self._match(frame, self.tpl['select_song'], roi=roi)
-
-    def _wait_for(self, tpl_key, ref_roi, timeout=5.0, present=True):
-        """Poll until template is present (or absent) in `ref_roi`. Returns
-        True iff the desired state is reached within timeout. Stop-aware:
-        bails immediately on stop_evt (returns False)."""
-        end = time.time() + timeout
-        while time.time() < end:
-            if self.stop_evt.is_set():
-                return False
-            frame = self._grab()
-            roi = self._ref_rect_to_local(*ref_roi)
-            found = self._match(frame, self.tpl[tpl_key], roi=roi) is not None
-            if found == present:
-                return True
-            if self._stop_wait(0.2):
-                return False
-        return False
-
     # --- per-song flow ------------------------------------------------------
 
     def _next_song(self):
-        self._click_ref(*ALBUM_NEXT_SONG_XY)
-        self._stop_wait(0.8)
+        self.watcher.click_ref(*ALBUM_NEXT_SONG_XY)
+        self.watcher.stop_wait(0.8)
 
     def _wait_for_album_page(self, timeout=60.0):
         """Poll up to `timeout` for the album page anchor. Worst-case
@@ -376,7 +272,7 @@ class AlbumRunner:
                 return False
             if self._on_album_page():
                 return True
-            if self._stop_wait(0.5):
+            if self.watcher.stop_wait(0.5):
                 return False
         return False
 
@@ -387,10 +283,10 @@ class AlbumRunner:
         # need to attach).
         if not skip_intro:
             # album page → difficulty selection
-            self._click_ref(*ALBUM_GO_PERFORM_XY)
+            self.watcher.click_ref(*ALBUM_GO_PERFORM_XY)
             if self.stop_evt.is_set():
                 return False
-            if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
+            if not self.watcher.wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
                                   timeout=5.0, present=True):
                 if self.stop_evt.is_set():
                     return False
@@ -401,22 +297,22 @@ class AlbumRunner:
 
             # pick difficulty card
             dx, dy = ALBUM_DIFFICULTY_COORDS[self.difficulty]
-            self._click_ref(dx, dy)
-            if self._stop_wait(0.3):
+            self.watcher.click_ref(dx, dy)
+            if self.watcher.stop_wait(0.3):
                 return False
 
             # start rhythm minigame; verify we left the diff screen
-            self._click_ref(*ALBUM_BEGIN_PERFORMANCE_XY)
+            self.watcher.click_ref(*ALBUM_BEGIN_PERFORMANCE_XY)
             if self.stop_evt.is_set():
                 return False
-            if not self._wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
+            if not self.watcher.wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
                                   timeout=5.0, present=False):
                 if self.stop_evt.is_set():
                     return False
                 print("  ERROR: still on difficulty screen after Begin "
                       "Performance click. Aborting song.")
                 return False
-            if self._stop_wait(0.8):
+            if self.watcher.stop_wait(0.8):
                 return False
         else:
             print("  mid-song hand-off — skipping intro, attaching "
@@ -510,7 +406,7 @@ class AlbumRunner:
             if viz_thread is not None:
                 viz_thread.join(timeout=2.0)
 
-        self._stop_wait(2.0)
+        self.watcher.stop_wait(2.0)
         return True
 
     def _end_watcher(self, stop_evt):
@@ -530,7 +426,7 @@ class AlbumRunner:
             res = self._find_select_song()
             if res is not None:
                 _, (cx, cy) = res
-                self._click_local(cx, cy)
+                self.watcher.click_local(cx, cy)
                 stop_evt.set()
                 return
 
@@ -622,7 +518,7 @@ class AlbumRunner:
                   f"[{self.difficulty}] ---")
             self._emit({'song': f'{i+1}/{songs_count}'})
             if not self.replay_canorus and not mid_song_iter:
-                frame = self._grab()
+                frame = self.watcher.grab()
                 if self._is_canorus(frame):
                     print("  skip — already canorus")
                     self._next_song()
@@ -650,8 +546,8 @@ class AlbumRunner:
                 if res is not None:
                     print("  clicking Select Song (results screen after pause)")
                     _, (cx, cy) = res
-                    self._click_local(cx, cy)
-                    if self._stop_wait(2.0):
+                    self.watcher.click_local(cx, cy)
+                    if self.watcher.stop_wait(2.0):
                         return False
 
             if not self._wait_for_album_page(timeout=60.0):
@@ -714,7 +610,7 @@ class AlbumRunner:
                 self._emit({'song': f'{i+1}/{songs_count} [{diff}]'})
 
                 if not self.replay_canorus and not mid_song_iter:
-                    frame = self._grab()
+                    frame = self.watcher.grab()
                     if self._is_canorus(frame):
                         print(f"  skip — already canorus at {diff}")
                         continue   # next difficulty; do NOT advance wheel
@@ -736,8 +632,8 @@ class AlbumRunner:
                     if res is not None:
                         print("  clicking Select Song (results screen after pause)")
                         _, (cx, cy) = res
-                        self._click_local(cx, cy)
-                        if self._stop_wait(2.0):
+                        self.watcher.click_local(cx, cy)
+                        if self.watcher.stop_wait(2.0):
                             return
 
                 if not self._wait_for_album_page(timeout=60.0):
