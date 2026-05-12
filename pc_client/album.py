@@ -26,17 +26,13 @@ from pathlib import Path
 
 import cv2
 
-from config import (ALBUM_BEGIN_PERFORMANCE_XY, ALBUM_DIFFICULTY,
-                    ALBUM_DIFFICULTY_COORDS, ALBUM_END_POLL_S,
-                    ALBUM_GO_PERFORM_XY, ALBUM_MATCH_THRESHOLD,
-                    ALBUM_NEXT_SONG_XY, ALBUM_SONG_COUNT,
-                    KEY_POLL_DELAY_S, REF_COLUMN_X, REF_HIT_LINE_Y,
-                    Y_SAMPLE_OFFSETS)
+from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
+                    ALBUM_MATCH_THRESHOLD, ALBUM_NEXT_SONG_XY,
+                    ALBUM_SONG_COUNT, KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS)
 from controller import ArduinoHIDController
-from detector import NoteDetector
 from game_window import find_game_window, get_game_geometry
 from screen_watcher import ScreenWatcher
-from standalone_runner import run_visualization
+from song_player import ROI_SELECT_SONG, SongPlayer
 
 
 # 1080p reference ROIs (search bounding boxes), derived from screenshots
@@ -55,12 +51,11 @@ ROI_CANORUS = {
 # template clean off the ROI edge (cost a debugging session to learn).
 ROI_GO_PERFORM  = (1530, 975, 380, 75)
 
-# "Select Song" pill on the post-song results screen.
-ROI_SELECT_SONG = (1260, 975, 260, 75)
-
-# "Begin Performance" pill on the difficulty-selection screen — used as
-# the anchor that the prior "Go Perform" click actually landed.
-ROI_BEGIN_PERFORMANCE = (970, 975, 320, 75)
+# `ROI_SELECT_SONG` and `ROI_BEGIN_PERFORMANCE` live in `song_player.py`
+# (owner of the song-flow state machine). `ROI_SELECT_SONG` is re-
+# imported above for `AlbumRunner._find_select_song`, which handles
+# the post-pause results-screen recovery the song-player's watcher
+# can't see (the watcher dies on pause).
 
 
 class AlbumRunner:
@@ -76,9 +71,10 @@ class AlbumRunner:
                 aborts the current song (releases keys via detector.stop)
                 and waits at the next boundary. Clear to resume.
             debug_evt: external Event — when set, the rhythm-mode portion
-                of _play_song spawns a viz thread that mirrors main.py's
-                overlay. Toggling clears/recreates the cv2 window in real
-                time without restarting the bot.
+                of `SongPlayer.play` spawns a viz thread that mirrors
+                `standalone_runner.run_visualization`'s overlay. Toggling
+                clears/recreates the cv2 window in real time without
+                restarting the bot.
             status_cb: optional callable(dict) — emits status updates so
                 the UI can mirror state ('state', 'song', 'fps', ...).
             mid_song_start: when True, the runner assumes a song is
@@ -192,6 +188,20 @@ class AlbumRunner:
             controller=self.controller, stop_evt=self.stop_evt,
             templates=self.tpl, match_threshold=ALBUM_MATCH_THRESHOLD)
 
+        # Per-song state machine: intro click chain → detector + viz +
+        # end-watcher → pause-resume → cleanup. AlbumRunner stays as
+        # the album-level orchestrator (cycle loops, canorus skip,
+        # wheel advance). `_dump_frame` is passed as the error-path
+        # debug-frame callback so SongPlayer's failure messages land
+        # in `_album_debug_*.png` next to album.py.
+        self.song_player = SongPlayer(
+            watcher=self.watcher, controller=self.controller,
+            hwnd=self.hwnd, region=self.region,
+            scale_x=self.scale_x, scale_y=self.scale_y,
+            stop_evt=self.stop_evt, pause_evt=self.pause_evt,
+            debug_evt=self.debug_evt, status_cb=self.status_cb,
+            dump_frame_fn=self._dump_frame)
+
         print(f"Album: {self.region['width']}x{self.region['height']} @ "
               f"({self.region['left']},{self.region['top']}), "
               f"scale {self.scale_x:.3f}x{self.scale_y:.3f}, "
@@ -275,160 +285,6 @@ class AlbumRunner:
             if self.watcher.stop_wait(0.5):
                 return False
         return False
-
-    def _play_song(self, skip_intro=False):
-        # Intro click chain — album page → difficulty selection → rhythm
-        # minigame. Skipped when the runner was started mid-song (the
-        # song is already on screen, only the detector + end-watcher
-        # need to attach).
-        if not skip_intro:
-            # album page → difficulty selection
-            self.watcher.click_ref(*ALBUM_GO_PERFORM_XY)
-            if self.stop_evt.is_set():
-                return False
-            if not self.watcher.wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
-                                  timeout=5.0, present=True):
-                if self.stop_evt.is_set():
-                    return False
-                print("  ERROR: difficulty screen never appeared "
-                      "(Go Perform click missed?). Aborting song.")
-                self._dump_frame('postclick_go_perform')
-                return False
-
-            # pick difficulty card
-            dx, dy = ALBUM_DIFFICULTY_COORDS[self.difficulty]
-            self.watcher.click_ref(dx, dy)
-            if self.watcher.stop_wait(0.3):
-                return False
-
-            # start rhythm minigame; verify we left the diff screen
-            self.watcher.click_ref(*ALBUM_BEGIN_PERFORMANCE_XY)
-            if self.stop_evt.is_set():
-                return False
-            if not self.watcher.wait_for('begin_perf', ROI_BEGIN_PERFORMANCE,
-                                  timeout=5.0, present=False):
-                if self.stop_evt.is_set():
-                    return False
-                print("  ERROR: still on difficulty screen after Begin "
-                      "Performance click. Aborting song.")
-                return False
-            if self.watcher.stop_wait(0.8):
-                return False
-        else:
-            print("  mid-song hand-off — skipping intro, attaching "
-                  "detector to the song already in progress")
-
-        # Fire up rhythm detector. Watcher signals end-of-song by clicking
-        # the "Select Song" button when the results screen appears.
-        column_centers = [int(x * self.scale_x) for x in REF_COLUMN_X]
-        hit_line_y = int(REF_HIT_LINE_Y * self.scale_y)
-        detector = NoteDetector(self.hwnd, column_centers, hit_line_y,
-                                self.controller)
-        detector.start()
-
-        # Helper to (re-)create the optional viz thread. Used for initial
-        # start and after mid-song pause resume. Gated by debug_evt.
-        def _start_viz(det):
-            """Spin up a viz thread for the given detector. Returns
-            (thread, stop_event) or (None, stop_event) if debug is off."""
-            vs = threading.Event()
-            if self.debug_evt is None:
-                return None, vs
-            cap = {'top': self.region['top'], 'left': self.region['left'],
-                   'width': self.region['width'],
-                   'height': self.region['height']}
-
-            def _worker():
-                try:
-                    run_visualization(
-                        cap, column_centers, hit_line_y, det,
-                        stop_evt=vs, debug_evt=self.debug_evt,
-                        fps_callback=(lambda f: self._emit({'fps': f}))
-                                      if self.status_cb else None,
-                        pin_console=False)
-                except Exception as e:
-                    print(f"[viz] worker died: {e}")
-
-            vt = threading.Thread(target=_worker, daemon=True,
-                                  name='album-viz')
-            vt.start()
-            return vt, vs
-
-        viz_thread, viz_stop = _start_viz(detector)
-
-        watcher_evt = threading.Event()
-        watcher = threading.Thread(target=self._end_watcher,
-                                   args=(watcher_evt,), daemon=True)
-        watcher.start()
-
-        try:
-            while not watcher_evt.wait(0.5):
-                if self.stop_evt.is_set():
-                    break
-                if not watcher.is_alive():
-                    print("  WARN: watcher thread died "
-                          "(see traceback above); aborting song")
-                    break
-
-                if self.pause_evt.is_set():
-                    # --- mid-song pause ---
-                    # Stop detector (releases keys) and viz, but keep the
-                    # watcher alive so it can detect end-of-song.
-                    print("  paused mid-song — releasing keys")
-                    detector.stop()
-                    viz_stop.set()
-                    if viz_thread is not None:
-                        viz_thread.join(timeout=2.0)
-                        viz_thread = None
-                    self._emit({'state': 'paused'})
-
-                    # Idle until resume, stop, or song-end.
-                    while (self.pause_evt.is_set()
-                           and not self.stop_evt.is_set()
-                           and not watcher_evt.is_set()):
-                        time.sleep(0.1)
-
-                    if self.stop_evt.is_set() or watcher_evt.is_set():
-                        break
-
-                    # --- resume: fresh detector + viz for the same song ---
-                    print("  resumed — restarting detector")
-                    self._emit({'state': 'running'})
-                    detector = NoteDetector(self.hwnd, column_centers,
-                                            hit_line_y, self.controller)
-                    detector.start()
-                    viz_thread, viz_stop = _start_viz(detector)
-        finally:
-            watcher_evt.set()
-            watcher.join(timeout=2.0)
-            detector.stop()
-            viz_stop.set()
-            if viz_thread is not None:
-                viz_thread.join(timeout=2.0)
-
-        self.watcher.stop_wait(2.0)
-        return True
-
-    def _end_watcher(self, stop_evt):
-        # `stop_evt` is the local watcher signal (passed by _play_song).
-        # Tick the wait at 0.2s so the watcher reacts to either the
-        # local signal OR the runner's global stop_evt within 200ms,
-        # while the actual Select-Song match still runs only every
-        # ALBUM_END_POLL_S seconds. (Plain stop_evt.wait(5.0) would
-        # ignore self.stop_evt for the full 5s.)
-        while not stop_evt.is_set() and not self.stop_evt.is_set():
-            end = time.time() + ALBUM_END_POLL_S
-            while time.time() < end:
-                if stop_evt.wait(0.2):
-                    return
-                if self.stop_evt.is_set():
-                    return
-            res = self._find_select_song()
-            if res is not None:
-                _, (cx, cy) = res
-                self.watcher.click_local(cx, cy)
-                stop_evt.set()
-                return
 
     # --- main loop ----------------------------------------------------------
 
@@ -525,14 +381,15 @@ class AlbumRunner:
                     continue
 
             print("  playing")
-            if not self._play_song(skip_intro=mid_song_iter):
+            if not self.song_player.play(self.difficulty, skip_intro=mid_song_iter):
                 if self.stop_evt.is_set():
                     return False
                 print("  aborting album (state machine broke; check coords).")
                 return False
 
-            # Pause may have fired mid-song — _play_song aborted and we
-            # land here. Wait at the boundary before clicking next-song.
+            # Pause may have fired mid-song — song_player.play aborted
+            # and we land here. Wait at the boundary before clicking
+            # next-song.
             self._await_resume()
             if self.stop_evt.is_set():
                 return False
@@ -616,7 +473,7 @@ class AlbumRunner:
                         continue   # next difficulty; do NOT advance wheel
 
                 print("  playing")
-                if not self._play_song(skip_intro=mid_song_iter):
+                if not self.song_player.play(self.difficulty, skip_intro=mid_song_iter):
                     if self.stop_evt.is_set():
                         return
                     print("  aborting album (state machine broke; check coords).")
