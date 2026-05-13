@@ -957,6 +957,27 @@ button {
    right after a short checkbox label) so they keep the default
    centered tooltip — anchoring them right would clip the tooltip
    off the panel's LEFT edge instead. */
+/* Help icon inside the sticky table header — smaller to match the
+   compact th text and z-index high enough to float above the scrolling
+   tbody rows. */
+.help-th {
+    width: 14px;
+    height: 14px;
+    font-size: 10px;
+    vertical-align: middle;
+    margin-left: 2px;
+}
+
+.help-th::after {
+    max-width: 320px;
+    /* anchor left edge to the icon so the wide tooltip stays inside
+       the panel rather than overflowing the right edge of the table. */
+    left: 0 !important;
+    right: auto !important;
+    transform: none !important;
+    z-index: 200;
+}
+
 .row-grid .help::after,
 .macro-controls-row .help::after,
 .macro-mode-row .help::after,
