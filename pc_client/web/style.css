@@ -960,22 +960,65 @@ button {
 /* Help icon inside the sticky table header — smaller to match the
    compact th text and z-index high enough to float above the scrolling
    tbody rows. */
+/* `.help-th` lives inside `.evt-list-wrapper` which has
+   `overflow-y: auto`. Auto-overflow clips absolutely-positioned
+   descendants on BOTH axes — so the standard `.help::after` tooltip
+   gets clipped against the wrapper's box, and when the wrapper is
+   short (no rows yet) the tooltip disappears entirely. Disable the
+   pseudo-element tooltip for help-th and let JS render a portal
+   tooltip in `document.body` (escapes the overflow context). See
+   `setupHelpThPortals` in app.js.
+
+   `.help-th-tooltip` (rendered by JS) mirrors `.help::after`
+   styling but uses `position: fixed` so JS-set top/left land in
+   viewport coords. */
+.help-th::after,
+.help-th::before {
+    display: none !important;
+}
+
+.help-th-tooltip {
+    position: fixed;
+    max-width: 320px;
+    padding: 8px 10px;
+    background: var(--bg-card-elev);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 12px;
+    font-weight: normal;
+    line-height: 1.4;
+    white-space: normal;
+    text-align: left;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+    z-index: 10000;
+    animation: helpThFadeIn 0.12s ease;
+}
+
+/* Caret pointing UP at the icon. Sits just above the tooltip body,
+   near the left edge (the tooltip's left edge is aligned to the
+   icon's left edge by JS, so the icon center is roughly 7-8px in). */
+.help-th-tooltip::before {
+    content: '';
+    position: absolute;
+    bottom: 100%;
+    left: 5px;
+    border: 5px solid transparent;
+    border-bottom-color: var(--border-strong);
+}
+
+@keyframes helpThFadeIn {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
 .help-th {
     width: 14px;
     height: 14px;
     font-size: 10px;
     vertical-align: middle;
     margin-left: 2px;
-}
-
-.help-th::after {
-    max-width: 320px;
-    /* anchor left edge to the icon so the wide tooltip stays inside
-       the panel rather than overflowing the right edge of the table. */
-    left: 0 !important;
-    right: auto !important;
-    transform: none !important;
-    z-index: 200;
 }
 
 .row-grid .help::after,

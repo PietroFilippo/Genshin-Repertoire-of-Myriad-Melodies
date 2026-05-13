@@ -778,6 +778,60 @@ function renderKeybinds(kb) {
 
 // --- init ------------------------------------------------------------------
 
+// --- help-th portal tooltips ----------------------------------------------
+
+// `.help-th` icons sit inside `.evt-list-wrapper` which has
+// `overflow-y: auto` (scrollable event list). Auto-overflow clips the
+// standard `.help::after` pseudo-element tooltip against the wrapper's
+// box on both axes, so when the wrapper is short (few or no events)
+// the tooltip is invisible. Render the tooltip in `document.body`
+// instead, positioned via getBoundingClientRect — it lives outside the
+// overflow context and stays visible regardless of wrapper size.
+function setupHelpThPortals() {
+    document.querySelectorAll('.help-th').forEach((icon) => {
+        const text = icon.getAttribute('data-help');
+        if (!text) return;
+        let tip = null;
+
+        const position = () => {
+            if (!tip) return;
+            const r = icon.getBoundingClientRect();
+            tip.style.top = (r.bottom + 8) + 'px';
+            // Clamp left so the 320px-max tooltip doesn't overflow
+            // the right edge of the viewport on narrow windows.
+            const maxLeft = window.innerWidth - 320 - 8;
+            tip.style.left = Math.max(8, Math.min(r.left, maxLeft)) + 'px';
+        };
+
+        const show = () => {
+            if (tip) return;
+            tip = document.createElement('div');
+            tip.className = 'help-th-tooltip';
+            tip.textContent = text;
+            document.body.appendChild(tip);
+            position();
+        };
+
+        const hide = () => {
+            if (tip) {
+                tip.remove();
+                tip = null;
+            }
+        };
+
+        icon.addEventListener('mouseenter', show);
+        icon.addEventListener('mouseleave', hide);
+        icon.addEventListener('focus', show);
+        icon.addEventListener('blur', hide);
+    });
+}
+
+// Help icons live in static HTML so the DOM is ready by the time this
+// script (at end of body) executes. Wiring is independent of the
+// pywebview API readiness — don't gate on init().
+setupHelpThPortals();
+
+
 function init() {
     if (STATE.initialized) return;
     STATE.initialized = true;
