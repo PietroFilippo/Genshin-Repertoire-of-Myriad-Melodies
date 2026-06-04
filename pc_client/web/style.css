@@ -685,7 +685,8 @@ button {
     border-color: var(--success);
 }
 
-.macro-mode-row {
+.macro-mode-row,
+.active-policy-row {
     gap: 8px;
     margin-bottom: 8px;
 }
@@ -695,7 +696,8 @@ button {
     margin-right: 4px;
 }
 
-.macro-mode-btn {
+.macro-mode-btn,
+.active-policy-btn {
     background: var(--bg-card);
     border: 1px solid var(--border-strong);
     border-radius: 4px;
@@ -704,15 +706,66 @@ button {
     transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
 
-.macro-mode-btn:hover {
+.macro-mode-btn:hover,
+.active-policy-btn:hover {
     background: var(--bg-card-elev);
     color: var(--text);
 }
 
-.macro-mode-btn.macro-mode-active {
+.macro-mode-btn.macro-mode-active,
+.active-policy-btn.macro-mode-active {
     background: var(--accent);
     border-color: var(--accent);
     color: #0d1116;
+}
+
+.active-macro-list {
+    display: grid;
+    gap: 6px;
+}
+
+.active-macro-row {
+    display: grid;
+    grid-template-columns: 28px minmax(160px, 1fr) minmax(86px, auto) auto auto auto;
+    gap: 8px;
+    align-items: center;
+    min-height: 34px;
+}
+
+.active-label {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    color: var(--text-dim);
+    background: var(--bg-card);
+    font-weight: 700;
+}
+
+.active-macro-row.active-playing .active-label {
+    color: #0d1116;
+    background: var(--success);
+    border-color: var(--success);
+}
+
+.active-slot-wrap {
+    max-width: none;
+}
+
+.active-binding {
+    min-width: 86px;
+}
+
+.active-macro-row button {
+    padding-left: 10px;
+    padding-right: 10px;
+}
+
+.active-capture-msg {
+    margin-top: 8px;
 }
 
 .slot-grid {
@@ -1024,6 +1077,7 @@ button {
 .row-grid .help::after,
 .macro-controls-row .help::after,
 .macro-mode-row .help::after,
+.active-policy-row .help::after,
 .evt-toolbar .help::after {
     left: auto;
     right: 0;

@@ -176,8 +176,46 @@
                 <button type="button" id="macro-stop-play" class="btn-secondary" disabled>Stop</button>
                 <span class="macro-status" id="macro-status">idle &middot; 0 events</span>
                 <span class="help" tabindex="0" aria-label="Macro info"
-                      data-help="Record a sequence of keyboard + mouse actions inside Genshin and play it back via the Arduino. Recording captures input only while Genshin is focused; alt-tabbing to another app pauses capture. Hotkeys for record / play / stop / save / load also fire only inside the game.">?</span>
+                      data-help="Record a sequence of keyboard + mouse actions inside Genshin and play it back through the selected input backend. Recording captures input only while Genshin is focused; alt-tabbing to another app pauses capture. Hotkeys for record / play / stop / save / load also fire only inside the game.">?</span>
             </div>
+        </fieldset>
+
+        <fieldset class="card" id="active-macros-card">
+            <legend>Active Macros</legend>
+            <div class="row active-policy-row">
+                <span class="macro-mode-label">During playback:</span>
+                <button type="button" class="active-policy-btn macro-mode-active" data-policy="ignore">Ignore</button>
+                <button type="button" class="active-policy-btn" data-policy="interrupt">Interrupt</button>
+                <span class="help" tabindex="0" aria-label="Active macros info"
+                      data-help="Assign up to two saved slots to their own Genshin-only playback hotkeys. Only one macro plays at a time. Ignore keeps the current playback running when the other active hotkey is pressed; Interrupt stops the current playback, releases held inputs, then starts the requested saved slot.">?</span>
+            </div>
+            <div class="active-macro-list">
+                <div class="active-macro-row" data-active="1">
+                    <span class="active-label">A</span>
+                    <div class="select-wrapper active-slot-wrap">
+                        <select class="active-slot">
+                            <option value="0">No slot</option>
+                        </select>
+                    </div>
+                    <span class="hk-binding active-binding">&lt;unset&gt;</span>
+                    <button type="button" class="active-bind btn-secondary">Bind</button>
+                    <button type="button" class="active-play btn-secondary">Play</button>
+                    <button type="button" class="active-clear btn-secondary">Clear</button>
+                </div>
+                <div class="active-macro-row" data-active="2">
+                    <span class="active-label">B</span>
+                    <div class="select-wrapper active-slot-wrap">
+                        <select class="active-slot">
+                            <option value="0">No slot</option>
+                        </select>
+                    </div>
+                    <span class="hk-binding active-binding">&lt;unset&gt;</span>
+                    <button type="button" class="active-bind btn-secondary">Bind</button>
+                    <button type="button" class="active-play btn-secondary">Play</button>
+                    <button type="button" class="active-clear btn-secondary">Clear</button>
+                </div>
+            </div>
+            <div class="hk-capture-msg active-capture-msg"></div>
         </fieldset>
 
         <fieldset class="card">
