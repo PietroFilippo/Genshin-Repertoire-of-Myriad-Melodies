@@ -5,6 +5,8 @@
 
 const STATE = {
     capturing: null,           // action name while waiting for keypress
+    activeCapturing: null,     // active macro position while binding hotkey
+    activeRenderSig: '',
     lastStatus: null,          // most recent status snapshot
     initialized: false,
 };
@@ -254,6 +256,28 @@ function endCapture() {
     STATE.capturing = null;
 }
 
+function beginActiveCapture(pos) {
+    if (STATE.capturing || STATE.activeCapturing) return;
+    STATE.activeCapturing = pos;
+    const row = document.querySelector(`.active-macro-row[data-active="${pos}"]`);
+    if (row) row.querySelector('.active-bind').textContent = 'â€¦';
+    const msg = $('.active-capture-msg');
+    if (msg) {
+        msg.textContent =
+            `Press a key or mouse button to bind active macro ${pos} (Esc to cancel)â€¦`;
+    }
+}
+
+function endActiveCapture() {
+    if (!STATE.activeCapturing) return;
+    const pos = STATE.activeCapturing;
+    const row = document.querySelector(`.active-macro-row[data-active="${pos}"]`);
+    if (row) row.querySelector('.active-bind').textContent = 'Bind';
+    const msg = $('.active-capture-msg');
+    if (msg) msg.textContent = '';
+    STATE.activeCapturing = null;
+}
+
 function labelFor(action) {
     return ({
         start_stop:   'Start/Stop',
@@ -271,6 +295,34 @@ const _MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', '
 
 // Capture phase so reserved-key swallow happens before browser default.
 window.addEventListener('keydown', (ev) => {
+    if (STATE.activeCapturing) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (ev.key === 'Escape') {
+            endActiveCapture();
+            return;
+        }
+        if (_MODIFIER_KEYS.has(ev.key)) return;
+        const payload = {
+            key: ev.key,
+            code: ev.code,
+            ctrlKey: ev.ctrlKey,
+            altKey: ev.altKey,
+            shiftKey: ev.shiftKey,
+            metaKey: ev.metaKey,
+        };
+        callApi('macro_set_active_hotkey', STATE.activeCapturing, payload)
+            .then((res) => {
+                if (res && res.ok === false
+                        && res.reason === 'duplicate_hotkey') {
+                    const msg = $('.active-capture-msg');
+                    if (msg) msg.textContent = 'That binding is already in use.';
+                    return;
+                }
+                endActiveCapture();
+            });
+        return;
+    }
     // Capture mode: any non-modifier key gets sent to Python.
     if (STATE.capturing) {
         ev.preventDefault();
@@ -308,6 +360,30 @@ window.addEventListener('keydown', (ev) => {
 // doesn't expose them, the user can still rebind via keyboard.
 const _BROWSER_BUTTON_TO_NAME = ['left', 'middle', 'right', 'x', 'x2'];
 window.addEventListener('mousedown', (ev) => {
+    if (STATE.activeCapturing) {
+        const row = document.querySelector(
+            `.active-macro-row[data-active="${STATE.activeCapturing}"]`);
+        if (row && ev.target.closest('.active-bind')
+                === row.querySelector('.active-bind')) {
+            return;
+        }
+        const name = _BROWSER_BUTTON_TO_NAME[ev.button];
+        if (!name) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        callApi('macro_set_active_hotkey', STATE.activeCapturing,
+                { mouseButton: name })
+            .then((res) => {
+                if (res && res.ok === false
+                        && res.reason === 'duplicate_hotkey') {
+                    const msg = $('.active-capture-msg');
+                    if (msg) msg.textContent = 'That binding is already in use.';
+                    return;
+                }
+                endActiveCapture();
+            });
+        return;
+    }
     if (!STATE.capturing) return;
     // Don't swallow clicks on the rebind button itself — the click that
     // started capture also bubbles a mousedown here. Detect via the
@@ -327,7 +403,7 @@ window.addEventListener('mousedown', (ev) => {
 // Also block contextmenu while capturing so right-click capture doesn't
 // pop the native menu.
 window.addEventListener('contextmenu', (ev) => {
-    if (STATE.capturing) ev.preventDefault();
+    if (STATE.capturing || STATE.activeCapturing) ev.preventDefault();
 }, true);
 
 // --- macros panel ----------------------------------------------------------
@@ -347,6 +423,111 @@ function slotNameOf(n) {
     // pywebview JSONifies dict keys as strings; normalize lookup.
     return map[n] || map[String(n)] || '';
 }
+
+function activeMacrosOf(status) {
+    const s = status || STATE.lastStatus || {};
+    const active = Array.isArray(s.macro_active_macros)
+        ? s.macro_active_macros : [];
+    return [0, 1].map((i) => {
+        const item = active[i] || {};
+        return {
+            slot: parseInt(item.slot, 10) || 0,
+            hotkey: item.hotkey || '',
+        };
+    });
+}
+
+function renderActiveMacroRows(status) {
+    const s = status || STATE.lastStatus || {};
+    const active = activeMacrosOf(s);
+    const occupied = new Set((s.macro_slots || []).map((n) => parseInt(n, 10)));
+    const names = s.macro_slot_names || {};
+    const playingSlot = parseInt(s.macro_playing_slot, 10) || 0;
+    const sig = JSON.stringify({
+        active,
+        slots: s.macro_slots || [],
+        names,
+        playingSlot,
+        state: s.macro_state || '',
+    });
+    if (sig === STATE.activeRenderSig) return;
+    STATE.activeRenderSig = sig;
+    $$('.active-macro-row').forEach((row) => {
+        const pos = parseInt(row.dataset.active, 10);
+        const item = active[pos - 1] || { slot: 0, hotkey: '' };
+        const select = row.querySelector('.active-slot');
+        const previous = String(item.slot || 0);
+        select.innerHTML = '<option value="0">No slot</option>';
+        (s.macro_slots || []).forEach((slot) => {
+            const opt = document.createElement('option');
+            opt.value = String(slot);
+            const name = names[slot] || names[String(slot)] || '';
+            opt.textContent = name ? `Slot ${slot} - ${name}` : `Slot ${slot}`;
+            select.appendChild(opt);
+        });
+        if (item.slot && !occupied.has(item.slot)) {
+            const opt = document.createElement('option');
+            opt.value = String(item.slot);
+            opt.textContent = `Missing slot ${item.slot}`;
+            select.appendChild(opt);
+        }
+        select.value = previous;
+
+        const binding = row.querySelector('.active-binding');
+        binding.textContent = displayBinding(item.hotkey);
+        binding.title = item.hotkey ? displayBinding(item.hotkey) : '';
+
+        const slotReady = !!item.slot && occupied.has(item.slot);
+        const isRecording = s.macro_state === 'recording';
+        const isPlayingThis = playingSlot && playingSlot === item.slot;
+        row.classList.toggle('active-playing', !!isPlayingThis);
+        row.querySelector('.active-play').disabled = !slotReady || isRecording;
+        row.querySelector('.active-bind').disabled = isRecording;
+        row.querySelector('.active-clear').disabled = !item.slot && !item.hotkey;
+    });
+}
+
+function renderActivePolicy(policy) {
+    const normalized = policy === 'interrupt' ? 'interrupt' : 'ignore';
+    $$('.active-policy-btn').forEach((btn) => {
+        btn.classList.toggle('macro-mode-active',
+            btn.dataset.policy === normalized);
+    });
+}
+
+$$('.active-policy-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        callApi('macro_set_conflict_policy', btn.dataset.policy);
+    });
+});
+
+$$('.active-macro-row').forEach((row) => {
+    const pos = parseInt(row.dataset.active, 10);
+    row.querySelector('.active-slot').addEventListener('change', (ev) => {
+        callApi('macro_set_active_slot', pos, parseInt(ev.target.value, 10))
+            .then((res) => {
+                if (res && res.ok === false) {
+                    STATE.activeRenderSig = '';
+                    renderActiveMacroRows(STATE.lastStatus || {});
+                }
+            });
+    });
+    row.querySelector('.active-bind').addEventListener('click', () => {
+        beginActiveCapture(pos);
+    });
+    row.querySelector('.active-play').addEventListener('click', () => {
+        callApi('macro_play_active', pos, false).then((res) => {
+            if (res && res.ok === false && res.reason === 'bot_running') {
+                if (confirm('The bot is running. Stop it and play this active macro?')) {
+                    callApi('macro_play_active', pos, true);
+                }
+            }
+        });
+    });
+    row.querySelector('.active-clear').addEventListener('click', () => {
+        callApi('macro_clear_active', pos);
+    });
+});
 
 $$('.slot').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -439,7 +620,8 @@ function renderMacroSlots(slots, namesMap, loadedSlot) {
     });
 }
 
-function renderMacroState(macroState, eventCount, loadedSlot, slotNames, dirty) {
+function renderMacroState(macroState, eventCount, loadedSlot, slotNames, dirty,
+                          playingSlot, playingName, playingSource) {
     const statusEl = $('#macro-status');
     const recBtn = $('#macro-record');
     const playBtn = $('#macro-play');
@@ -449,7 +631,13 @@ function renderMacroState(macroState, eventCount, loadedSlot, slotNames, dirty) 
     const loaded = parseInt(loadedSlot, 10) || 0;
     const isDirty = !!dirty;
     let suffix = '';
-    if (loaded > 0) {
+    if (stateLabel === 'playing' && playingSource === 'active') {
+        const slot = parseInt(playingSlot, 10) || 0;
+        const name = playingName || '';
+        suffix = name
+            ? ` Â· active slot ${slot} (${name})`
+            : ` Â· active slot ${slot}`;
+    } else if (loaded > 0) {
         const names = slotNames || {};
         const name = names[loaded] || names[String(loaded)] || '';
         const tag = isDirty ? '*' : '';
@@ -695,10 +883,13 @@ window.updateStatus = function updateStatus(data) {
 
     if ('macro_state' in data || 'macro_events' in data
         || 'macro_loaded' in data || 'macro_slot_names' in data
-        || 'macro_dirty' in data) {
+        || 'macro_dirty' in data || 'macro_playing_slot' in data
+        || 'macro_playing_source' in data) {
         renderMacroState(data.macro_state, data.macro_events,
                          data.macro_loaded, data.macro_slot_names,
-                         data.macro_dirty);
+                         data.macro_dirty, data.macro_playing_slot,
+                         data.macro_playing_name,
+                         data.macro_playing_source);
     }
     if ('macro_events' in data) {
         // Buffer changed externally (record finished, slot loaded,
@@ -718,6 +909,12 @@ window.updateStatus = function updateStatus(data) {
             data.macro_loaded || last.macro_loaded || 0);
     }
     if ('macro_pending' in data) renderMacroPending(data.macro_pending);
+    if ('macro_active_macros' in data || 'macro_conflict_policy' in data
+        || 'macro_slots' in data || 'macro_slot_names' in data
+        || 'macro_state' in data || 'macro_playing_slot' in data) {
+        renderActiveMacroRows(STATE.lastStatus || {});
+        renderActivePolicy((STATE.lastStatus || {}).macro_conflict_policy);
+    }
 
     // Sync debug checkbox without echoing back to Python.
     if ('debug' in data) {
@@ -866,6 +1063,11 @@ function init() {
             macro_loaded: macroSnap.macro_loaded || 0,
             macro_dirty: !!macroSnap.macro_dirty,
             macro_pending: macroSnap.macro_pending || '',
+            macro_playing_slot: macroSnap.macro_playing_slot || 0,
+            macro_playing_name: macroSnap.macro_playing_name || '',
+            macro_playing_source: macroSnap.macro_playing_source || '',
+            macro_active_macros: s.macro_active_macros || [],
+            macro_conflict_policy: s.macro_conflict_policy || 'ignore',
             input_backend: s.input_backend || 'arduino',
         });
     });
