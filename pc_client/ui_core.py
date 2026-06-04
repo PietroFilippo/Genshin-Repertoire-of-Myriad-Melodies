@@ -160,11 +160,52 @@ def macros_dir():
 # --- settings persistence ---------------------------------------------------
 
 _VALID_BACKENDS = ('arduino', 'software')
+ACTIVE_MACRO_COUNT = 2
+MACRO_CONFLICT_IGNORE = 'ignore'
+MACRO_CONFLICT_INTERRUPT = 'interrupt'
+_VALID_MACRO_CONFLICT_POLICIES = (
+    MACRO_CONFLICT_IGNORE,
+    MACRO_CONFLICT_INTERRUPT,
+)
 
 
 def _normalize_backend(name):
     name = (name or '').strip().lower()
     return name if name in _VALID_BACKENDS else INPUT_BACKEND_DEFAULT
+
+
+def _default_active_macros():
+    return [{'slot': 0, 'hotkey': ''} for _ in range(ACTIVE_MACRO_COUNT)]
+
+
+def _normalize_active_macros(value):
+    out = _default_active_macros()
+    if not isinstance(value, list):
+        return out
+    used_hotkeys = set()
+    for i, item in enumerate(value[:ACTIVE_MACRO_COUNT]):
+        if not isinstance(item, dict):
+            continue
+        try:
+            slot = int(item.get('slot') or 0)
+        except (TypeError, ValueError):
+            slot = 0
+        if not (1 <= slot <= 9):
+            slot = 0
+        hotkey = str(item.get('hotkey') or '').strip().lower()
+        if hotkey and hotkey in used_hotkeys:
+            hotkey = ''
+        if hotkey:
+            used_hotkeys.add(hotkey)
+        out[i] = {'slot': slot, 'hotkey': hotkey}
+    return out
+
+
+def _normalize_macro_conflict_policy(value):
+    value = (value or '').strip().lower()
+    if value in _VALID_MACRO_CONFLICT_POLICIES:
+        return value
+    return MACRO_CONFLICT_IGNORE
 
 
 def load_settings():
@@ -175,6 +216,8 @@ def load_settings():
         return {
             'keybinds': dict(UI_KEYBINDS_DEFAULT),
             'input_backend': INPUT_BACKEND_DEFAULT,
+            'macro_active_macros': _default_active_macros(),
+            'macro_conflict_policy': MACRO_CONFLICT_IGNORE,
         }
     try:
         with p.open('r', encoding='utf-8') as fh:
@@ -182,12 +225,22 @@ def load_settings():
         kb = dict(UI_KEYBINDS_DEFAULT)
         kb.update(data.get('keybinds', {}))
         backend = _normalize_backend(data.get('input_backend'))
-        return {'keybinds': kb, 'input_backend': backend}
+        active = _normalize_active_macros(data.get('macro_active_macros'))
+        policy = _normalize_macro_conflict_policy(
+            data.get('macro_conflict_policy'))
+        return {
+            'keybinds': kb,
+            'input_backend': backend,
+            'macro_active_macros': active,
+            'macro_conflict_policy': policy,
+        }
     except Exception as e:
         print(f"[ui] failed to load settings: {e} — using defaults")
         return {
             'keybinds': dict(UI_KEYBINDS_DEFAULT),
             'input_backend': INPUT_BACKEND_DEFAULT,
+            'macro_active_macros': _default_active_macros(),
+            'macro_conflict_policy': MACRO_CONFLICT_IGNORE,
         }
 
 
@@ -751,6 +804,9 @@ class MacroController:
         self._mouse_hook = None
         self._play_thread = None
         self._stop_play_evt = threading.Event()
+        self._playing_slot = None
+        self._playing_name = ''
+        self._playing_source = ''
         # Bindings reserved as macro hotkeys — filtered out of capture so
         # the user pressing the record-stop key doesn't end up inside the
         # macro itself.
@@ -809,6 +865,9 @@ class MacroController:
             'macro_loaded': self._engine.loaded_slot() or 0,
             'macro_dirty': self._engine.is_dirty(),
             'macro_pending': self._pending_action or '',
+            'macro_playing_slot': self._playing_slot or 0,
+            'macro_playing_name': self._playing_name,
+            'macro_playing_source': self._playing_source,
         }
 
     def get_events(self):
@@ -886,14 +945,71 @@ class MacroController:
                 return False
             controller = self._resolve_controller()
             if controller is None:
-                print("[macro] play aborted — no Arduino controller")
+                print("[macro] play aborted — no input controller")
                 return False
-            self._stop_play_evt.clear()
-            self._state = self.STATE_PLAYING
-            self._play_thread = threading.Thread(
-                target=self._play_run, args=(controller,),
-                daemon=True, name='macro-play')
-            self._play_thread.start()
+            events = [dict(ev) for ev in self._engine.events]
+            self._start_playback_locked(
+                controller, events, slot=None, name='', source='buffer')
+        self._emit()
+        return True
+
+    def play_slot(self, n, conflict_policy=MACRO_CONFLICT_IGNORE):
+        try:
+            n_int = int(n)
+        except (TypeError, ValueError):
+            return False
+        if not (1 <= n_int <= 9):
+            return False
+        path = macros_dir() / f'macro_{n_int}.json'
+        if not path.exists():
+            print(f"[macro] active slot {n_int} is empty")
+            return False
+        try:
+            events, name = MacroEngine.read(path)
+        except ValueError as e:
+            print(f"[macro] active slot {n_int} malformed: {e}")
+            return False
+        except Exception as e:
+            print(f"[macro] active slot {n_int} read failed: {e}")
+            return False
+        if not events:
+            print(f"[macro] active slot {n_int} has no events")
+            return False
+        controller = self._resolve_controller()
+        if controller is None:
+            print("[macro] active play aborted — no input controller")
+            return False
+
+        conflict_policy = _normalize_macro_conflict_policy(conflict_policy)
+        while True:
+            old_thread = None
+            with self._lock:
+                if self._state == self.STATE_RECORDING:
+                    print("[macro] cannot play active slot while recording")
+                    return False
+                if self._state == self.STATE_PLAYING:
+                    if self._playing_slot == n_int:
+                        print(f"[macro] slot {n_int} is already playing")
+                        return False
+                    if conflict_policy != MACRO_CONFLICT_INTERRUPT:
+                        print(f"[macro] slot {n_int} ignored — another macro "
+                              "is already playing")
+                        return False
+                    old_thread = self._play_thread
+                    print(f"[macro] interrupting current playback for "
+                          f"slot {n_int}")
+                    self._stop_play_evt.set()
+                else:
+                    self._start_playback_locked(
+                        controller, [dict(ev) for ev in events],
+                        slot=n_int, name=name, source='active')
+                    break
+            if old_thread is None:
+                continue
+            old_thread.join(timeout=2.0)
+            if old_thread.is_alive():
+                print("[macro] interrupt timed out — active slot not started")
+                return False
         self._emit()
         return True
 
@@ -903,18 +1019,39 @@ class MacroController:
         self._stop_play_evt.set()
         return True
 
-    def _play_run(self, controller):
-        print(f"[macro] playing {self._engine.event_count()} events")
+    def _start_playback_locked(self, controller, events, slot, name, source):
+        self._stop_play_evt = threading.Event()
+        self._state = self.STATE_PLAYING
+        self._playing_slot = slot
+        self._playing_name = name or ''
+        self._playing_source = source
+        self._play_thread = threading.Thread(
+            target=self._play_run,
+            args=(controller, events, self._stop_play_evt, slot, name, source),
+            daemon=True, name='macro-play')
+        self._play_thread.start()
+
+    def _play_run(self, controller, events, stop_evt, slot, name, source):
+        label = f"slot {slot}"
+        if name:
+            label += f" ({name!r})"
+        if source == 'buffer':
+            label = 'current buffer'
+        print(f"[macro] playing {len(events)} events from {label}")
         try:
             # Engine iterates events, sleeps cancellably, dispatches to
-            # the controller, and sweeps rhythm keys + L/R mouse on exit.
-            self._engine.play(controller, stop_evt=self._stop_play_evt,
-                              rhythm_keys=KEYS)
+            # the controller, and releases held macro inputs on exit.
+            MacroEngine.play_events(events, controller, stop_evt=stop_evt,
+                                    rhythm_keys=KEYS)
         except Exception as e:
             print(f"[macro] playback error: {e}")
         finally:
             with self._lock:
-                self._state = self.STATE_IDLE
+                if self._stop_play_evt is stop_evt:
+                    self._state = self.STATE_IDLE
+                    self._playing_slot = None
+                    self._playing_name = ''
+                    self._playing_source = ''
             print("[macro] playback finished")
             self._emit()
 
@@ -1137,6 +1274,9 @@ class MacroController:
         with self._lock:
             self._unhook()
             self._state = self.STATE_IDLE
+            self._playing_slot = None
+            self._playing_name = ''
+            self._playing_source = ''
         with self._pending_lock:
             self._clear_pending_locked()
         if self._play_thread is not None:
