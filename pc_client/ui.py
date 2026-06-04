@@ -129,11 +129,12 @@ from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
 from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
                      ACTION_MACRO_RECORD, ACTION_MACRO_SAVE,
                      ACTION_MACRO_STOP, ACTION_PAUSE, ACTION_START_STOP,
-                     BOT_ACTIONS, BotController, KeybindManager,
-                     MACRO_ACTIONS, MacroController, QueueWriter,
+                     ACTIVE_MACRO_COUNT, BOT_ACTIONS, BotController,
+                     KeybindManager, MACRO_ACTIONS, MACRO_CONFLICT_IGNORE,
+                     MACRO_CONFLICT_INTERRUPT, MacroController, QueueWriter,
                      UI_WINDOW_TITLE, focus_game_window, is_admin,
                      is_frozen, js_event_to_hotkey, load_settings,
-                     make_input_backend, save_settings,
+                     macros_dir, make_input_backend, save_settings,
                      warn_if_not_admin)
 
 
@@ -516,6 +517,14 @@ class BridgeApi:
             'macro_loaded': 0,
             'macro_dirty': False,
             'macro_pending': '',
+            'macro_playing_slot': 0,
+            'macro_playing_name': '',
+            'macro_playing_source': '',
+            'macro_active_macros': [
+                dict(x) for x in self._settings.get('macro_active_macros', [])
+            ],
+            'macro_conflict_policy': self._settings.get(
+                'macro_conflict_policy', MACRO_CONFLICT_IGNORE),
             'input_backend': self._settings.get('input_backend', 'arduino'),
         }
 
@@ -637,6 +646,12 @@ class BridgeApi:
                 'keybinds': dict(self._settings['keybinds']),
                 'difficulties': list(ALBUM_DIFFICULTY_COORDS),
                 'macro': self._macro.snapshot(),
+                'macro_active_macros': [
+                    dict(x) for x in self._settings.get(
+                        'macro_active_macros', [])
+                ],
+                'macro_conflict_policy': self._settings.get(
+                    'macro_conflict_policy', MACRO_CONFLICT_IGNORE),
                 'input_backend': self._settings.get('input_backend', 'arduino'),
             }
 
@@ -835,7 +850,10 @@ class BridgeApi:
             n = int(n)
         except (TypeError, ValueError):
             return {'ok': False, 'reason': 'bad_slot'}
-        return {'ok': bool(self._macro.clear_slot(n))}
+        ok = bool(self._macro.clear_slot(n))
+        if ok:
+            self._clear_active_slot_refs(n)
+        return {'ok': ok}
 
     def macro_rename_slot(self, n, name):
         try:
@@ -890,6 +908,100 @@ class BridgeApi:
         when the macro is busy (recording / playing)."""
         return {'ok': bool(self._macro.set_events(events))}
 
+    def macro_get_active_config(self):
+        with self._lock:
+            return {
+                'active_macros': [
+                    dict(x) for x in self._settings.get(
+                        'macro_active_macros', [])
+                ],
+                'conflict_policy': self._settings.get(
+                    'macro_conflict_policy', MACRO_CONFLICT_IGNORE),
+            }
+
+    def macro_set_active_slot(self, pos, slot):
+        idx = self._active_macro_index(pos)
+        if idx is None:
+            return {'ok': False, 'reason': 'bad_index'}
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            return {'ok': False, 'reason': 'bad_slot'}
+        if slot != 0 and not (1 <= slot <= 9):
+            return {'ok': False, 'reason': 'bad_slot'}
+        if slot and not (macros_dir() / f'macro_{slot}.json').exists():
+            return {'ok': False, 'reason': 'empty_slot'}
+        with self._lock:
+            active = self._active_macros_locked()
+            if slot:
+                for i, item in enumerate(active):
+                    if i != idx and item.get('slot') == slot:
+                        return {'ok': False, 'reason': 'duplicate_slot'}
+            active[idx]['slot'] = slot
+            self._settings['macro_active_macros'] = active
+            save_settings(self._settings)
+        self._install_keybinds()
+        self._push_active_status()
+        return {'ok': True}
+
+    def macro_set_active_hotkey(self, pos, payload):
+        idx = self._active_macro_index(pos)
+        if idx is None:
+            return {'ok': False, 'reason': 'bad_index'}
+        hotkey = js_event_to_hotkey(payload)
+        if not hotkey:
+            return {'ok': False, 'reason': 'bad_hotkey'}
+        with self._lock:
+            fixed_hotkeys = {
+                str(v).strip().lower()
+                for v in self._settings.get('keybinds', {}).values()
+                if v
+            }
+            if hotkey in fixed_hotkeys:
+                return {'ok': False, 'reason': 'duplicate_hotkey'}
+            active = self._active_macros_locked()
+            for i, item in enumerate(active):
+                if i != idx and item.get('hotkey') == hotkey:
+                    return {'ok': False, 'reason': 'duplicate_hotkey'}
+            active[idx]['hotkey'] = hotkey
+            self._settings['macro_active_macros'] = active
+            save_settings(self._settings)
+        self._install_keybinds()
+        self._push_active_status()
+        return {'ok': True, 'hotkey': hotkey}
+
+    def macro_clear_active(self, pos):
+        idx = self._active_macro_index(pos)
+        if idx is None:
+            return {'ok': False, 'reason': 'bad_index'}
+        with self._lock:
+            active = self._active_macros_locked()
+            active[idx] = {'slot': 0, 'hotkey': ''}
+            self._settings['macro_active_macros'] = active
+            save_settings(self._settings)
+        self._install_keybinds()
+        self._push_active_status()
+        return {'ok': True}
+
+    def macro_set_conflict_policy(self, policy):
+        policy = (policy or '').strip().lower()
+        if policy not in (MACRO_CONFLICT_IGNORE, MACRO_CONFLICT_INTERRUPT):
+            return {'ok': False, 'reason': 'bad_policy'}
+        with self._lock:
+            self._settings['macro_conflict_policy'] = policy
+            save_settings(self._settings)
+        self._push_active_status()
+        return {'ok': True}
+
+    def macro_play_active(self, pos, force=False):
+        if self._bot.is_running():
+            if not force:
+                return {'ok': False, 'reason': 'bot_running'}
+            self._stop_bot_blocking()
+        focus_game_window()
+        time.sleep(0.05)
+        return self._play_active_macro(pos)
+
     def start_stop_force(self):
         """Same as start_stop but stops a running macro first. Called by
         JS after the user confirms the cross-mode prompt."""
@@ -942,6 +1054,73 @@ class BridgeApi:
         return True
 
     # ---- internal ----
+
+    def _active_macro_index(self, pos):
+        try:
+            pos = int(pos)
+        except (TypeError, ValueError):
+            return None
+        if 1 <= pos <= ACTIVE_MACRO_COUNT:
+            return pos - 1
+        return None
+
+    def _active_macros_locked(self):
+        active = self._settings.get('macro_active_macros')
+        if not isinstance(active, list):
+            active = []
+        out = [{'slot': 0, 'hotkey': ''} for _ in range(ACTIVE_MACRO_COUNT)]
+        for i, item in enumerate(active[:ACTIVE_MACRO_COUNT]):
+            if not isinstance(item, dict):
+                continue
+            try:
+                slot = int(item.get('slot') or 0)
+            except (TypeError, ValueError):
+                slot = 0
+            if not (1 <= slot <= 9):
+                slot = 0
+            hotkey = str(item.get('hotkey') or '').strip().lower()
+            out[i] = {'slot': slot, 'hotkey': hotkey}
+        return out
+
+    def _push_active_status(self):
+        with self._lock:
+            active = [dict(x) for x in self._active_macros_locked()]
+            policy = self._settings.get(
+                'macro_conflict_policy', MACRO_CONFLICT_IGNORE)
+        self._enqueue_status({
+            'macro_active_macros': active,
+            'macro_conflict_policy': policy,
+        })
+
+    def _clear_active_slot_refs(self, slot):
+        changed = False
+        with self._lock:
+            active = self._active_macros_locked()
+            for item in active:
+                if item.get('slot') == slot:
+                    item['slot'] = 0
+                    changed = True
+            if changed:
+                self._settings['macro_active_macros'] = active
+                save_settings(self._settings)
+        if changed:
+            self._install_keybinds()
+            self._push_active_status()
+
+    def _play_active_macro(self, pos):
+        idx = self._active_macro_index(pos)
+        if idx is None:
+            return {'ok': False, 'reason': 'bad_index'}
+        with self._lock:
+            active = self._active_macros_locked()
+            item = active[idx]
+            slot = item.get('slot') or 0
+            policy = self._settings.get(
+                'macro_conflict_policy', MACRO_CONFLICT_IGNORE)
+        if not slot:
+            return {'ok': False, 'reason': 'inactive'}
+        return {'ok': bool(self._macro.play_slot(
+            slot, conflict_policy=policy))}
 
     def _ui_hwnd(self):
         """HWND of the pywebview window. Cached after first successful
@@ -1013,6 +1192,17 @@ class BridgeApi:
                            self._hotkey_macro_save, scope='game')
         self._keybinds.set(ACTION_MACRO_LOAD, kb.get(ACTION_MACRO_LOAD),
                            self._hotkey_macro_load, scope='game')
+        for pos, item in enumerate(
+                self._settings.get('macro_active_macros', []), start=1):
+            if pos > ACTIVE_MACRO_COUNT:
+                break
+            slot = item.get('slot') if isinstance(item, dict) else 0
+            hotkey = item.get('hotkey') if isinstance(item, dict) else ''
+            if slot and hotkey:
+                self._keybinds.set(
+                    f'macro_active_{pos}', hotkey,
+                    lambda pos=pos: self._hotkey_macro_active(pos),
+                    scope='game')
 
     # Hotkey callbacks run on the keyboard package's listener thread.
     # They only mutate threading.Events / BotController state (already
@@ -1051,6 +1241,14 @@ class BridgeApi:
                   '(or use the UI button to confirm)')
             return
         self._macro.play()
+
+    def _hotkey_macro_active(self, pos):
+        self._log_hotkey(f'macro_active_{pos}')
+        if self._bot.is_running():
+            print('[macro] bot is running — stop bot first '
+                  '(or use the UI button to confirm)')
+            return
+        self._play_active_macro(pos)
 
     def _hotkey_macro_stop(self):
         self._log_hotkey('macro_stop')
