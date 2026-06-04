@@ -8,8 +8,8 @@ The engine owns:
   for the same keyboard key).
 - The `double → down` event-type normalization.
 - Playback timing (sleep to each event's target time, cancellable
-  via a `threading.Event`) and the safety sweep (release rhythm
-  keys + L/R mouse on exit).
+  via a `threading.Event`) and the safety sweep (release inputs
+  this playback left held, plus rhythm keys + L/R mouse on exit).
 - On-disk slot format `{name, events}` with bare-list legacy
   back-compat on read.
 - `loaded_slot` / `dirty` bookkeeping so callers (UI) can show the
@@ -200,6 +200,8 @@ class MacroEngine:
         Caller manages state-machine transitions (mark playing on
         entry, idle on return)."""
         start = time.time()
+        held_keys = set()
+        held_mouse = set()
         try:
             for ev in self._events:
                 if stop_evt is not None and stop_evt.is_set():
@@ -218,18 +220,33 @@ class MacroEngine:
                 if device == 'keyboard':
                     if etype == 'down':
                         controller.key_down(key)
+                        held_keys.add(key)
                     elif etype == 'up':
                         controller.key_up(key)
+                        held_keys.discard(key)
                 elif device == 'mouse':
                     if etype in ('down', 'double'):
                         controller.mouse_down(key)
+                        held_mouse.add(key)
                     elif etype == 'up':
                         controller.mouse_up(key)
+                        held_mouse.discard(key)
         finally:
+            for k in list(held_keys):
+                controller.key_up(k)
+            for b in list(held_mouse):
+                controller.mouse_up(b)
             for k in rhythm_keys:
                 controller.key_up(k)
             controller.mouse_up('left')
             controller.mouse_up('right')
+
+    @staticmethod
+    def play_events(events, controller, stop_evt=None, rhythm_keys=()):
+        """Play an event list without adopting it as this engine's buffer."""
+        engine = MacroEngine()
+        engine._events = list(events)
+        engine.play(controller, stop_evt=stop_evt, rhythm_keys=rhythm_keys)
 
     # ---- slot I/O ----
 
