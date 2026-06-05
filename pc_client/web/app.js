@@ -238,11 +238,11 @@ function beginCapture(action) {
     if (STATE.capturing) return;
     STATE.capturing = action;
     const row = document.querySelector(`.hk-row[data-action="${action}"]`);
-    row.querySelector('.rebind').textContent = '…';
+    row.querySelector('.rebind').textContent = '...';
     const msg = captureMsgFor(action);
     if (msg) {
         msg.textContent =
-            `Press a key or mouse button to bind ${labelFor(action)} (Esc to cancel)…`;
+            `Press a key or mouse button to bind ${labelFor(action)} (Esc to cancel)...`;
     }
 }
 
@@ -260,11 +260,11 @@ function beginActiveCapture(pos) {
     if (STATE.capturing || STATE.activeCapturing) return;
     STATE.activeCapturing = pos;
     const row = document.querySelector(`.active-macro-row[data-active="${pos}"]`);
-    if (row) row.querySelector('.active-bind').textContent = 'â€¦';
+    if (row) row.querySelector('.active-bind').textContent = '...';
     const msg = $('.active-capture-msg');
     if (msg) {
         msg.textContent =
-            `Press a key or mouse button to bind active macro ${pos} (Esc to cancel)â€¦`;
+            `Press a key or mouse button to bind active macro ${pos} (Esc to cancel)...`;
     }
 }
 
