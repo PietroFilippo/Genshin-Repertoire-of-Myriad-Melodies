@@ -340,7 +340,16 @@ window.addEventListener('keydown', (ev) => {
             shiftKey: ev.shiftKey,
             metaKey: ev.metaKey,
         };
-        callApi('rebind', STATE.capturing, payload).then(() => endCapture());
+        callApi('rebind', STATE.capturing, payload).then((res) => {
+            if (res && res.ok === false
+                    && res.reason === 'duplicate_hotkey') {
+                const msg = captureMsgFor(STATE.capturing);
+                if (msg) msg.textContent = 'That binding is already in use.';
+                return;
+            }
+            if (!res) return;
+            endCapture();
+        });
         return;
     }
     // Suppress webview-default shortcuts that would reload / leave the
@@ -398,7 +407,16 @@ window.addEventListener('mousedown', (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
     callApi('rebind', STATE.capturing, { mouseButton: name })
-        .then(() => endCapture());
+        .then((res) => {
+            if (res && res.ok === false
+                    && res.reason === 'duplicate_hotkey') {
+                const msg = captureMsgFor(STATE.capturing);
+                if (msg) msg.textContent = 'That binding is already in use.';
+                return;
+            }
+            if (!res) return;
+            endCapture();
+        });
 }, true);
 // Also block contextmenu while capturing so right-click capture doesn't
 // pop the native menu.

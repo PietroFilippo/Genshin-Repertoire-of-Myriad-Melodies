@@ -178,11 +178,13 @@ def _default_active_macros():
     return [{'slot': 0, 'hotkey': ''} for _ in range(ACTIVE_MACRO_COUNT)]
 
 
-def _normalize_active_macros(value):
+def _normalize_active_macros(value, reserved_hotkeys=()):
     out = _default_active_macros()
     if not isinstance(value, list):
         return out
-    used_hotkeys = set()
+    used_hotkeys = {
+        str(h).strip().lower() for h in reserved_hotkeys if h
+    }
     for i, item in enumerate(value[:ACTIVE_MACRO_COUNT]):
         if not isinstance(item, dict):
             continue
@@ -225,7 +227,8 @@ def load_settings():
         kb = dict(UI_KEYBINDS_DEFAULT)
         kb.update(data.get('keybinds', {}))
         backend = _normalize_backend(data.get('input_backend'))
-        active = _normalize_active_macros(data.get('macro_active_macros'))
+        active = _normalize_active_macros(
+            data.get('macro_active_macros'), reserved_hotkeys=kb.values())
         policy = _normalize_macro_conflict_policy(
             data.get('macro_conflict_policy'))
         return {
