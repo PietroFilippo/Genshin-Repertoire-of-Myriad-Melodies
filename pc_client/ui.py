@@ -780,7 +780,10 @@ class BridgeApi:
         hotkey = js_event_to_hotkey(payload)
         if not hotkey:
             return None
+        hotkey = hotkey.strip().lower()
         with self._lock:
+            if self._hotkey_in_use_locked(hotkey, current_action=action):
+                return {'ok': False, 'reason': 'duplicate_hotkey'}
             self._settings['keybinds'][action] = hotkey
             save_settings(self._settings)
         self._install_keybinds()
@@ -951,18 +954,11 @@ class BridgeApi:
         hotkey = js_event_to_hotkey(payload)
         if not hotkey:
             return {'ok': False, 'reason': 'bad_hotkey'}
+        hotkey = hotkey.strip().lower()
         with self._lock:
-            fixed_hotkeys = {
-                str(v).strip().lower()
-                for v in self._settings.get('keybinds', {}).values()
-                if v
-            }
-            if hotkey in fixed_hotkeys:
+            if self._hotkey_in_use_locked(hotkey, current_active_index=idx):
                 return {'ok': False, 'reason': 'duplicate_hotkey'}
             active = self._active_macros_locked()
-            for i, item in enumerate(active):
-                if i != idx and item.get('hotkey') == hotkey:
-                    return {'ok': False, 'reason': 'duplicate_hotkey'}
             active[idx]['hotkey'] = hotkey
             self._settings['macro_active_macros'] = active
             save_settings(self._settings)
@@ -1081,6 +1077,23 @@ class BridgeApi:
             hotkey = str(item.get('hotkey') or '').strip().lower()
             out[i] = {'slot': slot, 'hotkey': hotkey}
         return out
+
+    def _hotkey_in_use_locked(self, hotkey, current_action=None,
+                              current_active_index=None):
+        hotkey = (hotkey or '').strip().lower()
+        if not hotkey:
+            return False
+        for action, binding in self._settings.get('keybinds', {}).items():
+            if action == current_action:
+                continue
+            if str(binding or '').strip().lower() == hotkey:
+                return True
+        for i, item in enumerate(self._active_macros_locked()):
+            if i == current_active_index:
+                continue
+            if str(item.get('hotkey') or '').strip().lower() == hotkey:
+                return True
+        return False
 
     def _push_active_status(self):
         with self._lock:

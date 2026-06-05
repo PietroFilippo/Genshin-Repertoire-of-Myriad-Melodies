@@ -96,8 +96,8 @@ pip install opencv-python mss numpy pyserial pywebview pythonnet keyboard mouse 
 
 Run the UI:
 ```powershell
-python pc_client\ui.py
 ```
+python pc_client\ui.py
 
 (Run your terminal as Administrator first, or in-game hotkeys won't fire.)
 
