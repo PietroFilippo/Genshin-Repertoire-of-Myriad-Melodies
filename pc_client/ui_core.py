@@ -791,12 +791,23 @@ class MacroController:
     STATE_PLAYING = 'playing'
 
     SLOT_TIMEOUT_S = 4.0
+    TRIGGER_DEBOUNCE_S = 0.25
 
     def __init__(self, controller_provider, on_status):
         # Shared with BotController so we don't fight for the COM port.
         self._controller_provider = controller_provider
         self._on_status = on_status
         self._lock = threading.Lock()
+        # Serialize whole user commands (play active, interrupt, stop).
+        # `_lock` only protects field snapshots and is released while an
+        # interrupted worker joins. Without this outer lock, a stop hotkey
+        # can target the old worker during that hand-off and miss the new
+        # playback that starts immediately after.
+        self._command_lock = threading.Lock()
+        # Last trigger time per playback source. Repeated callbacks refresh
+        # the timestamp so holding/spamming a macro hotkey cannot restart it
+        # as soon as the current playback exits. Protected by _command_lock.
+        self._last_play_trigger_ts = {}
         self._state = self.STATE_IDLE
         # Event buffer + auto-repeat suppression + playback timing live
         # in MacroEngine. We own the state machine, hooks, foreground
@@ -939,87 +950,96 @@ class MacroController:
     # ---- playback ----
 
     def play(self):
-        with self._lock:
-            if self._state != self.STATE_IDLE:
-                print(f"[macro] cannot play — state is {self._state}")
-                return False
-            if self._engine.event_count() == 0:
-                print("[macro] no macro recorded / loaded")
-                return False
-            controller = self._resolve_controller()
-            if controller is None:
-                print("[macro] play aborted — no input controller")
-                return False
-            events = [dict(ev) for ev in self._engine.events]
-            self._start_playback_locked(
-                controller, events, slot=None, name='', source='buffer')
+        with self._command_lock:
+            repeated = self._is_repeated_play_trigger_locked(('buffer', None))
+            with self._lock:
+                if repeated or self._state == self.STATE_PLAYING:
+                    return False
+                if self._state != self.STATE_IDLE:
+                    print(f"[macro] cannot play - state is {self._state}")
+                    return False
+                if self._engine.event_count() == 0:
+                    print("[macro] no macro recorded / loaded")
+                    return False
+                controller = self._resolve_controller()
+                if controller is None:
+                    print("[macro] play aborted - no input controller")
+                    return False
+                events = [dict(ev) for ev in self._engine.events]
+                self._start_playback_locked(
+                    controller, events, slot=None, name='', source='buffer')
         self._emit()
         return True
 
     def play_slot(self, n, conflict_policy=MACRO_CONFLICT_IGNORE):
-        try:
-            n_int = int(n)
-        except (TypeError, ValueError):
-            return False
-        if not (1 <= n_int <= 9):
-            return False
-        path = macros_dir() / f'macro_{n_int}.json'
-        if not path.exists():
-            print(f"[macro] active slot {n_int} is empty")
-            return False
-        try:
-            events, name = MacroEngine.read(path)
-        except ValueError as e:
-            print(f"[macro] active slot {n_int} malformed: {e}")
-            return False
-        except Exception as e:
-            print(f"[macro] active slot {n_int} read failed: {e}")
-            return False
-        if not events:
-            print(f"[macro] active slot {n_int} has no events")
-            return False
-        controller = self._resolve_controller()
-        if controller is None:
-            print("[macro] active play aborted — no input controller")
-            return False
-
-        conflict_policy = _normalize_macro_conflict_policy(conflict_policy)
-        while True:
-            old_thread = None
-            with self._lock:
-                if self._state == self.STATE_RECORDING:
-                    print("[macro] cannot play active slot while recording")
-                    return False
-                if self._state == self.STATE_PLAYING:
-                    if self._playing_slot == n_int:
-                        print(f"[macro] slot {n_int} is already playing")
-                        return False
-                    if conflict_policy != MACRO_CONFLICT_INTERRUPT:
-                        print(f"[macro] slot {n_int} ignored — another macro "
-                              "is already playing")
-                        return False
-                    old_thread = self._play_thread
-                    print(f"[macro] interrupting current playback for "
-                          f"slot {n_int}")
-                    self._stop_play_evt.set()
-                else:
-                    self._start_playback_locked(
-                        controller, [dict(ev) for ev in events],
-                        slot=n_int, name=name, source='active')
-                    break
-            if old_thread is None:
-                continue
-            old_thread.join(timeout=2.0)
-            if old_thread.is_alive():
-                print("[macro] interrupt timed out — active slot not started")
+        with self._command_lock:
+            try:
+                n_int = int(n)
+            except (TypeError, ValueError):
                 return False
+            if not (1 <= n_int <= 9):
+                return False
+            if self._is_repeated_play_trigger_locked(('slot', n_int)):
+                return False
+            path = macros_dir() / f'macro_{n_int}.json'
+            if not path.exists():
+                print(f"[macro] active slot {n_int} is empty")
+                return False
+            try:
+                events, name = MacroEngine.read(path)
+            except ValueError as e:
+                print(f"[macro] active slot {n_int} malformed: {e}")
+                return False
+            except Exception as e:
+                print(f"[macro] active slot {n_int} read failed: {e}")
+                return False
+            if not events:
+                print(f"[macro] active slot {n_int} has no events")
+                return False
+            controller = self._resolve_controller()
+            if controller is None:
+                print("[macro] active play aborted - no input controller")
+                return False
+
+            conflict_policy = _normalize_macro_conflict_policy(conflict_policy)
+            while True:
+                old_thread = None
+                with self._lock:
+                    if self._state == self.STATE_RECORDING:
+                        print("[macro] cannot play active slot while recording")
+                        return False
+                    if self._state == self.STATE_PLAYING:
+                        if self._playing_slot == n_int:
+                            return False
+                        if conflict_policy != MACRO_CONFLICT_INTERRUPT:
+                            print(f"[macro] slot {n_int} ignored - another macro "
+                                  "is already playing")
+                            return False
+                        old_thread = self._play_thread
+                        print(f"[macro] interrupting current playback for "
+                              f"slot {n_int}")
+                        self._stop_play_evt.set()
+                    else:
+                        self._start_playback_locked(
+                            controller, [dict(ev) for ev in events],
+                            slot=n_int, name=name, source='active')
+                        break
+                if old_thread is None:
+                    continue
+                old_thread.join(timeout=2.0)
+                if old_thread.is_alive():
+                    print("[macro] interrupt timed out - active slot not started")
+                    return False
         self._emit()
         return True
 
     def stop_play(self):
-        if self._state != self.STATE_PLAYING:
-            return False
-        self._stop_play_evt.set()
+        with self._command_lock:
+            with self._lock:
+                if self._state != self.STATE_PLAYING:
+                    return False
+                stop_evt = self._stop_play_evt
+            stop_evt.set()
         return True
 
     def _start_playback_locked(self, controller, events, slot, name, source):
@@ -1286,6 +1306,13 @@ class MacroController:
             self._play_thread.join(timeout=2.0)
 
     # ---- internal ----
+
+    def _is_repeated_play_trigger_locked(self, trigger_key):
+        now = time.monotonic()
+        last = self._last_play_trigger_ts.get(trigger_key)
+        self._last_play_trigger_ts[trigger_key] = now
+        return (last is not None and
+                now - last < self.TRIGGER_DEBOUNCE_S)
 
     def _resolve_controller(self):
         if self._controller_provider is None:
