@@ -20,6 +20,9 @@ Finding IDs in the class docstrings refer to the UX review:
   RC2 detector focus gate trusts a recycled game HWND (another process)
   RC3 album.py CLI ignores INPUT_BACKEND_DEFAULT (always the Arduino)
   RC4 calibrate.py isn't DPI-aware (overlay misplaced on scaled displays)
+  W1  game closed during the final wheel click's settle → "completed"
+  W2  game RECREATES its window (fullscreen toggle, display-mode change):
+      a dead HWND must be followed to the new window, not reported closed
 
 Run:  python -m unittest discover -s tests -p "test_*.py"
 """
@@ -49,6 +52,7 @@ from config import (ALBUM_BEGIN_PERFORMANCE_XY,         # noqa: E402
 
 REGION_1080 = {'top': 0, 'left': 0, 'width': 1920, 'height': 1080}
 GAME_HWND = 4242
+NEW_HWND = 5353      # the window Genshin recreated (fullscreen toggle, ...)
 
 
 def _quiet():
@@ -500,18 +504,33 @@ class ScreenWatcherClicks(unittest.TestCase):
 
 class FakeUser32:
     def __init__(self, exists=True, iconic=(), size=(1920, 1080),
-                 origin=(0, 0), find=GAME_HWND):
+                 origin=(0, 0), find=GAME_HWND, windows=None):
         self.exists = exists
         self.iconic = list(iconic)   # successive IsIconic results
         self.size = size
         self.origin = origin
         self.find = find
         self.shown = []
+        # Optional {hwnd: (w, h)} of the live windows — models a game that
+        # recreates its window (old handle dies, FindWindowW returns the
+        # new one). None = a single window per `exists` / `size`.
+        self.windows = windows
+
+    @staticmethod
+    def _h(hwnd):
+        return int(getattr(hwnd, 'value', hwnd) or 0)  # HWND() or int
+
+    def recreate(self, new_hwnd, size):
+        """The game replaced its window (fullscreen toggle, ...)."""
+        self.windows = {new_hwnd: size}
+        self.find = new_hwnd
 
     def FindWindowW(self, cls, title):
         return self.find
 
     def IsWindow(self, hwnd):
+        if self.windows is not None:
+            return self._h(hwnd) in self.windows
         return self.exists
 
     def IsIconic(self, hwnd):
@@ -521,8 +540,11 @@ class FakeUser32:
         self.shown.append(cmd)
 
     def GetClientRect(self, hwnd, ref):
+        size = self.size
+        if self.windows is not None:
+            size = self.windows.get(self._h(hwnd), (0, 0))
         ref._obj.left, ref._obj.top = 0, 0
-        ref._obj.right, ref._obj.bottom = self.size
+        ref._obj.right, ref._obj.bottom = size
 
     def GetWindowRect(self, hwnd, ref):
         self.GetClientRect(hwnd, ref)
@@ -596,6 +618,59 @@ class GameWindowGeometry(unittest.TestCase):
         self._patch(broken)
         self.assertFalse(game_window.window_gone(GAME_HWND))
 
+    def test_resolve_follows_recreated_window(self):
+        """W2 — a dead HWND isn't "closed" while a game window exists."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        self._patch(fake)
+        self.assertEqual(game_window.resolve_game_window(GAME_HWND),
+                         GAME_HWND)
+        fake.iconic = [True]                      # minimized: still ours
+        self.assertEqual(game_window.resolve_game_window(GAME_HWND),
+                         GAME_HWND)
+        fake.recreate(NEW_HWND, (1280, 720))
+        self.assertEqual(game_window.resolve_game_window(GAME_HWND),
+                         NEW_HWND)
+        fake.windows = {}                          # closed
+        self.assertIsNone(game_window.resolve_game_window(GAME_HWND))
+        fake.find = 0
+        self.assertIsNone(game_window.resolve_game_window(GAME_HWND))
+
+    def test_follow_geometry_adopts_new_window_or_reports_closed(self):
+        fake = FakeUser32(windows={NEW_HWND: (1280, 720)}, find=NEW_HWND)
+        self._patch(fake)
+        rec = Recorder()
+        with _quiet():
+            hwnd, (region, sx, sy) = game_window.follow_game_geometry(
+                GAME_HWND, stop_evt=threading.Event(), status_cb=rec)
+        self.assertEqual((hwnd, region['width'], round(sx, 3)),
+                         (NEW_HWND, 1280, round(2 / 3, 3)))
+        self.assertEqual(rec.values('last_error'), [])
+        fake.windows = {}
+        stop = threading.Event()
+        with _quiet():
+            self.assertIsNone(game_window.follow_game_geometry(
+                GAME_HWND, stop_evt=stop, status_cb=rec))
+        self.assertFalse(stop.is_set())
+        self.assertEqual(rec.values('last_error'),
+                         [game_window.MSG_WINDOW_CLOSED])
+
+    def test_follow_geometry_window_recreated_during_minimized_wait(self):
+        """W2 — the old window vanishes while we wait for it to be
+        restored: follow the new one, no "closed" flash (the minimized
+        notice is cleared)."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)}, iconic=[True])
+        self._patch(fake)
+        rec = Recorder()
+        swap = threading.Timer(0.1, fake.recreate, (NEW_HWND, (1280, 720)))
+        swap.start()
+        self.addCleanup(swap.cancel)
+        with _quiet():
+            hwnd, (region, _, _) = game_window.follow_game_geometry(
+                GAME_HWND, stop_evt=threading.Event(), status_cb=rec)
+        self.assertEqual((hwnd, region['width']), (NEW_HWND, 1280))
+        self.assertEqual(rec.values('last_error'),
+                         [game_window.MSG_WINDOW_MINIMIZED, ''])
+
 
 # --- standalone runner --------------------------------------------------------
 
@@ -634,8 +709,9 @@ class StandaloneRunner(unittest.TestCase):
                                             921)),
             mock.patch.object(standalone_runner, 'find_game_window',
                               return_value=GAME_HWND),
-            mock.patch.object(standalone_runner, 'get_game_geometry',
-                              return_value=(moved, 2 / 3, 2 / 3)),
+            mock.patch.object(standalone_runner, 'follow_game_geometry',
+                              return_value=(GAME_HWND,
+                                            (moved, 2 / 3, 2 / 3))),
             mock.patch.object(standalone_runner, 'NoteDetector', FakeDetector),
         ]
         for p in patches:
@@ -793,6 +869,26 @@ class StandaloneRunner(unittest.TestCase):
         self.assertEqual(self.rec.values('state')[-1], 'idle')
         self.assertEqual(len(FakeDetector.instances), 1)
         self.assertTrue(FakeDetector.instances[0].stopped)
+
+    def test_recreated_window_mid_play_continues_on_new_hwnd(self):
+        """W2 — old HWND gone + new HWND found (fullscreen toggle at a new
+        size): the run keeps going on a detector for the new window and
+        lane layout; no error, only the user's Stop ends it."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        swap = threading.Timer(0.1, fake.recreate, (NEW_HWND, (1280, 720)))
+        stopper = threading.Timer(0.5, self.stop.set)
+        for t in (swap, stopper):
+            t.start()
+            self.addCleanup(t.cancel)
+        elapsed = self._run_real_viz(fake)
+        self.assertGreaterEqual(elapsed, 0.45)         # ended by Stop
+        self.assertEqual(self.rec.values('last_error'), [])
+        first, second = FakeDetector.instances
+        self.assertEqual(first.hwnd, GAME_HWND)
+        self.assertTrue(first.stopped)
+        self.assertEqual(second.hwnd, NEW_HWND)
+        self.assertEqual(second.column_centers[0], int(417 * 2 / 3))
+        self.assertTrue(second.stopped)
 
     def test_minimized_mid_play_keeps_running(self):
         """RC1 — minimized is not closed: play waits (until Stop here)
@@ -1046,6 +1142,15 @@ class VisualizationWindow(unittest.TestCase):
             if debug_on:
                 self.cv2['destroyWindow'].assert_called()
 
+    def test_recreated_window_exits_for_detector_rebuild(self):
+        """W2 — even at the same size: the detector holds a dead HWND."""
+        stop = threading.Event()
+        polls = [None, standalone_runner.WINDOW_REPLACED]
+        reason = self._run_viz(
+            stop, geometry_poll=lambda: polls.pop(0) if polls else None)
+        self.assertEqual(reason, standalone_runner.VIZ_EXIT_GEOMETRY)
+        self.assertFalse(stop.is_set())
+
 
 class GeometryTrackerTests(unittest.TestCase):
     """RR4 — the tracker behind Standalone / CLI mid-play polling."""
@@ -1060,8 +1165,9 @@ class GeometryTrackerTests(unittest.TestCase):
         for geom in ((dict(REGION_1080), 1.0, 1.0), None):
             with mock.patch.object(standalone_runner, 'read_game_geometry',
                                    return_value=geom), \
-                    mock.patch.object(standalone_runner, 'window_gone',
-                                      return_value=False):
+                    mock.patch.object(standalone_runner,
+                                      'resolve_game_window',
+                                      side_effect=lambda hwnd: hwnd):
                 self.assertIsNone(t.poll())
 
     def test_closed_game_reported_minimized_is_not(self):
@@ -1075,6 +1181,19 @@ class GeometryTrackerTests(unittest.TestCase):
                                return_value=FakeUser32(exists=False)):
             self.assertEqual(t.poll(), standalone_runner.WINDOW_GONE)
         self.assertEqual(t.current[0], REGION_1080)   # last-known kept
+
+    def test_recreated_window_adopted_not_gone(self):
+        """W2 — old HWND dead, a new game window exists: adopt it (with its
+        new size) and ask for a detector rebuild."""
+        t = self._tracker()
+        fake = FakeUser32(windows={NEW_HWND: (1280, 720)}, find=NEW_HWND)
+        with mock.patch.object(game_window, '_user32', return_value=fake), \
+                _quiet():
+            self.assertEqual(t.poll(), standalone_runner.WINDOW_REPLACED)
+            self.assertEqual(t.hwnd, NEW_HWND)
+            self.assertEqual(t.current[0]['width'], 1280)
+            self.assertEqual(t.current[2], int(REF_HIT_LINE_Y * 2 / 3))
+            self.assertIsNone(t.poll())                # settled on it
 
     def test_move_vs_resize(self):
         t = self._tracker()
@@ -1104,15 +1223,15 @@ class AlbumRunnerBase(unittest.TestCase):
         self.rec = Recorder()
         self.set_mouse = mock.MagicMock()
         self.get_mouse = mock.MagicMock(return_value=(6, 10, 1))
-        # GAME_HWND isn't a real window: without this the real IsWindow
-        # would call the game closed. Tests flip it to simulate that.
-        self.window_gone = mock.MagicMock(return_value=False)
+        # The game's windows as Win32 reports them: the REAL
+        # follow / resolve / read_game_geometry run over this fake.
+        # Tests close the game (`fake.windows = {}`) or have it recreate
+        # its window (`fake.recreate(...)`).
+        self.fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
         patches = [
-            mock.patch.object(album, 'window_gone', self.window_gone),
+            mock.patch.object(game_window, '_user32', return_value=self.fake),
             mock.patch.object(album, 'find_game_window',
                               return_value=GAME_HWND),
-            mock.patch.object(album, 'get_game_geometry',
-                              return_value=(dict(REGION_1080), 1.0, 1.0)),
             mock.patch.object(album.AlbumRunner, '_load_tpl',
                               staticmethod(_tpl)),
             mock.patch.object(album, '_get_mouse_params', self.get_mouse),
@@ -1434,12 +1553,10 @@ class AlbumRunnerClicksAndGeometry(AlbumRunnerBase):
         self.assertEqual(self.rec.values('last_error'), [])
 
 
-class AlbumGameClosed(AlbumRunnerBase):
-    """RC1 — Genshin closed mid-album: the run ends promptly as FAILED
-    with MSG_WINDOW_CLOSED, instead of looping until Stop (rhythm phase)
-    or reporting a misleading click / navigation error after a long
-    timeout. Every test arms a Stop timer so a regression fails instead
-    of hanging."""
+class AlbumWindowFixture(AlbumRunnerBase):
+    """Runner over the fake game windows with the rhythm phase's detector
+    / viz stubbed. Every runner arms a Stop timer so a regression fails
+    instead of hanging. No tests."""
 
     def setUp(self):
         super().setUp()
@@ -1456,7 +1573,7 @@ class AlbumGameClosed(AlbumRunnerBase):
             self.addCleanup(p.stop)
 
     def close_game(self):
-        self.window_gone.return_value = True
+        self.fake.windows = {}           # no game window left at all
 
     def runner(self, timeout=3.0):
         r = self.make_runner()
@@ -1470,6 +1587,13 @@ class AlbumGameClosed(AlbumRunnerBase):
     def closed_error_only(self):
         self.assertEqual(self.rec.values('last_error'),
                          [game_window.MSG_WINDOW_CLOSED])
+
+
+class AlbumGameClosed(AlbumWindowFixture):
+    """RC1 — Genshin closed mid-album: the run ends promptly as FAILED
+    with MSG_WINDOW_CLOSED, instead of looping until Stop (rhythm phase)
+    or reporting a misleading click / navigation error after a long
+    timeout."""
 
     def test_refresh_tells_closed_from_minimized(self):
         r = self.runner()
@@ -1570,6 +1694,114 @@ class AlbumGameClosed(AlbumRunnerBase):
         self.assertLess(elapsed, 1.5)
         self.closed_error_only()
         self.assertEqual(r._halt_result(), album.RESULT_FAILED)
+
+    def test_closed_during_final_wheel_settle_is_not_completed(self):
+        """W1 — the 12th (wheel-reset) click landed, then the game closed
+        during its 0.8 s settle: FAILED + MSG_WINDOW_CLOSED, not
+        "Album complete"."""
+        r = self.runner()
+        r.watcher.click_ref = mock.MagicMock(return_value=True)
+        r.watcher.stop_wait = lambda secs: self.close_game() or False
+        with _quiet():
+            self.assertEqual(r._finish_wheel(ALBUM_SONG_COUNT),
+                             album.RESULT_FAILED)
+        self.closed_error_only()
+
+    def test_stop_wins_over_closure_during_wheel_settle(self):
+        """W1 — Stop keeps precedence: stopped, no error."""
+        r = self.runner()
+        r.watcher.click_ref = mock.MagicMock(return_value=True)
+        r.watcher.stop_wait = lambda secs: (self.close_game()
+                                            or r.stop_evt.set() or True)
+        with _quiet():
+            self.assertEqual(r._finish_wheel(ALBUM_SONG_COUNT),
+                             album.RESULT_STOPPED)
+        self.assertEqual(self.rec.values('last_error'), [])
+
+
+class AlbumWindowRecreated(AlbumWindowFixture):
+    """W2 — Genshin RECREATES its window (fullscreen / Alt+Enter toggle,
+    resolution or display-mode change): the old HWND dies while the game
+    keeps running. The run must adopt the new window and carry on — not
+    end as "Genshin was closed"."""
+
+    def recreate(self, size=(1280, 720)):
+        self.fake.recreate(NEW_HWND, size)
+
+    def assert_adopted(self, r, width):
+        self.assertEqual(r.hwnd, NEW_HWND)
+        self.assertEqual(r.song_player.hwnd, NEW_HWND)
+        self.assertEqual(r.watcher.region['width'], width)
+        self.assertEqual(r.song_player.region['width'], width)
+        self.assertEqual(self.rec.values('last_error'), [])
+
+    def test_navigation_check_adopts_new_window(self):
+        r = self.runner()
+        self.recreate()
+        with _quiet():
+            self.assertFalse(r._window_gone())
+        self.assert_adopted(r, 1280)
+        self.assertEqual(r.tpl['go_perform'].shape[1],
+                         round(40 * 1280 / 1920))   # templates rescaled
+
+    def test_wheel_settle_and_boundary_follow_new_window(self):
+        r = self.runner()
+        r.watcher.click_ref = mock.MagicMock(return_value=True)
+        r.watcher.stop_wait = lambda secs: self.recreate() or False
+        with _quiet():
+            self.assertTrue(r._next_song())
+            self.assertTrue(r._song_boundary())     # blocking re-read
+        self.assert_adopted(r, 1280)
+
+    def test_blocking_refresh_follows_new_window(self):
+        r = self.runner()
+        self.recreate(size=(1920, 1080))
+        with _quiet():
+            self.assertTrue(r._refresh_geometry(block=True))
+        self.assert_adopted(r, 1920)
+
+    def test_mid_song_detector_rebuilt_on_new_window(self):
+        """Old HWND gone + new HWND found mid-song: a detector for the new
+        window (and its lane layout) takes over; the song ends normally."""
+        r = self.runner()
+        sp = r.song_player
+
+        def end_watcher(local_stop):
+            if _wait_until(lambda: len(FakeDetector.instances) >= 2):
+                time.sleep(0.05)
+                local_stop.set()
+
+        sp._end_watcher = end_watcher
+        sp.watcher.stop_wait = lambda secs: r.stop_evt.wait(0.01)
+        recreator = threading.Timer(0.1, self.recreate)
+        recreator.start()
+        self.addCleanup(recreator.cancel)
+        with _quiet():
+            self.assertTrue(sp._rhythm_phase())     # runner's own thread
+        self.assertFalse(r.stop_evt.is_set())
+        first, second = FakeDetector.instances
+        self.assertEqual(first.hwnd, GAME_HWND)
+        self.assertTrue(first.stopped)
+        self.assertEqual(second.hwnd, NEW_HWND)
+        self.assertEqual(second.column_centers[0], int(417 * 2 / 3))
+        self.assert_adopted(r, 1280)
+
+    def test_click_follows_new_window(self):
+        """The pre-click live check adopts the recreated window (moved
+        here) and click_ref re-targets onto it instead of refusing."""
+        for name in ('CLICK_HOVER_S', 'CLICK_HOLD_S', 'CLICK_SETTLE_S'):
+            p = mock.patch.object(screen_watcher, name, 0)
+            p.start()
+            self.addCleanup(p.stop)
+        r = self.runner()
+        self.recreate(size=(1920, 1080))
+        self.fake.origin = (100, 50)
+        with _quiet():
+            self.assertTrue(r.watcher.click_ref(500, 500))
+        moves = [c[1:] for c in r.controller.snapshot() if c[0] == 'move_to']
+        self.assertEqual(moves, [(500, 500), (600, 550)])
+        self.assertEqual(r.hwnd, NEW_HWND)
+        self.assertEqual(self.rec.values('last_error'), [])
 
 
 # --- SongPlayer ----------------------------------------------------------------
@@ -1879,6 +2111,23 @@ class SongPlayerRhythmPhase(unittest.TestCase):
         self.assertEqual(second.column_centers[0], int(417 * 2 / 3))
         self.geometry_fn.assert_any_call(False)
 
+    def test_recreated_window_rebuilds_detector_same_layout(self):
+        """W2 — update_hwnd (window recreated at the same size) still
+        replaces the detector: the old one reads a dead HWND."""
+        with _quiet():
+            t, out = self._start()
+            self.assertTrue(_wait_until(lambda: FakeDetector.instances))
+            self.sp.update_hwnd(NEW_HWND)
+            self.assertTrue(_wait_until(
+                lambda: len(FakeDetector.instances) == 2))
+            self.song_end.set()
+            t.join(2.0)
+        first, second = FakeDetector.instances
+        self.assertTrue(first.stopped)
+        self.assertEqual((first.hwnd, second.hwnd), (GAME_HWND, NEW_HWND))
+        self.assertEqual(second.column_centers, first.column_centers)
+        self.assertEqual(out, [True])
+
     def test_stop_during_resize_teardown_does_not_restart(self):
         """RR2 — Stop lands while the old detector is being joined."""
         stop = self.stop
@@ -2039,15 +2288,19 @@ class MainCliGameClosed(unittest.TestCase):
     backend closed, timer restored, exit 1 + message) when Genshin is
     closed mid-run, headless or with the debug viz."""
 
-    def _run(self, debug_mode):
+    def _run(self, debug_mode, fake=None, on_sleep=None):
         import main as cli
         FakeDetector.instances = []
         ctrl = FakeInput()
         restore = mock.MagicMock()
         sleeps = []
+        if fake is None:
+            fake = FakeUser32(exists=False)
 
         def sleep(secs):                  # bounds a regression: Ctrl+C
             sleeps.append(secs)
+            if on_sleep is not None:
+                on_sleep(len(sleeps))
             if len(sleeps) > 50:
                 raise KeyboardInterrupt
 
@@ -2070,7 +2323,7 @@ class MainCliGameClosed(unittest.TestCase):
         code = None
         with mock.patch.multiple(cli, **patches), \
                 mock.patch.object(game_window, '_user32',
-                                  return_value=FakeUser32(exists=False)), \
+                                  return_value=fake), \
                 _quiet() as out:
             try:
                 cli.main()
@@ -2087,6 +2340,26 @@ class MainCliGameClosed(unittest.TestCase):
             self.assertTrue(all(d.stopped for d in FakeDetector.instances))
             self.assertTrue(ctrl.closed)
             restore.assert_called_once()
+
+    def test_headless_follows_recreated_window_then_exits_on_close(self):
+        """W2 — a recreated window rebuilds the detector on the new HWND
+        (new layout); only a real close ends the CLI."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+
+        def on_sleep(n):
+            if n == 1:
+                fake.recreate(NEW_HWND, (1280, 720))
+            elif n == 3:
+                fake.windows = {}
+
+        code, out, ctrl, _ = self._run(False, fake=fake, on_sleep=on_sleep)
+        self.assertEqual(code, 1)
+        self.assertIn(game_window.MSG_WINDOW_CLOSED, out)
+        first, second = FakeDetector.instances
+        self.assertEqual(first.hwnd, GAME_HWND)
+        self.assertEqual(second.hwnd, NEW_HWND)
+        self.assertEqual(second.column_centers[0], int(417 * 2 / 3))
+        self.assertTrue(first.stopped and second.stopped)
 
 
 if __name__ == '__main__':

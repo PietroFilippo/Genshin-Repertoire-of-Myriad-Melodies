@@ -34,7 +34,7 @@ from config import (ALBUM_BEGIN_PERFORMANCE_XY, ALBUM_DIFFICULTY_COORDS,
                     ALBUM_END_POLL_S, ALBUM_GO_PERFORM_XY,
                     PIXEL_THRESHOLD, Y_SAMPLE_OFFSETS)
 from detector import NoteDetector
-from game_window import scaled_layout
+from game_window import same_hwnd, scaled_layout
 from standalone_runner import run_visualization
 
 
@@ -153,6 +153,12 @@ class SongPlayer:
         self.region = dict(region)
         self.scale_x = scale_x
         self.scale_y = scale_y
+
+    def update_hwnd(self, hwnd):
+        """The game recreated its window (fullscreen toggle, display-mode
+        change): new HWND for the detector's GDI reads and focus gate.
+        `_rhythm_phase` rebuilds the detector (+ viz) on its next tick."""
+        self.hwnd = hwnd
 
     def play(self, difficulty, skip_intro=False):
         """Play one song at `difficulty`. Returns True on normal
@@ -407,7 +413,7 @@ class SongPlayer:
             target=self._end_watcher, args=(watcher_evt,), daemon=True)
         end_watcher_thread.start()
 
-        st = {'detector': None, 'layout': None,
+        st = {'detector': None, 'layout': None, 'hwnd': None,
               'viz_thread': None, 'viz_stop': threading.Event(),
               'viz_region': None}
 
@@ -432,6 +438,7 @@ class SongPlayer:
         def start_detection(layout):
             column_centers, hit_line_y = layout
             st['layout'] = layout
+            st['hwnd'] = self.hwnd
             st['detector'] = NoteDetector(self.hwnd, column_centers,
                                           hit_line_y, self.controller)
             st['detector'].start()
@@ -494,8 +501,17 @@ class SongPlayer:
                         window_lost = not self.stop_evt.is_set()
                         break
                 layout = scaled_layout(self.scale_x, self.scale_y)
-                if st['detector'] is None or layout != st['layout']:
-                    if st['detector'] is not None:
+                # A recreated game window (new HWND, via update_hwnd)
+                # needs a fresh detector too: the old one reads — and
+                # gates focus on — a handle that no longer exists.
+                recreated = (st['detector'] is not None
+                             and not same_hwnd(self.hwnd, st['hwnd']))
+                if (st['detector'] is None or layout != st['layout']
+                        or recreated):
+                    if recreated:
+                        print("  game window recreated — rebuilding the "
+                              "detector for the new window")
+                    elif st['detector'] is not None:
                         print("  game window resized — rebuilding the "
                               "detector for the new lane layout")
                     stop_detection()

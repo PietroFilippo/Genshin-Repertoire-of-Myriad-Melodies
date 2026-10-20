@@ -24,9 +24,9 @@ from config import (KEYS, PIXEL_THRESHOLD, KEY_POLL_DELAY_S,
 from detector import NoteDetector
 from controller import ArduinoHIDController
 from game_window import (MSG_WINDOW_CLOSED, MSG_WINDOW_NOT_FOUND,
-                         find_game_window, auto_detect, get_game_geometry,
-                         read_game_geometry, same_hwnd, scaled_layout,
-                         window_gone)
+                         find_game_window, auto_detect, follow_game_geometry,
+                         read_game_geometry, resolve_game_window, same_hwnd,
+                         scaled_layout)
 
 try:
     from controller import ArduinoConnectionError
@@ -44,15 +44,19 @@ MSG_ARDUINO_UNAVAILABLE = ("Arduino not connected — plug it in or switch the "
 VIZ_EXIT_STOP = 'stop'
 VIZ_EXIT_PAUSE = 'pause'
 VIZ_EXIT_QUIT = 'quit'
-# The game window was resized (lane layout changed) — rebuild the detector
-# and re-enter with the new geometry. A plain move is handled in place.
+# The game window was resized (lane layout changed) or recreated (new
+# HWND) — rebuild the detector and re-enter with the new geometry / handle
+# (`GeometryTracker.hwnd`). A plain move is handled in place.
 VIZ_EXIT_GEOMETRY = 'geometry'
-# The game window no longer exists (Genshin was closed) — the caller ends
+# No game window exists any more (Genshin was closed) — the caller ends
 # the run. A minimized / hidden game is NOT this: play just waits for it.
 VIZ_EXIT_WINDOW_GONE = 'window_gone'
 
-# `GeometryTracker.poll()` result when the game window no longer exists.
+# `GeometryTracker.poll()` results besides None / a new geometry: no game
+# window exists any more, or the game recreated its window (fullscreen
+# toggle, display-mode change) and the tracker adopted the new HWND.
 WINDOW_GONE = 'window_gone'
+WINDOW_REPLACED = 'window_replaced'
 
 # Non-blocking geometry poll cadence during active play (window moved /
 # resized while a song runs) — same cadence as the album's SongPlayer.
@@ -215,9 +219,12 @@ class GeometryTracker:
     during active play. `poll()` is cheap (`read_game_geometry` never
     messages the game) — call it every ~GEOMETRY_POLL_S. Returns the new
     (capture_region, column_centers, hit_line_y) when anything changed,
-    WINDOW_GONE when the game window no longer exists (Genshin closed —
-    end the run), else None (no change, or the window is minimized /
-    off-screen right now — keep the last-known geometry)."""
+    WINDOW_REPLACED when the game recreated its window (`hwnd` now holds
+    the new handle and `current` its geometry when readable — rebuild
+    the detector for it), WINDOW_GONE when no game window exists any
+    more (Genshin closed — end the run), else None (no change, or the
+    window is minimized / off-screen right now — keep the last-known
+    geometry)."""
 
     def __init__(self, hwnd, capture_region, column_centers, hit_line_y,
                  tag='[standalone]'):
@@ -239,7 +246,20 @@ class GeometryTracker:
         if geom is None:
             # Minimized / off-screen: keep waiting. Closed: say so, or the
             # run would keep "playing" a game that no longer exists.
-            return WINDOW_GONE if window_gone(self.hwnd) else None
+            # Recreated (dead HWND, but a game window exists): follow it.
+            live = resolve_game_window(self.hwnd)
+            if live is None:
+                return WINDOW_GONE
+            if same_hwnd(live, self.hwnd):
+                return None
+            self.hwnd = live
+            geom = read_game_geometry(live)
+            if geom is not None:
+                region, scale_x, scale_y = geom
+                self.set(region, *scaled_layout(scale_x, scale_y))
+            print(f"{self.tag} game window recreated — following the new "
+                  f"window")
+            return WINDOW_REPLACED
         region, scale_x, scale_y = geom
         cols, hit = scaled_layout(scale_x, scale_y)
         new = (dict(region), cols, hit)
@@ -310,8 +330,9 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             (capture_region, column_centers, hit_line_y), e.g.
             `GeometryTracker.poll`. Called every GEOMETRY_POLL_S whether
             debug is on or off. A move retargets the capture in place; a
-            resize returns VIZ_EXIT_GEOMETRY so the caller rebuilds the
-            detector; WINDOW_GONE returns VIZ_EXIT_WINDOW_GONE.
+            resize (or WINDOW_REPLACED) returns VIZ_EXIT_GEOMETRY so the
+            caller rebuilds the detector; WINDOW_GONE returns
+            VIZ_EXIT_WINDOW_GONE.
 
     Returns why the loop exited: VIZ_EXIT_STOP (stop_evt), VIZ_EXIT_PAUSE
     (pause_evt), VIZ_EXIT_QUIT ('q' / window closed with no debug_evt),
@@ -423,12 +444,16 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             if geometry_poll is not None and time.time() >= next_geom_poll:
                 next_geom_poll = time.time() + GEOMETRY_POLL_S
                 new_geom = geometry_poll()
-                if new_geom == WINDOW_GONE:
-                    # Genshin was closed — nothing left to play.
+                if new_geom in (WINDOW_GONE, WINDOW_REPLACED):
+                    # Closed: nothing left to play. Recreated: the
+                    # detector holds the dead HWND — the caller rebuilds
+                    # it (any size change included) like for a resize.
                     if window_open:
                         close_window()
                         window_open = False
-                    exit_reason = VIZ_EXIT_WINDOW_GONE
+                    exit_reason = (VIZ_EXIT_WINDOW_GONE
+                                   if new_geom == WINDOW_GONE
+                                   else VIZ_EXIT_GEOMETRY)
                     break
                 if new_geom is not None:
                     if layout_changed(
@@ -596,15 +621,16 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
 def _refresh_standalone_geometry(hwnd, stop_evt, status_cb):
     """Re-read the game geometry after a pause (windowed Genshin may have
     been moved or resized meanwhile). Blocks — stop-aware — while the
-    game is minimized. Returns (hwnd, capture_region, column_centers,
-    hit_line_y), or None if stop fired or the game window is gone."""
+    game is minimized, following a window the game recreates meanwhile.
+    Returns (hwnd, capture_region, column_centers, hit_line_y), or None
+    if stop fired or no game window exists (MSG_WINDOW_CLOSED reported)."""
     # The user may have restarted the game during the pause — prefer a
     # fresh handle. FindWindowW doesn't message the target, so it's cheap.
-    hwnd = find_game_window() or hwnd
-    geom = get_game_geometry(hwnd, stop_evt=stop_evt, status_cb=status_cb)
-    if geom is None:
+    followed = follow_game_geometry(find_game_window() or hwnd,
+                                    stop_evt=stop_evt, status_cb=status_cb)
+    if followed is None:
         return None
-    capture_region, scale_x, scale_y = geom
+    hwnd, (capture_region, scale_x, scale_y) = followed
     column_centers, hit_line_y = scaled_layout(scale_x, scale_y)
     return hwnd, capture_region, column_centers, hit_line_y
 
@@ -713,8 +739,8 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
                 refreshed = _refresh_standalone_geometry(hwnd, stop_evt,
                                                          status_cb)
                 if refreshed is None:
-                    # Stop fired while waiting for a minimized game, or the
-                    # game window is gone (get_game_geometry reported it).
+                    # Stop fired while waiting for a minimized game, or no
+                    # game window exists (follow_game_geometry reported it).
                     break
                 new_hwnd, new_region, new_cols, new_hit = refreshed
                 if (new_region != old_region or new_cols != old_cols
@@ -731,6 +757,8 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
                 continue
 
             capture_region, column_centers, hit_line_y = tracker.current
+            # The tracker may have adopted a recreated game window.
+            hwnd = tracker.hwnd
             detector = NoteDetector(hwnd, column_centers, hit_line_y,
                                     controller)
             if status_cb:
@@ -764,9 +792,10 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
                 _error(MSG_WINDOW_CLOSED)
                 break
             if reason == VIZ_EXIT_GEOMETRY:
-                # Resized mid-play — tracker holds the new layout; loop
-                # back to build a detector for it (the gate at the top
-                # handles a Pause that landed during the teardown).
+                # Resized / window recreated mid-play — tracker holds the
+                # new layout and HWND; loop back to build a detector for
+                # it (the gate at the top handles a Pause that landed
+                # during the teardown).
                 continue
             if reason == VIZ_EXIT_PAUSE:
                 # pause_evt may already be clear again (quick Pause→Resume

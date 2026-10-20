@@ -32,8 +32,8 @@ from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
                     ALBUM_SONG_COUNT, INPUT_BACKEND_DEFAULT,
                     KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS)
 from game_window import (MSG_WINDOW_CLOSED, MSG_WINDOW_NOT_FOUND,
-                         find_game_window, get_game_geometry,
-                         read_game_geometry, window_gone)
+                         find_game_window, follow_game_geometry,
+                         read_game_geometry, resolve_game_window, same_hwnd)
 from screen_watcher import ScreenWatcher
 from song_player import ROI_GO_PERFORM, ROI_SELECT_SONG, SongPlayer
 from standalone_runner import MSG_ARDUINO_UNAVAILABLE, make_fallback_arduino
@@ -168,8 +168,11 @@ class AlbumRunner:
         # cleared). Lets a generic failure message avoid overwriting a
         # specific one already on screen (e.g. "window closed").
         self._last_error = ''
-        # Sticky: the game window no longer exists (see _window_gone).
+        # Sticky: no game window exists any more (see _window_gone).
         self._window_closed = False
+        # The thread that builds and runs us (BotController worker / CLI
+        # main). Geometry is only applied on it — see _adopt_hwnd.
+        self._owner_thread = threading.current_thread()
         # album_progress state (reset + first emitted at run() start).
         self._progress = {'index': 0, 'total': 0,
                           'difficulty': self.difficulties[0],
@@ -185,16 +188,17 @@ class AlbumRunner:
             print("ERROR: game window not found")
             self._emit({'last_error': MSG_WINDOW_NOT_FOUND})
             raise AlbumSetupError("game window not found")
-        geom = get_game_geometry(self.hwnd, stop_evt=self.stop_evt,
-                                 status_cb=self._emit)
-        if geom is None:
+        followed = follow_game_geometry(self.hwnd, stop_evt=self.stop_evt,
+                                        status_cb=self._emit)
+        if followed is None:
             if self.stop_evt.is_set():
                 # Stop fired while waiting for the game window to be visible.
                 # Re-raise as RuntimeError so the BotController worker exits.
                 raise AlbumSetupError("album-init aborted by stop_evt")
-            # Window closed while we waited — get_game_geometry reported it.
+            # Game closed while we waited — follow_game_geometry reported it.
             raise AlbumSetupError("game window closed")
-        self.region, self.scale_x, self.scale_y = geom
+        # (A window the game recreated during the wait is followed.)
+        self.hwnd, (self.region, self.scale_x, self.scale_y) = followed
         # Game enforces 16:9, so scale_x ~= scale_y. Use scale_x for
         # template resampling (single scalar AssetScale, mirroring BGI).
         self.scale = self.scale_x
@@ -236,7 +240,8 @@ class AlbumRunner:
             # client rect right before mouse-down, catching a move /
             # resize our ~0.5 s poll hasn't published yet.
             # `window_gone_fn` ends the watcher's waits as soon as the
-            # game is closed (reported once, by _window_gone).
+            # game is closed (reported once, by _window_gone), and lets
+            # its click check follow a window the game recreated.
             self.watcher = ScreenWatcher(
                 region=self.region, scale_x=self.scale_x, scale_y=self.scale_y,
                 controller=self.controller, stop_evt=self.stop_evt,
@@ -324,34 +329,67 @@ class AlbumRunner:
         if self._window_closed:
             return False
         if block:
-            geom = get_game_geometry(self.hwnd, stop_evt=self.stop_evt,
-                                     status_cb=self._emit)
-            if geom is None:
+            followed = follow_game_geometry(self.hwnd,
+                                            stop_evt=self.stop_evt,
+                                            status_cb=self._emit)
+            if followed is None:
                 if not self.stop_evt.is_set():
-                    # Gone — get_game_geometry reported MSG_WINDOW_CLOSED.
+                    # No game window — follow_game_geometry reported
+                    # MSG_WINDOW_CLOSED.
                     self._window_closed = True
                 return False
+            hwnd, geom = followed
+            if not same_hwnd(hwnd, self.hwnd):
+                self._adopt_hwnd(hwnd, geom)
         else:
             geom = read_game_geometry(self.hwnd)
             if geom is None:
+                # Minimized / off-screen: keep the last-known geometry.
+                # Closed: end the run. Recreated: _window_gone() adopted
+                # the new window (and applied its geometry).
                 return not self._window_gone()
         self._apply_geometry(*geom)
         return True
 
     def _window_gone(self):
-        """True once the game window no longer exists (Genshin closed;
-        `game_window.window_gone`, a non-blocking IsWindow). Reports
-        MSG_WINDOW_CLOSED the first time. Sticky: the run is bound to
-        this HWND and can't recover, so every later step fails fast. A
-        minimized / off-screen game is NOT gone."""
-        if not self._window_closed:
-            if not window_gone(self.hwnd):
-                return False
+        """True once no game window exists any more (Genshin closed).
+        Our HWND being dead isn't enough: the game may have RECREATED
+        its window (fullscreen toggle, display-mode change) — then the
+        new window is adopted and the run carries on (False). Reports
+        MSG_WINDOW_CLOSED the first time; sticky, so every later step
+        fails fast. Non-blocking (`game_window.resolve_game_window`:
+        IsWindow + FindWindowW). A minimized / off-screen game is NOT
+        gone."""
+        if self._window_closed:
+            return True
+        live = resolve_game_window(self.hwnd)
+        if live is None:
             self._window_closed = True
             print("ERROR: Genshin Impact window closed — ending the album "
                   "run")
             self._emit({'last_error': MSG_WINDOW_CLOSED})
-        return True
+            return True
+        if not same_hwnd(live, self.hwnd):
+            self._adopt_hwnd(live)
+        return False
+
+    def _adopt_hwnd(self, hwnd, geom=None):
+        """The game recreated its window: follow the new HWND. The
+        watcher's live checks read `self.hwnd`; SongPlayer rebuilds its
+        detector for the new handle. On the runner's own thread the new
+        window's geometry (`geom`, else a fresh read) is applied at once
+        — a size change rescales the templates like any resize; other
+        threads (the end watcher's click check) leave that to the next
+        poll, so templates are never rescaled under the album thread."""
+        print("[album] game window recreated — following the new window")
+        self.hwnd = hwnd
+        self.song_player.update_hwnd(hwnd)
+        if threading.current_thread() is not self._owner_thread:
+            return
+        if geom is None:
+            geom = read_game_geometry(hwnd)
+        if geom is not None:
+            self._apply_geometry(*geom)
 
     def _apply_geometry(self, region, scale_x, scale_y):
         if (region == self.region and scale_x == self.scale_x
@@ -435,7 +473,10 @@ class AlbumRunner:
             if self.watcher.click_ref(*ALBUM_NEXT_SONG_XY):
                 # Settle wait — Stop here must propagate, otherwise the
                 # final wheel reset would report the run as completed.
-                return not self.watcher.stop_wait(0.8)
+                # So must a game closed during the settle (Stop wins).
+                if self.watcher.stop_wait(0.8):
+                    return False
+                return not self._window_gone()
             if self.stop_evt.is_set() or self._window_gone():
                 return False
             if attempt == 0:

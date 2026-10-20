@@ -89,12 +89,14 @@ class ScreenWatcher:
                 mouse-down so a window change the caller's periodic poll
                 hasn't published yet still stops the click. None = no
                 live check (caller-published geometry only).
-            window_gone_fn: optional `callable() -> bool`, True once the
-                game window no longer exists (e.g. `game_window.
-                window_gone(hwnd)`; AlbumRunner passes a wrapper that
-                also reports it). `wait_for` gives up as soon as it says
-                so instead of polling a closed game until the timeout.
-                None = no check.
+            window_gone_fn: optional `callable() -> bool`, True once no
+                game window exists any more (AlbumRunner passes its
+                `_window_gone`, which also reports it and adopts a window
+                the game recreated — `live_geometry_fn` then reads the
+                new one). `wait_for` gives up as soon as it says so
+                instead of polling a closed game until the timeout; the
+                pre-click live check re-reads once when it says "not
+                gone". None = no check.
         """
         if stop_evt is None:
             raise ValueError("ScreenWatcher requires a stop_evt — "
@@ -262,11 +264,23 @@ class ScreenWatcher:
         any click would land on whatever is behind it."""
         if self._live_geometry_fn is None:
             return True
+        generation = self._geom[3]
         try:
             live = self._live_geometry_fn()
+            if (live is None and self._window_gone_fn is not None
+                    and not self._window_gone()):
+                # Not closed: minimized — or the game recreated its window
+                # and window_gone_fn just adopted the new one; read again.
+                live = self._live_geometry_fn()
         except Exception as e:
             print(f"    [watcher] live window check failed: {e}")
             return True
+        if self._geom[3] != generation:
+            # window_gone_fn adopted a recreated window and published its
+            # geometry: (sx, sy) was computed for the old one.
+            print("    click SKIPPED — the game recreated its window; "
+                  "target was for the old one")
+            return False
         if live is None:
             print("    click SKIPPED — game window isn't usable right now "
                   "(minimized / closed / off-screen)")

@@ -20,8 +20,8 @@ from detector import NoteDetector
 from game_window import MSG_WINDOW_CLOSED, find_game_window, auto_detect
 from standalone_runner import (GEOMETRY_POLL_S, VIZ_EXIT_GEOMETRY,
                                VIZ_EXIT_WINDOW_GONE, WINDOW_GONE,
-                               GeometryTracker, run_visualization,
-                               layout_changed)
+                               WINDOW_REPLACED, GeometryTracker,
+                               run_visualization, layout_changed)
 from system_setup import boost_timer, restore_timer, set_dpi_aware
 from ui_core import make_input_backend
 
@@ -86,8 +86,9 @@ def main():
 
     # Windowed Genshin can be moved / resized while we run. A move needs
     # nothing (the detector reads client-relative pixels; the viz retargets
-    # its capture itself); a resize changes the lane layout, so rebuild the
-    # detector for it.
+    # its capture itself); a resize changes the lane layout, and a window
+    # the game recreated (fullscreen toggle, ...) has a new HWND, so
+    # rebuild the detector for either (the tracker holds the new HWND).
     tracker = GeometryTracker(hwnd, capture_region, column_centers,
                               hit_line_y, tag='[cli]')
 
@@ -95,7 +96,7 @@ def main():
         nonlocal detector
         detector.stop()
         _, cols, hit = tracker.current
-        detector = NoteDetector(hwnd, cols, hit, controller)
+        detector = NoteDetector(tracker.hwnd, cols, hit, controller)
         detector.start()
 
     # Set when Genshin is closed mid-run: shut down cleanly, then exit 1.
@@ -107,7 +108,8 @@ def main():
             while True:
                 region, cols, hit = tracker.current
                 reason = run_visualization(region, cols, hit, detector,
-                                           pin_console=True, game_hwnd=hwnd,
+                                           pin_console=True,
+                                           game_hwnd=tracker.hwnd,
                                            geometry_poll=tracker.poll)
                 if reason == VIZ_EXIT_WINDOW_GONE:
                     game_closed = True
@@ -128,7 +130,8 @@ def main():
                 if new == WINDOW_GONE:
                     game_closed = True
                     break
-                if new is not None and layout_changed(old, new):
+                if new == WINDOW_REPLACED or (
+                        new is not None and layout_changed(old, new)):
                     _rebuild_detector()
                 time.sleep(GEOMETRY_POLL_S)
     except KeyboardInterrupt:

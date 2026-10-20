@@ -18,7 +18,7 @@ from config import (GAME_WINDOW_TITLE, REF_WIDTH, REF_HEIGHT,
 MSG_WINDOW_NOT_FOUND = ("Genshin Impact window not found — start the game, "
                         "then press Start.")
 # Also the reason a run ends when the game is closed mid-run (rhythm
-# phase, album navigation) — see `window_gone`.
+# phase, album navigation) — see `resolve_game_window`.
 MSG_WINDOW_CLOSED = ("Genshin Impact window closed — start the game, "
                      "then press Start.")
 MSG_WINDOW_MINIMIZED = ("Genshin Impact is minimized — restore the game "
@@ -133,8 +133,10 @@ def _geometry(left, top, width, height):
 
 
 def window_gone(hwnd):
-    """Non-blocking: True when the game window no longer exists (Genshin
-    was closed) — `IsWindow` is false, or there is no handle at all.
+    """Non-blocking: True when this window handle no longer exists —
+    `IsWindow` is false, or there is no handle at all. That alone does
+    NOT mean Genshin was closed (it may have recreated its window): to
+    decide whether a run should end, use `resolve_game_window`.
 
     A minimized, hidden, too-small or off-screen window is NOT gone:
     callers keep waiting for it. An error reading the state counts as
@@ -158,8 +160,9 @@ def read_game_geometry(hwnd):
     Returns (capture_region, scale_x, scale_y) when the window exists, is
     restored and is at least 800x600 on screen; None otherwise
     (minimized, too small, off-screen, or the window is gone). Callers
-    treat None as "keep the last-known geometry" and use `window_gone`
-    to tell a closed game (end the run) from a minimized one (wait).
+    treat None as "keep the last-known geometry" and use
+    `resolve_game_window` to tell a closed game (end the run) or a
+    recreated window (adopt it) from a minimized one (wait).
 
     Cheap — IsWindow / IsIconic / GetClientRect / ClientToScreen read
     kernel-side window state and never message the game — so it is
@@ -179,7 +182,60 @@ def read_game_geometry(hwnd):
     return _geometry(left, top, width, height)
 
 
-def get_game_geometry(hwnd, stop_evt=None, status_cb=None):
+def resolve_game_window(hwnd):
+    """The live game window for a run bound to `hwnd`: `hwnd` itself
+    while it exists (minimized / hidden included); otherwise a re-found
+    game window — Genshin can RECREATE its window (fullscreen toggle,
+    resolution or display-mode change) while the game keeps running, so
+    a dead `hwnd` alone doesn't mean the game was closed; None only when
+    no game window exists at all (closed). Callers adopt a returned
+    handle that differs from `hwnd` (rebuild the detector for it).
+
+    Non-blocking: IsWindow + FindWindowW, neither messages the game —
+    fine on the ~0.5 s poll paths, never on the detector's 5 ms loops."""
+    if not window_gone(hwnd):
+        return hwnd
+    new = find_game_window()
+    if new and not window_gone(new):
+        return new
+    return None
+
+
+# A window recreated again and again while we wait can't loop forever.
+_FOLLOW_ATTEMPTS = 5
+
+
+def follow_game_geometry(hwnd, stop_evt=None, status_cb=None):
+    """`get_game_geometry` that follows a recreated game window (see
+    `resolve_game_window`): blocking and stop-aware, waits for a restored
+    window like it. Returns (hwnd, (capture_region, scale_x, scale_y)) —
+    `hwnd` may be a new handle the caller must adopt — or None when
+    stopped (check `stop_evt.is_set()`) or when no game window exists
+    any more (MSG_WINDOW_CLOSED reported)."""
+    for _ in range(_FOLLOW_ATTEMPTS):
+        if stop_evt is not None and stop_evt.is_set():
+            return None
+        live = resolve_game_window(hwnd)
+        if live is None:
+            break
+        if not same_hwnd(live, hwnd):
+            print("Genshin Impact window was recreated — following the "
+                  "new window.")
+        hwnd = live
+        geom = get_game_geometry(hwnd, stop_evt=stop_evt,
+                                 status_cb=status_cb, report_closed=False)
+        if geom is not None:
+            return hwnd, geom
+        # Stopped, or the window vanished during the wait: loop re-finds.
+    if stop_evt is not None and stop_evt.is_set():
+        return None
+    print("ERROR: Genshin Impact window closed.")
+    _report(status_cb, MSG_WINDOW_CLOSED)
+    return None
+
+
+def get_game_geometry(hwnd, stop_evt=None, status_cb=None,
+                      report_closed=True):
     """Get the game client area position and size from its window handle.
 
     Waits for the game window to be restored and visible. If `stop_evt` is
@@ -196,6 +252,10 @@ def get_game_geometry(hwnd, stop_evt=None, status_cb=None):
     `last_error` while we are blocked waiting on the user (minimized /
     off-screen / closed), and `last_error: ''` once a reported wait
     clears so the UI doesn't keep showing a stale problem.
+
+    `report_closed=False` leaves "the window is gone" to the caller (no
+    log line, no MSG_WINDOW_CLOSED; a reported wait is cleared) — used by
+    `follow_game_geometry`, which first re-finds a recreated window.
 
     Returns:
         (capture_region, scale_x, scale_y) on success, or None if stopped
@@ -220,6 +280,10 @@ def get_game_geometry(hwnd, stop_evt=None, status_cb=None):
             return None
 
         if not user32.IsWindow(hwnd):
+            if not report_closed:
+                if reported:
+                    _report(status_cb, '')
+                return None
             print("ERROR: Genshin Impact window closed.")
             _report(status_cb, MSG_WINDOW_CLOSED)
             return None
@@ -274,10 +338,13 @@ def auto_detect(stop_evt=None, status_cb=None):
         _report(status_cb, MSG_WINDOW_NOT_FOUND)
         return None
 
-    geom = get_game_geometry(hwnd, stop_evt=stop_evt, status_cb=status_cb)
-    if geom is None:
+    # Follows a window recreated during the wait; callers re-fetch the
+    # HWND with find_game_window() afterwards, which then returns it.
+    followed = follow_game_geometry(hwnd, stop_evt=stop_evt,
+                                    status_cb=status_cb)
+    if followed is None:
         return None
-    capture_region, scale_x, scale_y = geom
+    capture_region, scale_x, scale_y = followed[1]
 
     # Scale reference 1080p positions to actual resolution.
     # Positions are relative to the client area (capture region), so no
