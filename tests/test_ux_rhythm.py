@@ -320,6 +320,71 @@ class ScreenWatcherClicks(unittest.TestCase):
             self.assertFalse(w.click_local(1390, 1010, generation=gen))
         self.assertEqual(ctrl.snapshot(), [])
 
+    def _live_watcher(self, ctrl, live):
+        return screen_watcher.ScreenWatcher(
+            REGION_1080, 1.0, 1.0, ctrl, self.stop, templates={},
+            live_geometry_fn=lambda: live[0])
+
+    def test_live_rect_change_mid_hover_blocks_mouse_down(self):
+        """RR7 — the window shrank right after the last geometry poll, so
+        nobody called update_geometry and the generation is unchanged.
+        The live client-rect read right before mouse-down must refuse the
+        click, publish the new geometry and bump the generation."""
+        ctrl = FakeInput()
+        live = [(dict(REGION_1080), 1.0, 1.0)]
+        w = self._live_watcher(ctrl, live)
+        small = {'top': 0, 'left': 0, 'width': 1280, 'height': 720}
+        gen = w.generation
+        real_wait = w.stop_wait
+
+        def hover(secs):                  # live rect changes mid-hover
+            live[0] = (small, 2 / 3, 2 / 3)
+            return real_wait(secs)
+
+        w.stop_wait = hover
+        with _quiet():
+            self.assertFalse(w.click_local(1390, 1010, generation=gen))
+        self.assertNotIn('mouse_down', [c[0] for c in ctrl.snapshot()])
+        self.assertEqual(w.region, small)
+        self.assertNotEqual(w.generation, gen)
+
+    def test_live_check_refuses_when_window_unusable(self):
+        """RR7 — minimized / closed between poll and click."""
+        ctrl = FakeInput()
+        w = self._live_watcher(ctrl, [None])
+        with _quiet():
+            self.assertFalse(w.click_ref(500, 500))
+        self.assertNotIn('mouse_down', [c[0] for c in ctrl.snapshot()])
+
+    def test_click_ref_recomputes_target_after_live_change(self):
+        """RR7 — a reference click is still valid on the new window, so
+        click_ref re-targets once instead of failing."""
+        ctrl = FakeInput()
+        live = [(dict(REGION_1080), 1.0, 1.0)]
+        w = self._live_watcher(ctrl, live)
+        real_move = ctrl.move_to
+
+        def move(x, y, **k):
+            live[0] = ({'top': 0, 'left': 0, 'width': 1280, 'height': 720},
+                       2 / 3, 2 / 3)
+            return real_move(x, y, **k)
+
+        ctrl.move_to = move
+        with _quiet():
+            self.assertTrue(w.click_ref(1500, 900))
+        moves = [c[1:] for c in ctrl.snapshot() if c[0] == 'move_to']
+        self.assertEqual(moves, [(1500, 900), (1000, 600)])
+        self.assertEqual([c[0] for c in ctrl.snapshot()].count('mouse_down'),
+                         1)
+
+    def test_unchanged_live_rect_clicks_normally(self):
+        ctrl = FakeInput()
+        w = self._live_watcher(ctrl, [(dict(REGION_1080), 1.0, 1.0)])
+        with _quiet():
+            self.assertTrue(w.click_local(100, 100,
+                                          generation=w.generation))
+        self.assertIn('mouse_down', [c[0] for c in ctrl.snapshot()])
+
     def test_geometry_change_during_cursor_travel_aborts_click(self):
         """RR1 — resized while move_to was in flight."""
         ctrl = FakeInput()
@@ -513,6 +578,45 @@ class StandaloneRunner(unittest.TestCase):
         self.assertEqual(second.column_centers[0], int(417 * 2 / 3))
         self.assertEqual(second.hit_line_y, int(REF_HIT_LINE_Y * 2 / 3))
         self.assertEqual(calls[1][0]['left'], 30)   # viz got the new region
+
+    def test_pause_during_resize_teardown_routes_through_pause(self):
+        """RR8 — Pause lands while the resized-away detector is being
+        torn down: the replacement must not start (or report 'running')
+        until resume."""
+        small = {'top': 0, 'left': 0, 'width': 1280, 'height': 720}
+        pause = self.pause
+        started_while_paused = []
+
+        class PauseOnTeardown(FakeDetector):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                started_while_paused.append(pause.is_set())
+
+            def stop(self):
+                super().stop()
+                if len(FakeDetector.instances) == 1:
+                    pause.set()
+                    threading.Timer(0.1, pause.clear).start()
+
+        calls = []
+
+        def viz(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                kwargs['geometry_poll']()
+                return standalone_runner.VIZ_EXIT_GEOMETRY
+            self.stop.set()
+            return standalone_runner.VIZ_EXIT_STOP
+
+        with mock.patch.object(standalone_runner, 'NoteDetector',
+                               PauseOnTeardown), \
+                mock.patch.object(standalone_runner, 'read_game_geometry',
+                                  return_value=(small, 2 / 3, 2 / 3)):
+            self._run(viz)
+        self.assertEqual(self.rec.values('state'),
+                         ['running', 'paused', 'running', 'idle'])
+        self.assertEqual(len(FakeDetector.instances), 2)
+        self.assertEqual(started_while_paused, [False, False])
 
     def test_resize_mid_play_rebuilds_detector(self):
         """RR4 — resized while playing (no pause): the viz's geometry

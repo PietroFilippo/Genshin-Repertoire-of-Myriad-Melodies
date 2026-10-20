@@ -218,10 +218,14 @@ class AlbumRunner:
             # waits. Templates dict passed by reference; we keep self.tpl
             # for _diagnose_album_page's raw matchTemplate call (which
             # needs the score even below threshold).
+            # `live_geometry_fn` lets every click re-read the game's
+            # client rect right before mouse-down, catching a move /
+            # resize our ~0.5 s poll hasn't published yet.
             self.watcher = ScreenWatcher(
                 region=self.region, scale_x=self.scale_x, scale_y=self.scale_y,
                 controller=self.controller, stop_evt=self.stop_evt,
-                templates=self.tpl, match_threshold=ALBUM_MATCH_THRESHOLD)
+                templates=self.tpl, match_threshold=ALBUM_MATCH_THRESHOLD,
+                live_geometry_fn=lambda: read_game_geometry(self.hwnd))
 
             # Per-song state machine: intro click chain → detector + viz +
             # end-watcher → pause-resume → cleanup. AlbumRunner stays as

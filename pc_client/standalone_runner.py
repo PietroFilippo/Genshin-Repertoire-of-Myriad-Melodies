@@ -654,8 +654,57 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
     tracker = GeometryTracker(hwnd, capture_region, column_centers,
                               hit_line_y)
 
+    # Set when a pause interrupted the previous detector, so the resume path
+    # (geometry re-read) runs even if pause_evt was already cleared again
+    # (quick Pause→Resume while detector.stop() was joining).
+    resume_pending = False
+
     try:
         while not _stopped():
+            # --- pause / resume gate ---
+            # Every loop-back passes here BEFORE a detector starts: after a
+            # pause exit, and after a resize rebuild whose teardown a Pause
+            # landed in (otherwise the replacement would start — and could
+            # type — with Pause set).
+            if resume_pending or (pause_evt is not None
+                                  and pause_evt.is_set()):
+                resume_pending = False
+                if pause_evt is not None and pause_evt.is_set():
+                    if status_cb:
+                        status_cb({'state': 'paused'})
+                    print("[standalone] paused — detector stopped, "
+                          "waiting for resume")
+                    while pause_evt.is_set():
+                        if stop_evt is not None:
+                            if stop_evt.wait(0.1):
+                                break
+                        else:
+                            time.sleep(0.1)
+                    if _stopped():
+                        break
+                print("[standalone] resumed")
+
+                # Windowed Genshin may have been moved / resized while paused.
+                old_region, old_cols, old_hit = tracker.current
+                refreshed = _refresh_standalone_geometry(hwnd, stop_evt,
+                                                         status_cb)
+                if refreshed is None:
+                    # Stop fired while waiting for a minimized game, or the
+                    # game window is gone (get_game_geometry reported it).
+                    break
+                new_hwnd, new_region, new_cols, new_hit = refreshed
+                if (new_region != old_region or new_cols != old_cols
+                        or new_hit != old_hit or new_hwnd != hwnd):
+                    print(f"[standalone] game window moved/resized — now "
+                          f"{new_region['width']}x{new_region['height']} @ "
+                          f"({new_region['left']},{new_region['top']})")
+                hwnd = new_hwnd
+                tracker.hwnd = hwnd
+                tracker.set(new_region, new_cols, new_hit)
+                # Paused again while we waited on the window? Back to
+                # the gate rather than starting a detector.
+                continue
+
             capture_region, column_centers, hit_line_y = tracker.current
             detector = NoteDetector(hwnd, column_centers, hit_line_y,
                                     controller)
@@ -683,48 +732,17 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
                 break
             if reason == VIZ_EXIT_GEOMETRY:
                 # Resized mid-play — tracker holds the new layout; loop
-                # back to build a detector for it.
+                # back to build a detector for it (the gate at the top
+                # handles a Pause that landed during the teardown).
                 continue
-            # If we exited because of stop (not pause), we're done.
-            if reason != VIZ_EXIT_PAUSE:
-                break
-
-            # --- paused: idle until resume or stop ---
-            # pause_evt may already be clear again (quick Pause→Resume
-            # while detector.stop() was joining) — then skip straight to
-            # the resume path instead of treating it as "run over".
-            if pause_evt.is_set():
-                if status_cb:
-                    status_cb({'state': 'paused'})
-                print("[standalone] paused — detector stopped, "
-                      "waiting for resume")
-                while pause_evt.is_set():
-                    if stop_evt is not None:
-                        if stop_evt.wait(0.1):
-                            break
-                    else:
-                        time.sleep(0.1)
-                if _stopped():
-                    break
-            print("[standalone] resumed")
-
-            # Windowed Genshin may have been moved / resized while paused.
-            refreshed = _refresh_standalone_geometry(hwnd, stop_evt,
-                                                     status_cb)
-            if refreshed is None:
-                # Stop fired while waiting for a minimized game, or the
-                # game window is gone (get_game_geometry reported it).
-                break
-            new_hwnd, new_region, new_cols, new_hit = refreshed
-            if (new_region != capture_region or new_cols != column_centers
-                    or new_hit != hit_line_y or new_hwnd != hwnd):
-                print(f"[standalone] game window moved/resized — now "
-                      f"{new_region['width']}x{new_region['height']} @ "
-                      f"({new_region['left']},{new_region['top']})")
-            hwnd = new_hwnd
-            tracker.hwnd = hwnd
-            tracker.set(new_region, new_cols, new_hit)
-            # Loop back to spin up a fresh detector.
+            if reason == VIZ_EXIT_PAUSE:
+                # pause_evt may already be clear again (quick Pause→Resume
+                # while detector.stop() was joining) — the gate still runs
+                # the resume path instead of treating it as "run over".
+                resume_pending = True
+                continue
+            # Exited because of 'q' / window close with no debug toggle.
+            break
     finally:
         if own_controller:
             controller.close()

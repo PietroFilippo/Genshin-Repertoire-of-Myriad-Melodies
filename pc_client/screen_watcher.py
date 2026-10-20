@@ -63,7 +63,8 @@ DEFAULT_MATCH_THRESHOLD = 0.85
 
 class ScreenWatcher:
     def __init__(self, region, scale_x, scale_y, controller, stop_evt,
-                 templates, match_threshold=DEFAULT_MATCH_THRESHOLD):
+                 templates, match_threshold=DEFAULT_MATCH_THRESHOLD,
+                 live_geometry_fn=None):
         """
         Args:
             region: dict with keys top/left/width/height — the mss
@@ -81,6 +82,13 @@ class ScreenWatcher:
             match_threshold: default minimum `cv2.matchTemplate`
                 score for `match()` to count as a hit. Per-call
                 override available via the method's `threshold` arg.
+            live_geometry_fn: optional `callable() -> (region, scale_x,
+                scale_y) | None` reading the game window's CURRENT client
+                rect (e.g. `game_window.read_game_geometry(hwnd)` — a few
+                non-messaging Win32 reads). Checked right before every
+                mouse-down so a window change the caller's periodic poll
+                hasn't published yet still stops the click. None = no
+                live check (caller-published geometry only).
         """
         if stop_evt is None:
             raise ValueError("ScreenWatcher requires a stop_evt — "
@@ -88,6 +96,11 @@ class ScreenWatcher:
                              "external one to thread through")
         # (region, scale_x, scale_y, generation) — see module docstring.
         self._geom = (dict(region), scale_x, scale_y, 0)
+        # Serializes generation bumps: update_geometry can be called from
+        # the album thread (periodic poll) and from a clicking thread
+        # (live check) at the same time.
+        self._geom_lock = threading.Lock()
+        self._live_geometry_fn = live_geometry_fn
         self.controller = controller
         self.stop_evt = stop_evt
         self.templates = templates
@@ -123,7 +136,8 @@ class ScreenWatcher:
         either the old geometry or the new one, never a mix. Templates
         are caller-owned: on a resolution change the caller rescales its
         `templates` dict in place."""
-        self._geom = (dict(region), scale_x, scale_y, self._geom[3] + 1)
+        with self._geom_lock:
+            self._geom = (dict(region), scale_x, scale_y, self._geom[3] + 1)
 
     # --- capture + coord helpers -------------------------------------------
 
@@ -193,12 +207,13 @@ class ScreenWatcher:
 
         Returns True if the click was issued, False if it wasn't — stop
         fired, `move_to` didn't converge (clicking wherever the cursor
-        happened to stop could hit the wrong UI element), or
-        `generation` was given and the geometry changed before the
-        button went down (target computed for the old window). Callers
-        treat False like a missed click; check `stop_evt.is_set()` /
-        `generation` to tell the cases apart (same escape hatch as
-        `move_to`)."""
+        happened to stop could hit the wrong UI element), `generation`
+        was given and the geometry changed before the button went down
+        (target computed for the old window), or the live window check
+        failed (see `_live_target_ok`; that one also publishes the new
+        geometry, bumping `generation`). Callers treat False like a
+        missed click; check `stop_evt.is_set()` / `generation` to tell
+        the cases apart (same escape hatch as `move_to`)."""
         if self._stale(generation):
             return False
         converged = self.controller.move_to(int(sx), int(sy),
@@ -218,8 +233,12 @@ class ScreenWatcher:
         if self.stop_wait(CLICK_HOVER_S):
             return False
         # Last chance to notice the window moved / resized while the
-        # cursor travelled (Arduino move_to can take ~600 ms).
+        # cursor travelled (Arduino move_to can take ~600 ms): first the
+        # caller-published geometry, then the LIVE client rect — the
+        # periodic poll may not have seen a change that just happened.
         if self._stale(generation):
+            return False
+        if not self._live_target_ok(sx, sy):
             return False
         self.controller.mouse_down('left')
         self.stop_wait(CLICK_HOLD_S)
@@ -227,10 +246,53 @@ class ScreenWatcher:
         self.stop_wait(CLICK_SETTLE_S)
         return True
 
+    def _live_target_ok(self, sx, sy):
+        """Read the game's current client rect (cheap, non-messaging) and
+        confirm it still matches our geometry and contains (sx, sy).
+        On a mismatch publish the live geometry (bumps `generation`, so
+        callers re-compute / re-capture) and refuse the click. If the
+        window isn't usable right now (minimized / gone), refuse too —
+        any click would land on whatever is behind it."""
+        if self._live_geometry_fn is None:
+            return True
+        try:
+            live = self._live_geometry_fn()
+        except Exception as e:
+            print(f"    [watcher] live window check failed: {e}")
+            return True
+        if live is None:
+            print("    click SKIPPED — game window isn't usable right now "
+                  "(minimized / closed / off-screen)")
+            return False
+        region, sx_scale, sy_scale = live
+        cur_region, cur_sx, cur_sy, _ = self._geom
+        inside = (region['left'] <= sx < region['left'] + region['width']
+                  and region['top'] <= sy < region['top'] + region['height'])
+        if (region == cur_region and sx_scale == cur_sx
+                and sy_scale == cur_sy and inside):
+            return True
+        if region != cur_region or sx_scale != cur_sx or sy_scale != cur_sy:
+            self.update_geometry(region, sx_scale, sy_scale)
+        print(f"    click SKIPPED — game window is now "
+              f"{region['width']}x{region['height']} @ "
+              f"({region['left']},{region['top']}); target "
+              f"({int(sx)},{int(sy)}) was for the old window")
+        return False
+
     def click_ref(self, ref_x, ref_y):
         """Click at a 1080p reference position. Returns `click_screen`'s
-        result."""
-        return self.click_screen(*self.ref_to_screen(ref_x, ref_y))
+        result. If the window moved / resized under the click (the
+        generation changed), the target is re-computed from the new
+        geometry and the click retried once — unlike `click_local`, a
+        reference coordinate stays valid across a geometry change."""
+        for _ in range(2):
+            gen = self.generation
+            if self.click_screen(*self.ref_to_screen(ref_x, ref_y),
+                                 generation=gen):
+                return True
+            if self.stop_evt.is_set() or self.generation == gen:
+                return False
+        return False
 
     def click_local(self, lx, ly, generation=None):
         """Click at a capture-region-local position (e.g. the (cx, cy)
