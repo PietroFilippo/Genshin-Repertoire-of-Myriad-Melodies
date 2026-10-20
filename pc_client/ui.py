@@ -182,6 +182,10 @@ POLL_MS = 50          # status drain cadence — matches Tk version
 # Unchanged status is re-pushed at most this often (keep-alive) — every
 # other tick pushes only when the status changed or there is log text.
 STATUS_KEEPALIVE_S = 1.0
+# detach() waits at most this long for a pending engine-ownership
+# transition before the final shutdown (longest legitimate hold: a forced
+# backend switch = bot join 5 s + macro join 2 s).
+TEARDOWN_ENGINE_LOCK_TIMEOUT_S = 8.0
 LOG_QUEUE_SIZE = 10000
 
 # Stable identity for Windows so the taskbar doesn't group us under
@@ -539,6 +543,16 @@ class BridgeApi:
         # dialog → close(confirmed=True), or the native prompt) so the
         # close isn't asked about twice. See allow_close.
         self._close_confirmed = False
+        # Set first thing in detach(): every start path, the backend
+        # switch and _get_arduino refuse from then on.
+        self._tearing_down = False
+        # Count of BridgeApi.restart_in_mode calls in progress (waiting for
+        # _engine_lock or joining the old run; changed under self._lock):
+        # while > 0, start_stop treats a press as Stop and issues it
+        # WITHOUT waiting for _engine_lock.
+        self._restart_pending = 0
+        # True while _push is inside evaluate_js (see detach).
+        self._push_in_flight = False
 
         self._status_lock = threading.Lock()
         self._status = {
@@ -636,19 +650,40 @@ class BridgeApi:
         self._drain_thread.start()
 
     def detach(self):
-        """Tear down on window close. Restore stdio first so any teardown
-        prints land on the original streams. Idempotent — `closing` and
-        `closed` events both call this and only the first call does
-        work."""
+        """Tear down on window close. Drop the LL hooks first (see below),
+        then restore stdio so any teardown prints land on the original
+        streams. Idempotent — `closing` and `closed` events both call this
+        and only the first call does work."""
         if self._detached:
             return
         self._detached = True
+        # Refuse every new ownership transition from here on: bot Start /
+        # mode switch / backend switch refuse, and _get_arduino won't
+        # build a backend (so a macro Play can't get one either). A Start
+        # already queued on _engine_lock must not resume after the final
+        # backend close below and restart input while the window closes.
+        self._tearing_down = True
+
+        # FIRST: drop the actual Win32 LL hooks via the captured handles.
+        # This is the move that kills the mouse-lag-on-close — once the
+        # WH_MOUSE_LL hook is gone, system mouse events stop routing
+        # through our process, so it doesn't matter how slow the rest
+        # of teardown (WebView2, pythonnet, etc) is.
+        _release_ll_hooks()
+
+        # Stop pushing NOW (flags only — instant). _push re-checks
+        # _stopping right before evaluate_js, and evaluate_js needs THIS
+        # UI thread (pywebview runs `closing` on it), so the drain must
+        # not start another call it can't finish until we return.
+        self._stopping = True
+        self._drain_stop.set()
+
         # Hide the window before any blocking teardown. `closing` runs
         # synchronously on the WinForms UI thread, and the bot / macro
         # joins below can take seconds mid-album — hidden, that wait is
         # invisible instead of a frozen window. Pure visibility change:
-        # the hook / drain / WebView2 ordering below is untouched
-        # (WebView2 is only disposed after this handler returns).
+        # the hook / drain / WebView2 ordering is untouched (WebView2 is
+        # only disposed after this handler returns).
         self._hide_window_for_teardown()
         # Ask the bot to wind down now (non-blocking) so its exit overlaps
         # the drain join + hook release; _bot.shutdown() below still joins.
@@ -658,8 +693,6 @@ class BridgeApi:
             pass
         sys.stdout = self._orig_stdout
         sys.stderr = self._orig_stderr
-        self._stopping = True
-        self._drain_stop.set()
 
         # Wait for the drain thread to actually exit before pywebview
         # gets to dispose WebView2. Otherwise the drain's next 50 ms tick
@@ -668,18 +701,18 @@ class BridgeApi:
         # (the throw itself is swallowed by _push's bare except, but the
         # log line is emitted from inside pywebview before that). One
         # tick is 50 ms; 500 ms is generous.
+        # Exception: a push already IN FLIGHT is parked waiting for this
+        # very UI thread and cannot finish until we return — joining would
+        # only burn the full 500 ms, so skip the wait in that case (the
+        # flags above guarantee it is the drain's last call).
         if self._drain_thread is not None:
-            try:
-                self._drain_thread.join(timeout=0.5)
-            except Exception:
-                pass
-
-        # FIRST: drop the actual Win32 LL hooks via the captured handles.
-        # This is the move that kills the mouse-lag-on-close — once the
-        # WH_MOUSE_LL hook is gone, system mouse events stop routing
-        # through our process, so it doesn't matter how slow the rest
-        # of teardown (WebView2, pythonnet, etc) is.
-        _release_ll_hooks()
+            if self._push_in_flight:
+                print('[ui] drain push in flight during close — not waiting')
+            else:
+                try:
+                    self._drain_thread.join(timeout=0.5)
+                except Exception:
+                    pass
 
         # Then drop subscribers from the keyboard/mouse packages so any
         # in-flight callbacks don't see torn-down state.
@@ -696,24 +729,41 @@ class BridgeApi:
             self._keybinds.clear_all()
         except Exception:
             pass
+        # Serialize the final shutdown against a pending ownership
+        # transition (a Start / Play / backend switch that already holds
+        # _engine_lock finishes first; anything queued behind us sees
+        # _tearing_down and refuses). Bounded: the longest legitimate hold
+        # is a forced backend switch (bot join 5 s + macro join 2 s).
+        got_engine = False
         try:
-            self._macro.shutdown()
-        except Exception as e:
-            print(f"[ui] macro shutdown error: {e}")
+            got_engine = self._engine_lock.acquire(
+                timeout=TEARDOWN_ENGINE_LOCK_TIMEOUT_S)
+        except Exception:
+            got_engine = False
+        if not got_engine:
+            print('[ui] engine lock busy at close — tearing down anyway')
         try:
-            self._bot.shutdown()
-        except Exception as e:
-            print(f"[ui] bot shutdown error: {e}")
-        # Close the shared Arduino last — both bot + macro have stopped
-        # by now so no more writes are coming.
-        with self._arduino_lock:
-            ard = self._arduino
-            self._arduino = None
-        if ard is not None:
             try:
-                ard.close()
+                self._macro.shutdown()
             except Exception as e:
-                print(f"[ui] arduino close error: {e}")
+                print(f"[ui] macro shutdown error: {e}")
+            try:
+                self._bot.shutdown()
+            except Exception as e:
+                print(f"[ui] bot shutdown error: {e}")
+            # Close the shared Arduino last — both bot + macro have stopped
+            # by now so no more writes are coming.
+            with self._arduino_lock:
+                ard = self._arduino
+                self._arduino = None
+            if ard is not None:
+                try:
+                    ard.close()
+                except Exception as e:
+                    print(f"[ui] arduino close error: {e}")
+        finally:
+            if got_engine:
+                self._engine_lock.release()
 
     # ---- JS-callable methods ----
 
@@ -751,12 +801,27 @@ class BridgeApi:
         return {'ok': True}
 
     def start_stop(self):
+        """Start/Stop toggle (UI button + Start/Stop hotkey).
+
+        The STOP side never waits for _engine_lock: a mode switch holds
+        that lock while it joins the old run (up to 5 s), and a Stop
+        queued behind it would only land after the new mode had already
+        started — the user's Stop must win. BotController.stop() is
+        lock-free here and bumps the command generation restart_in_mode
+        re-checks before starting the new mode. A press while a mode
+        switch is pending therefore counts as Stop, too."""
+        if self._bot.is_running() or self._restart_pending > 0:
+            self._bot.stop()
+            return True
+        if self._tearing_down:
+            return False
         # Ownership check + start under _engine_lock so a macro Play /
         # backend switch on another thread can't observe "bot idle" and
-        # start alongside us. Stop is non-blocking, so the hold is short.
+        # start alongside us.
         with self._engine_lock:
             if self._bot.is_running():
-                self._bot.stop()
+                # Another path started the bot while we waited for the
+                # lock; this press meant Start, so leave that run alone.
                 return True
             if self._macro.is_busy():
                 # Hotkey path arrives here — JS path uses start_stop_force
@@ -769,7 +834,11 @@ class BridgeApi:
 
     def _start_bot_locked(self):
         """Start the bot with the current Main-tab options. Caller holds
-        _engine_lock and has checked that the macro is idle."""
+        _engine_lock and has checked that the macro is idle. Refuses once
+        teardown began (a Start queued on _engine_lock behind detach)."""
+        if self._tearing_down:
+            print('[ui] app is closing — bot not started')
+            return False
         with self._lock:
             opts = dict(self._opts)
         mode = opts.pop('mode', 'standalone')
@@ -841,17 +910,30 @@ class BridgeApi:
                 and old_state == BotController.STATE_RUNNING):
             opts['mid_song_start'] = True
 
+        if not self._bot.is_running():
+            return True
+        if self._tearing_down:
+            return False
         # The whole stop → join → start runs under _engine_lock so a
         # macro Play / backend switch can't slip in between the old run's
         # exit and the new run's start. Bounded by BotController's 5 s
         # join. BotController itself refuses the start if a Stop landed
         # meanwhile (command generation) — the user's Stop always wins.
-        with self._engine_lock:
-            if not self._bot.is_running():
-                return True
-            if self._macro.is_busy():
-                return False
-            ok = self._bot.restart_in_mode(mode, opts)
+        # While this is pending (incl. waiting for the lock), start_stop
+        # treats a press as Stop and issues it without the lock, so that
+        # Stop really does land before the new run would start.
+        with self._lock:
+            self._restart_pending += 1
+        try:
+            with self._engine_lock:
+                if not self._bot.is_running() or self._tearing_down:
+                    return not self._tearing_down
+                if self._macro.is_busy():
+                    return False
+                ok = self._bot.restart_in_mode(mode, opts)
+        finally:
+            with self._lock:
+                self._restart_pending -= 1
         if not ok:
             print(f'[ui] switch to {mode} mode did not start a new run '
                   '(Stop requested, or the old run did not exit in time)')
@@ -929,6 +1011,9 @@ class BridgeApi:
                     self._settings['keybinds'][action] = previous
             self._install_keybinds()
             return {'ok': False, 'reason': 'install_failed'}
+        # The key the user just pressed to capture this binding may still
+        # be in the listener backlog: never let THAT press fire it.
+        self._keybinds.latch_until_release(action)
         with self._lock:
             save_settings(self._settings)
             keybinds = dict(self._settings['keybinds'])
@@ -988,8 +1073,12 @@ class BridgeApi:
             if refusal is not None:
                 return refusal
             excluded_kb, excluded_mouse = self._macro_excluded_bindings()
+            # No held-key filtering (the click wasn't the hotkey), but the
+            # record hotkey is still tracked so stopping with it in game
+            # removes exactly that press.
             res = self._macro.toggle_record(excluded_kb=excluded_kb,
-                                            excluded_mouse=excluded_mouse)
+                                            excluded_mouse=excluded_mouse,
+                                            track_chord=self._record_binding())
         return dict(res)
 
     def macro_play(self, force=False):
@@ -1001,14 +1090,13 @@ class BridgeApi:
             # answered without yanking focus to Genshin first.
             if (self._macro.state() != MacroController.STATE_RECORDING
                     and self._macro.event_count() > 0):
-                # UI-button entry — user is in the UI, not the game. Pull
-                # Genshin to the foreground so keystrokes from playback
-                # land in the game, not the UI / desktop — and refuse if
-                # that can't be verified.
-                refusal = self._focus_game_for_macro()
+                refusal = self._prepare_and_focus_for_macro()
                 if refusal is not None:
                     return refusal
-            return self._explain_backend_failure(self._macro.play())
+            # require_foreground: re-verified as the very last step before
+            # the worker starts, after every wait above.
+            return self._explain_backend_failure(
+                self._macro.play(require_foreground=True))
 
     def macro_stop(self):
         return dict(self._macro.stop_play())
@@ -1046,7 +1134,11 @@ class BridgeApi:
         # Check → (forced stop) → swap all under _engine_lock so no bot /
         # macro start can interleave. The joins inside are the existing
         # bounded ones (bot 5 s, macro 2 s).
+        if self._tearing_down:
+            return {'ok': False, 'reason': 'closing'}
         with self._engine_lock:
+            if self._tearing_down:
+                return {'ok': False, 'reason': 'closing'}
             with self._lock:
                 current = self._settings.get('input_backend', 'arduino')
             if name == current:
@@ -1183,6 +1275,8 @@ class BridgeApi:
                     self._settings['macro_active_macros'] = active
             self._install_keybinds()
             return {'ok': False, 'reason': 'install_failed'}
+        # As in rebind: the captured press must not fire the new binding.
+        self._keybinds.latch_until_release(action)
         with self._lock:
             save_settings(self._settings)
         self._push_active_status()
@@ -1223,17 +1317,33 @@ class BridgeApi:
                 slot = self._active_macros_locked()[idx].get('slot') or 0
             if (slot and self._macro.state() != MacroController.STATE_RECORDING
                     and (macros_dir() / f'macro_{slot}.json').exists()):
-                refusal = self._focus_game_for_macro()
+                refusal = self._prepare_and_focus_for_macro()
                 if refusal is not None:
                     return refusal
-            return self._play_active_macro(pos)
+            return self._play_active_macro(pos, require_foreground=True)
+
+    def _prepare_and_focus_for_macro(self):
+        """UI-button playback prelude. Build the input backend FIRST (a
+        first Arduino connect takes ~2 s), THEN switch to Genshin and
+        verify it — so the user can't alt-tab away between the focus check
+        and playback. MacroController re-checks the foreground once more
+        right before the worker starts (require_foreground). None on
+        success, else a refusal dict (also published as macro_error)."""
+        prep = self._macro.prepare_backend()
+        if not prep:
+            return self._explain_backend_failure(prep)
+        return self._focus_game_for_macro()
 
     def _macro_claim_engine_locked(self, force):
         """Caller holds _engine_lock. None when the bot is idle (or was
         force-stopped AND its worker really exited); otherwise a refusal
         dict for JS: 'bot_running' (JS confirms, re-calls with force) or
         'bot_stop_timeout' (the forced stop didn't finish — never start a
-        macro on a backend the bot may still be writing to)."""
+        macro on a backend the bot may still be writing to), or 'closing'
+        (detach() began — a start queued behind teardown must not install
+        recording hooks or spawn a playback worker)."""
+        if self._macro_closing():
+            return {'ok': False, 'reason': 'closing'}
         if not self._bot.is_running():
             return None
         if not force:
@@ -1243,6 +1353,15 @@ class BridgeApi:
         msg = "The bot didn't stop in time - macro not started. Try again."
         self._macro.set_error(msg)
         return {'ok': False, 'reason': 'bot_stop_timeout', 'message': msg}
+
+    def _macro_closing(self):
+        """True once detach() started tearing the app down. Macro starts
+        (buttons and hotkeys) refuse from then on; MacroController's own
+        shutdown latch covers anything already past this check."""
+        if getattr(self, '_tearing_down', False):
+            print('[macro] start refused - the app is closing')
+            return True
+        return False
 
     def _focus_game_for_macro(self):
         """Bring Genshin to the front before UI-button playback and
@@ -1277,8 +1396,13 @@ class BridgeApi:
         JS after the user confirms the cross-mode prompt. Returns
         {'ok': bool}; {'ok': False, 'reason': 'busy'} when the macro did
         not actually stop within its bounded wait — the bot is never
-        started alongside a still-running macro."""
+        started alongside a still-running macro. {'ok': False, 'reason':
+        'closing'} once the window is closing."""
+        if self._tearing_down:
+            return {'ok': False, 'reason': 'closing'}
         with self._engine_lock:
+            if self._tearing_down:
+                return {'ok': False, 'reason': 'closing'}
             if self._bot.is_running():
                 # Raced with another Start — never turn a force-START
                 # into a Stop.
@@ -1575,7 +1699,7 @@ class BridgeApi:
             self._push_active_status()
         return letters
 
-    def _play_active_macro(self, pos):
+    def _play_active_macro(self, pos, require_foreground=False):
         idx = self._active_macro_index(pos)
         if idx is None:
             return {'ok': False, 'reason': 'bad_index'}
@@ -1588,7 +1712,26 @@ class BridgeApi:
         if not slot:
             return {'ok': False, 'reason': 'inactive'}
         return self._explain_backend_failure(
-            self._macro.play_slot(slot, conflict_policy=policy))
+            self._macro.play_slot(slot, conflict_policy=policy,
+                                  require_foreground=require_foreground))
+
+    def _record_binding(self):
+        with self._lock:
+            return self._settings.get('keybinds', {}).get(ACTION_MACRO_RECORD)
+
+    @staticmethod
+    def _binding_label(binding):
+        """Human label for a stored binding, for in-game log / hint text
+        ('ctrl+y' -> 'Ctrl+Y', 'mouse:x' -> 'Mouse 4')."""
+        b = str(binding or '').strip().lower()
+        if not b:
+            return 'the hotkey'
+        if b.startswith('mouse:'):
+            return {'left': 'Left Click', 'right': 'Right Click',
+                    'middle': 'Middle Click', 'x': 'Mouse 4',
+                    'x2': 'Mouse 5'}.get(b[6:], b)
+        return '+'.join(p.upper() if len(p) == 1 else p.capitalize()
+                        for p in b.split('+'))
 
     def _explain_backend_failure(self, res):
         """MacroController only knows "no backend"; _get_arduino left the
@@ -1651,27 +1794,31 @@ class BridgeApi:
         return self._ui_hwnd()
 
     def _install_keybinds(self):
-        self._keybinds.clear_all()
+        # Transactional (KeybindManager.apply): unchanged bindings stay
+        # installed, changed ones are installed before the old hook is
+        # removed, and only actions that are no longer wanted get cleared.
+        # The old clear_all()-then-set() lost Play/Stop entirely when the
+        # mouse hook failed to install, even on the rollback reinstall.
         kb = self._settings['keybinds']
-        # Bot hotkeys — fire when Genshin or UI is focused.
-        self._keybinds.set(ACTION_START_STOP, kb.get(ACTION_START_STOP),
-                           self._hotkey_start_stop, scope='app')
-        self._keybinds.set(ACTION_PAUSE, kb.get(ACTION_PAUSE),
-                           self._hotkey_pause, scope='app')
-        self._keybinds.set(ACTION_DEBUG, kb.get(ACTION_DEBUG),
-                           self._hotkey_debug, scope='app')
-        # Macro hotkeys — strict Genshin-only gate (per spec). Won't
-        # fire from the UI window itself; user clicks the buttons there.
-        self._keybinds.set(ACTION_MACRO_RECORD, kb.get(ACTION_MACRO_RECORD),
-                           self._hotkey_macro_record, scope='game')
-        self._keybinds.set(ACTION_MACRO_PLAY, kb.get(ACTION_MACRO_PLAY),
-                           self._hotkey_macro_play, scope='game')
-        self._keybinds.set(ACTION_MACRO_STOP, kb.get(ACTION_MACRO_STOP),
-                           self._hotkey_macro_stop, scope='game')
-        self._keybinds.set(ACTION_MACRO_SAVE, kb.get(ACTION_MACRO_SAVE),
-                           self._hotkey_macro_save, scope='game')
-        self._keybinds.set(ACTION_MACRO_LOAD, kb.get(ACTION_MACRO_LOAD),
-                           self._hotkey_macro_load, scope='game')
+        desired = {
+            # Bot hotkeys — fire when Genshin or UI is focused.
+            ACTION_START_STOP: (kb.get(ACTION_START_STOP),
+                                self._hotkey_start_stop, 'app'),
+            ACTION_PAUSE: (kb.get(ACTION_PAUSE), self._hotkey_pause, 'app'),
+            ACTION_DEBUG: (kb.get(ACTION_DEBUG), self._hotkey_debug, 'app'),
+            # Macro hotkeys — strict Genshin-only gate (per spec). Won't
+            # fire from the UI window itself; user clicks the buttons there.
+            ACTION_MACRO_RECORD: (kb.get(ACTION_MACRO_RECORD),
+                                  self._hotkey_macro_record, 'game'),
+            ACTION_MACRO_PLAY: (kb.get(ACTION_MACRO_PLAY),
+                                self._hotkey_macro_play, 'game'),
+            ACTION_MACRO_STOP: (kb.get(ACTION_MACRO_STOP),
+                                self._hotkey_macro_stop, 'game'),
+            ACTION_MACRO_SAVE: (kb.get(ACTION_MACRO_SAVE),
+                                self._hotkey_macro_save, 'game'),
+            ACTION_MACRO_LOAD: (kb.get(ACTION_MACRO_LOAD),
+                                self._hotkey_macro_load, 'game'),
+        }
         for pos, item in enumerate(
                 self._settings.get('macro_active_macros', []), start=1):
             if pos > ACTIVE_MACRO_COUNT:
@@ -1679,10 +1826,11 @@ class BridgeApi:
             slot = item.get('slot') if isinstance(item, dict) else 0
             hotkey = item.get('hotkey') if isinstance(item, dict) else ''
             if slot and hotkey:
-                self._keybinds.set(
-                    f'macro_active_{pos}', hotkey,
+                desired[f'macro_active_{pos}'] = (
+                    hotkey,
                     lambda pos=pos: self._hotkey_macro_active(pos),
-                    scope='game')
+                    'game')
+        self._keybinds.apply(desired)
         # Print what is actually bound. "which button does what" has been
         # guessed at twice; the log should just say.
         try:
@@ -1716,14 +1864,26 @@ class BridgeApi:
     # check + start so a bot Start can't slip in between. The record
     # hotkey's own binding is passed through as `chord` so a modifier
     # chord (ctrl+y) never leaks into the recording at either end.
+    #
+    # Record / Load over an unsaved buffer need a second press within
+    # MacroController.DISCARD_CONFIRM_S (confirm_discard_hotkey) — the
+    # first press only arms and says so. Play hotkeys pass
+    # require_foreground so the game is re-verified as the last step
+    # before playback, after any wait for _engine_lock or the backend.
     def _hotkey_macro_record(self):
         self._log_hotkey('macro_record')
-        with self._lock:
-            chord = self._settings['keybinds'].get(ACTION_MACRO_RECORD)
+        chord = self._record_binding()
         if self._macro.state() == MacroController.STATE_RECORDING:
             self._macro.stop_record(chord=chord)
             return
+        if self._macro_closing():
+            return
+        if not self._macro.confirm_discard_hotkey(
+                'record', self._binding_label(chord)):
+            return
         with self._engine_lock:
+            if self._macro_closing():
+                return
             if self._bot.is_running():
                 print('[macro] bot is running — stop bot first '
                       '(or use the UI button to confirm)')
@@ -1736,20 +1896,25 @@ class BridgeApi:
     def _hotkey_macro_play(self):
         self._log_hotkey('macro_play')
         with self._engine_lock:
+            if self._macro_closing():
+                return
             if self._bot.is_running():
                 print('[macro] bot is running — stop bot first '
                       '(or use the UI button to confirm)')
                 return
-            self._explain_backend_failure(self._macro.play())
+            self._explain_backend_failure(
+                self._macro.play(require_foreground=True))
 
     def _hotkey_macro_active(self, pos):
         self._log_hotkey(f'macro_active_{pos}')
         with self._engine_lock:
+            if self._macro_closing():
+                return
             if self._bot.is_running():
                 print('[macro] bot is running — stop bot first '
                       '(or use the UI button to confirm)')
                 return
-            self._play_active_macro(pos)
+            self._play_active_macro(pos, require_foreground=True)
 
     def _hotkey_macro_stop(self):
         self._log_hotkey('macro_stop')
@@ -1757,10 +1922,19 @@ class BridgeApi:
 
     def _hotkey_macro_save(self):
         self._log_hotkey('macro_save')
+        if self._macro_closing():
+            return
         self._macro.begin_save_pending()
 
     def _hotkey_macro_load(self):
         self._log_hotkey('macro_load')
+        if self._macro_closing():
+            return
+        with self._lock:
+            key = self._settings.get('keybinds', {}).get(ACTION_MACRO_LOAD)
+        if not self._macro.confirm_discard_hotkey(
+                'load', self._binding_label(key)):
+            return
         self._macro.begin_load_pending()
 
     def _macro_excluded_bindings(self):
@@ -1802,8 +1976,18 @@ class BridgeApi:
         it under the same lock, so a build here can't produce a stale
         backend type mid-switch. Must never take _engine_lock: the bot
         worker calls this while other threads may hold _engine_lock and
-        join that worker."""
+        join that worker.
+
+        Once teardown began (detach) it refuses outright — no new or
+        cached backend is handed out, so nothing (bot or macro) can
+        restart input after the final backend close."""
+        if self._tearing_down:
+            self._backend_error = 'the app is closing'
+            return None
         with self._arduino_lock:
+            if self._tearing_down:
+                self._backend_error = 'the app is closing'
+                return None
             ctrl = self._arduino
             if ctrl is not None:
                 try:
@@ -2016,12 +2200,21 @@ class BridgeApi:
             + ('try{if(window.appendLog)appendLog(' + log_json + ');}'
                'catch(e){console.error(e);}' if log_text else '')
         )
+        # Mark in-flight BEFORE the last _stopping check; detach sets
+        # _stopping BEFORE reading _push_in_flight. So either this call
+        # sees the close and skips, or detach sees the call in flight and
+        # doesn't wait on a drain parked on the (busy) UI thread.
+        self._push_in_flight = True
         try:
+            if self._stopping:
+                return False
             self._window.evaluate_js(script)
         except Exception:
             # Window gone or page not ready yet — silent skip so the next
             # tick still runs.
             return False
+        finally:
+            self._push_in_flight = False
         return True
 
 

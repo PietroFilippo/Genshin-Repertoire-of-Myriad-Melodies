@@ -353,7 +353,9 @@ class RecordingFilterTests(_TempSlots):
         self.macro.start_record((), ())
         self.macro._on_kb_event(_kb('a', 'down', 30))
         self.macro._on_kb_event(_kb('a', 'up', 30))
-        self.assertTrue(_wait_for(lambda: {'macro_events': 2} in self.status))
+        self.assertTrue(_wait_for(lambda: any(
+            set(s) == {'macro_events', 'macro_status_gen'}
+            and s['macro_events'] == 2 for s in self.status)))
         self.macro.stop_record()
 
     def test_recording_bumps_revision_and_discards_with_warning(self):
@@ -565,7 +567,9 @@ class _FakeBot:
             self.running = False
 
 
-class BridgeMacroTests(_TempSlots):
+class _BridgeBase(_TempSlots):
+    """BridgeApi built without __init__ (no settings file, no window)."""
+
     def setUp(self):
         super().setUp()
         try:
@@ -597,6 +601,8 @@ class BridgeMacroTests(_TempSlots):
             p.start()
             self.addCleanup(p.stop)
 
+
+class BridgeMacroTests(_BridgeBase):
     def test_play_refuses_when_game_is_not_running(self):
         self.macro.apply_events([_ev(0, 'a', 'down')])
         with mock.patch.object(self.ui, 'focus_game_window_ex',
@@ -634,7 +640,9 @@ class BridgeMacroTests(_TempSlots):
     def test_play_active_starts_after_verified_focus(self):
         _write_slot(self.dir, 4, [_ev(0, 'k', 'down'), _ev(0.01, 'k', 'up')])
         with mock.patch.object(self.ui, 'focus_game_window_ex',
-                               return_value=(1, '')):
+                               return_value=(1, '')), \
+             mock.patch.object(ui_core, 'is_allowed_game_only',
+                               return_value=True):
             res = self.api.macro_play_active(2, False)
         self.assertTrue(res['ok'])
         self.assertTrue(_wait_for(lambda: ('key_down', 'k')
@@ -663,6 +671,529 @@ class BridgeMacroTests(_TempSlots):
                                           res['rev'] - 1, 0, False)
         self.assertEqual('stale', stale['reason'])
         self.assertIs(type(stale), dict)
+
+
+# ---- Review round 2 (MR1-MR7) --------------------------------------------
+
+class _HookedRecording(_TempSlots):
+    """Recording with hook installers + foreground patched."""
+
+    def setUp(self):
+        super().setUp()
+        self.in_game = True
+        self.pressed = set()
+        patches = [
+            mock.patch.object(ui_core.keyboard, 'hook', return_value='kb'),
+            mock.patch.object(ui_core.keyboard, 'unhook'),
+            mock.patch.object(ui_core.mouse, 'hook', return_value='ms'),
+            mock.patch.object(ui_core.mouse, 'unhook'),
+            mock.patch.object(ui_core.keyboard, 'is_pressed',
+                              side_effect=lambda k: k in self.pressed),
+            mock.patch.object(ui_core, 'is_allowed_game_only',
+                              side_effect=lambda: self.in_game),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def keys(self):
+        return [(e['key'], e['event_type']) for e in self.macro.get_events()]
+
+
+class RecordingSessionTests(_HookedRecording):
+    """MR1: an ingestion callback can never append outside its session."""
+
+    def _paused_callback(self, event, session):
+        """Run _on_kb_event on a thread, paused inside the foreground probe
+        (i.e. after the cheap state pre-check, before the session lock)."""
+        entered, gate = threading.Event(), threading.Event()
+
+        def slow_probe():
+            entered.set()
+            gate.wait(2.0)
+            return True
+
+        patch = mock.patch.object(ui_core, 'is_allowed_game_only',
+                                  side_effect=slow_probe)
+        patch.start()
+        t = threading.Thread(target=self.macro._on_kb_event,
+                             args=(event, session))
+        t.start()
+        self.assertTrue(entered.wait(1.0))
+        patch.stop()
+        return t, gate
+
+    def test_paused_callback_cannot_append_after_stop_apply_save(self):
+        self.macro.start_record((), ())
+        sid = self.macro._rec_live_session
+        self.macro._on_kb_event(_kb('a', 'down', 30), sid)
+        t, gate = self._paused_callback(_kb('x', 'down', 45), sid)
+        self.assertTrue(self.macro.stop_record())
+        snap = self.macro.get_events_snapshot()
+        self.assertTrue(self.macro.apply_events(
+            [_ev(0, 'b', 'down')], expected_rev=snap['rev'],
+            expected_slot=snap['loaded']))
+        self.assertTrue(self.macro.save_slot(3, 'saved'))
+        rev = self.macro.get_events_snapshot()['rev']
+        gate.set()
+        t.join(1.0)
+        self.assertFalse(t.is_alive())
+        after = self.macro.get_events_snapshot()
+        self.assertEqual([('b', 'down')], self.keys())
+        self.assertEqual(rev, after['rev'])
+        self.assertFalse(after['dirty'])
+        self.assertEqual(_read_slot(self.dir, 3)['events'], after['events'])
+
+    def test_callback_from_old_session_cannot_land_in_next_recording(self):
+        self.macro.start_record((), ())
+        old = self.macro._rec_live_session
+        t, gate = self._paused_callback(_kb('x', 'down', 45), old)
+        self.macro.stop_record()
+        self.macro.start_record((), ())
+        self.assertNotEqual(old, self.macro._rec_live_session)
+        gate.set()
+        t.join(1.0)
+        self.macro.stop_record()
+        self.assertEqual([], self.keys())
+
+    def test_stop_waits_for_an_append_in_progress(self):
+        self.macro.start_record((), ())
+        sid = self.macro._rec_live_session
+        real = self.macro._engine.record_keyboard
+        inside, gate = threading.Event(), threading.Event()
+
+        def slow_append(name, etype):
+            real(name, etype)
+            inside.set()
+            gate.wait(2.0)
+
+        self.macro._engine.record_keyboard = slow_append
+        t = threading.Thread(target=self.macro._on_kb_event,
+                             args=(_kb('x', 'down', 45), sid))
+        t.start()
+        self.assertTrue(inside.wait(1.0))
+        done = threading.Event()
+        stopper = threading.Thread(
+            target=lambda: (self.macro.stop_record(), done.set()))
+        stopper.start()
+        self.assertFalse(done.wait(0.15))     # blocked on the append
+        gate.set()
+        t.join(1.0)
+        stopper.join(1.0)
+        self.assertTrue(done.is_set())
+        snap = self.macro.get_events_snapshot()
+        self.assertEqual([('x', 'down')], self.keys())
+        self.assertEqual('idle', snap['state'])
+
+    def test_hooks_are_installed_with_their_session(self):
+        installed = []
+        with mock.patch.object(ui_core.keyboard, 'hook',
+                               side_effect=lambda cb: installed.append(cb)
+                               or 'kb'):
+            self.macro.start_record((), ())
+            installed[0](_kb('q', 'down', 16))  # live session -> recorded
+            self.macro.stop_record()
+            self.assertEqual([('q', 'down')], self.keys())
+            self.macro.start_record((), ())
+        self.assertEqual(2, len(installed))
+        installed[0](_kb('w', 'down', 17))      # first session's hook
+        installed[1](_kb('e', 'down', 18))      # current session's hook
+        self.macro.stop_record()
+        self.assertEqual([('e', 'down')], self.keys())
+
+
+class ChordTrimTests(_HookedRecording):
+    """MR6: a hotkey Stop removes exactly the press that stopped it."""
+
+    def test_tapped_and_released_chord_is_removed_entirely(self):
+        self.macro.start_record((), (), track_chord='ctrl+y')
+        for ev in (_kb('a', 'down', 30), _kb('a', 'up', 30),
+                   _kb('ctrl', 'down', 29), _kb('y', 'down', 21),
+                   _kb('y', 'up', 21), _kb('ctrl', 'up', 29)):
+            self.macro._on_kb_event(ev)
+        self.macro.stop_record(chord='ctrl+y')
+        self.assertEqual([('a', 'down'), ('a', 'up')], self.keys())
+
+    def test_ctrl_held_for_an_earlier_ctrl_click_is_kept(self):
+        self.macro.start_record((), (), track_chord='ctrl+y')
+        self.macro._on_kb_event(_kb('ctrl', 'down', 29))
+        self.macro._on_mouse_event(mouse.ButtonEvent('down', 'left', 0))
+        self.macro._on_mouse_event(mouse.ButtonEvent('up', 'left', 0))
+        self.macro._on_kb_event(_kb('y', 'down', 21))
+        self.macro.stop_record(chord='ctrl+y')
+        self.assertEqual([('ctrl', 'down'), ('left', 'down'),
+                          ('left', 'up')], self.keys())
+
+    def test_bare_main_key_is_an_unrelated_use(self):
+        self.macro.start_record((), (), track_chord='ctrl+y')
+        for ev in (_kb('y', 'down', 21), _kb('y', 'up', 21),
+                   _kb('a', 'down', 30), _kb('a', 'up', 30),
+                   # hotkey callback beat the recorder: only Ctrl arrived
+                   _kb('ctrl', 'down', 29)):
+            self.macro._on_kb_event(ev)
+        self.macro.stop_record(chord='ctrl+y')
+        self.assertEqual([('y', 'down'), ('y', 'up'), ('a', 'down'),
+                          ('a', 'up')], self.keys())
+
+    def test_ui_stop_keeps_everything(self):
+        self.macro.start_record((), (), track_chord='ctrl+y')
+        for ev in (_kb('ctrl', 'down', 29), _kb('y', 'down', 21),
+                   _kb('y', 'up', 21), _kb('ctrl', 'up', 29)):
+            self.macro._on_kb_event(ev)
+        self.macro.stop_record()                 # UI button: no chord
+        self.assertEqual(4, len(self.keys()))
+
+
+class StatusOrderTests(_HookedRecording):
+    """MR3: an older snapshot can't publish after (and stick over) a
+    newer one."""
+
+    def test_stale_recording_snapshot_is_dropped(self):
+        self.macro.start_record((), ())
+        gate, entered = threading.Event(), threading.Event()
+        real = self.macro.slot_names
+        block = {'on': True}
+
+        def slow_names():
+            if block['on']:
+                block['on'] = False
+                entered.set()
+                gate.wait(2.0)
+            return real()
+
+        self.macro.slot_names = slow_names
+        old = threading.Thread(target=self.macro._emit)
+        old.start()                          # reads state = recording
+        self.assertTrue(entered.wait(1.0))
+        self.macro.stop_record()             # publishes newer 'idle'
+        gate.set()
+        old.join(1.0)
+        full = [s for s in self.status if 'macro_state' in s]
+        self.assertEqual('idle', full[-1]['macro_state'])
+        gens = [s['macro_status_gen'] for s in self.status]
+        self.assertEqual(gens, sorted(gens))
+
+
+class DiscardGuardTests(_TempSlots):
+    """MR2: in-game Record / Load over an unsaved buffer need two presses."""
+
+    def test_first_press_arms_second_proceeds(self):
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+        self.assertFalse(self.macro.confirm_discard_hotkey('record', 'Y'))
+        snap = self.macro.snapshot()
+        self.assertEqual('confirm_record', snap['macro_pending'])
+        self.assertIn('press Y again within 3 s', snap['macro_pending_hint'])
+        self.assertTrue(self.macro.confirm_discard_hotkey('record', 'Y'))
+        self.assertEqual('', self.macro.snapshot()['macro_pending'])
+
+    def test_nothing_unsaved_proceeds_at_once(self):
+        self.assertTrue(self.macro.confirm_discard_hotkey('load', 'F11'))
+        _write_slot(self.dir, 1, [_ev(0, 'a', 'down')])
+        self.macro.load_slot(1)                       # clean buffer
+        self.assertTrue(self.macro.confirm_discard_hotkey('load', 'F11'))
+
+    def test_window_expires_and_actions_do_not_mix(self):
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+        self.macro.DISCARD_CONFIRM_S = 0.05
+        self.assertFalse(self.macro.confirm_discard_hotkey('load'))
+        self.assertFalse(self.macro.confirm_discard_hotkey('record'))
+        time.sleep(0.1)
+        self.assertFalse(self.macro.confirm_discard_hotkey('record'))
+        self.assertTrue(_wait_for(
+            lambda: self.macro.snapshot()['macro_pending'] == '', 0.5))
+
+
+class ForegroundAtStartTests(_TempSlots):
+    """MR4: backend first, then the game must be in front right before
+    the worker starts."""
+
+    def test_backend_resolved_before_foreground_check(self):
+        order = []
+        self.macro.apply_events([_ev(0, 'q', 'down')])
+        controller = _Recorder()
+
+        def provider():
+            order.append('backend')
+            return controller
+
+        def probe():
+            order.append('foreground')
+            return False
+
+        self.macro._controller_provider = provider
+        with mock.patch.object(ui_core, 'is_allowed_game_only',
+                               side_effect=probe), \
+             mock.patch.object(ui_core, 'refresh_game_hwnd'):
+            res = self.macro.play(require_foreground=True)
+        self.assertEqual('not_foreground', res['reason'])
+        self.assertEqual('backend', order[0])
+        self.assertEqual(MacroController.STATE_IDLE, self.macro.state())
+        self.assertEqual([], controller.calls)
+
+    def test_active_slot_rechecks_foreground(self):
+        _write_slot(self.dir, 2, [_ev(0, 'k', 'down')])
+        self.macro._controller_provider = lambda: _Recorder()
+        with mock.patch.object(ui_core, 'is_allowed_game_only',
+                               return_value=False), \
+             mock.patch.object(ui_core, 'refresh_game_hwnd'):
+            res = self.macro.play_slot(2, require_foreground=True)
+        self.assertEqual('not_foreground', res['reason'])
+        self.assertTrue(self.macro.snapshot()['macro_error'])
+
+
+class PickerReleaseTests(_TempSlots):
+    """MR5: swallowed keys are released by scan code, with an expiry."""
+
+    def setUp(self):
+        super().setUp()
+        self.in_game = True
+        self.unhook = mock.MagicMock()
+        for p in (mock.patch.object(ui_core.keyboard, 'hook',
+                                    return_value='picker-hook'),
+                  mock.patch.object(ui_core.keyboard, 'unhook', self.unhook),
+                  mock.patch.object(ui_core.keyboard, 'is_pressed',
+                                    return_value=False),
+                  mock.patch.object(ui_core, 'is_allowed_game_only',
+                                    side_effect=lambda: self.in_game)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+        self.chosen = []
+        p = mock.patch.object(self.macro, 'save_slot',
+                              side_effect=lambda n: self.chosen.append(n))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_release_renamed_by_shift_still_clears_the_swallow(self):
+        self.macro.begin_save_pending()
+        self.assertFalse(self.macro._picker_key_hook(_kb('1', 'down', 2)))
+        self.assertTrue(_wait_for(lambda: self.chosen == [1]))
+        # Shift went down before '1' came up: the release says '!'.
+        self.assertFalse(self.macro._picker_key_hook(_kb('!', 'up', 2)))
+        self.assertEqual({}, self.macro._picker_swallowed)
+        self.in_game = False                  # e.g. typing in chat now
+        self.assertTrue(self.macro._picker_key_hook(_kb('1', 'down', 2)))
+        self.assertTrue(_wait_for(lambda: self.unhook.called))
+
+    def test_lost_release_expires(self):
+        self.macro.PICKER_SWALLOW_MAX_S = 0.05
+        self.macro.begin_save_pending()
+        self.assertFalse(self.macro._picker_key_hook(_kb('2', 'down', 3)))
+        self.assertTrue(_wait_for(lambda: self.chosen == [2]))
+        time.sleep(0.1)                       # the release never came
+        self.assertTrue(self.macro._picker_key_hook(_kb('2', 'down', 3)))
+        self.assertTrue(_wait_for(lambda: self.unhook.called))
+
+
+class SlotAssociationTests(_TempSlots):
+    """MR7: tying the buffer to a slot moves the revision; a slot-0 editor
+    can't save over a buffer that now belongs to a slot."""
+
+    def test_save_to_new_slot_bumps_revision_and_refuses_slot0_editor(self):
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+        editor = self.macro.get_events_snapshot()       # loaded 0
+        self.assertEqual(0, editor['loaded'])
+        self.assertTrue(self.macro.save_slot(3, 'three'))
+        now = self.macro.get_events_snapshot()
+        self.assertGreater(now['rev'], editor['rev'])
+        res = self.macro.apply_events([_ev(0, 'b', 'down')],
+                                      expected_rev=editor['rev'],
+                                      expected_slot=0)
+        self.assertEqual('stale', res['reason'])
+        res = self.macro.apply_events([_ev(0, 'b', 'down')],
+                                      expected_rev=now['rev'],
+                                      expected_slot=0)
+        self.assertEqual('stale', res['reason'])
+        self.assertEqual('a', _read_slot(self.dir, 3)['events'][0]['key'])
+
+    def test_resaving_the_loaded_slot_keeps_the_revision(self):
+        _write_slot(self.dir, 4, [_ev(0, 'a', 'down')])
+        self.macro.load_slot(4)
+        rev = self.macro.get_events_snapshot()['rev']
+        self.macro._engine.mark_dirty()
+        self.assertTrue(self.macro.save_slot(4))
+        self.assertEqual(rev, self.macro.get_events_snapshot()['rev'])
+
+
+class BridgeRoundTwoTests(_BridgeBase):
+    """MR2 / MR4 through the bridge + hotkey bodies."""
+
+    def setUp(self):
+        super().setUp()
+        self.api._settings['keybinds'] = {
+            self.ui.ACTION_MACRO_RECORD: 'ctrl+y',
+            self.ui.ACTION_MACRO_LOAD: 'f11',
+        }
+        self.api._keybinds = types.SimpleNamespace(get_bindings=lambda: {})
+        for p in (mock.patch.object(ui_core.keyboard, 'hook',
+                                    return_value='kb'),
+                  mock.patch.object(ui_core.keyboard, 'unhook'),
+                  mock.patch.object(ui_core.mouse, 'hook', return_value='ms'),
+                  mock.patch.object(ui_core.mouse, 'unhook'),
+                  mock.patch.object(ui_core.keyboard, 'is_pressed',
+                                    return_value=False)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_record_hotkey_over_unsaved_needs_second_press(self):
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+        self.api._hotkey_macro_record()
+        self.assertEqual(MacroController.STATE_IDLE, self.macro.state())
+        self.assertIn('Ctrl+Y', self.macro.snapshot()['macro_pending_hint'])
+        self.api._hotkey_macro_record()
+        self.assertEqual(MacroController.STATE_RECORDING, self.macro.state())
+        self.macro.stop_record()
+
+    def test_load_hotkey_over_unsaved_needs_second_press(self):
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+        with mock.patch.object(self.macro, 'begin_load_pending') as arm:
+            self.api._hotkey_macro_load()
+            arm.assert_not_called()
+            self.api._hotkey_macro_load()
+            arm.assert_called_once()
+
+    def test_ui_play_prepares_backend_before_switching_focus(self):
+        order = []
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+
+        def provider():
+            order.append('backend')
+            return self.controller
+
+        def focus(**_kw):
+            order.append('focus')
+            return (1, '')
+
+        self.macro._controller_provider = provider
+        with mock.patch.object(self.ui, 'focus_game_window_ex',
+                               side_effect=focus), \
+             mock.patch.object(ui_core, 'is_allowed_game_only',
+                               return_value=True):
+            res = self.api.macro_play(False)
+        self.assertTrue(res['ok'])
+        self.assertEqual(['backend', 'focus'], order[:2])
+        self.macro.stop_play()
+
+    def test_ui_play_refuses_if_user_left_the_game_after_focus(self):
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+        with mock.patch.object(self.ui, 'focus_game_window_ex',
+                               return_value=(1, '')), \
+             mock.patch.object(ui_core, 'is_allowed_game_only',
+                               return_value=False), \
+             mock.patch.object(ui_core, 'refresh_game_hwnd'):
+            res = self.api.macro_play(False)
+        self.assertEqual('not_foreground', res['reason'])
+        self.assertEqual([], self.controller.calls)
+
+    def test_hotkey_play_rechecks_foreground(self):
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+        with mock.patch.object(ui_core, 'is_allowed_game_only',
+                               return_value=False), \
+             mock.patch.object(ui_core, 'refresh_game_hwnd'):
+            self.api._hotkey_macro_play()
+        self.assertEqual(MacroController.STATE_IDLE, self.macro.state())
+        self.assertEqual([], self.controller.calls)
+
+
+class ShutdownLatchTests(_HookedRecording):
+    """BU1 follow-up: nothing starts after MacroController.shutdown()."""
+
+    def test_starts_after_shutdown_are_refused(self):
+        _write_slot(self.dir, 1, [_ev(0, 'k', 'down')])
+        self.macro.apply_events([_ev(0, 'q', 'down')])
+        controller = _Recorder()
+        self.macro._controller_provider = lambda: controller
+        self.macro.shutdown()
+        ui_core.keyboard.hook.reset_mock()
+        self.assertEqual('closing', self.macro.start_record((), ())['reason'])
+        self.assertEqual('closing', self.macro.play()['reason'])
+        self.assertEqual('closing', self.macro.play_slot(1)['reason'])
+        self.assertEqual('closing', self.macro.begin_save_pending()['reason'])
+        self.assertEqual('closing', self.macro.begin_load_pending()['reason'])
+        ui_core.keyboard.hook.assert_not_called()
+        self.assertEqual(MacroController.STATE_IDLE, self.macro.state())
+        self.assertEqual([], controller.calls)
+
+    def test_play_waiting_on_backend_cannot_start_after_shutdown(self):
+        self.macro.apply_events([_ev(0, 'q', 'down')])
+        controller = _Recorder()
+        entered, gate = threading.Event(), threading.Event()
+
+        def slow_provider():                 # first Arduino connect
+            entered.set()
+            gate.wait(2.0)
+            return controller
+
+        self.macro._controller_provider = slow_provider
+        result = {}
+        t = threading.Thread(
+            target=lambda: result.update(res=self.macro.play()))
+        t.start()
+        self.assertTrue(entered.wait(1.0))
+        self.macro.shutdown()                # app closes meanwhile
+        gate.set()
+        t.join(2.0)
+        self.assertEqual('closing', result['res']['reason'])
+        self.assertEqual(MacroController.STATE_IDLE, self.macro.state())
+        self.assertEqual([], controller.calls)
+
+
+class BridgeTeardownTests(_BridgeBase):
+    """BU1 follow-up: macro starts queued behind detach() refuse."""
+
+    def setUp(self):
+        super().setUp()
+        self.api._settings['keybinds'] = {
+            self.ui.ACTION_MACRO_RECORD: 'ctrl+y',
+            self.ui.ACTION_MACRO_LOAD: 'f11',
+        }
+        self.api._keybinds = types.SimpleNamespace(get_bindings=lambda: {})
+        self.kb_hook = mock.MagicMock(return_value='kb')
+        for p in (mock.patch.object(ui_core.keyboard, 'hook', self.kb_hook),
+                  mock.patch.object(ui_core.keyboard, 'unhook'),
+                  mock.patch.object(ui_core.mouse, 'hook', return_value='ms'),
+                  mock.patch.object(ui_core.mouse, 'unhook'),
+                  mock.patch.object(ui_core.keyboard, 'is_pressed',
+                                    return_value=False),
+                  mock.patch.object(ui_core, 'is_allowed_game_only',
+                                    return_value=True)):
+            p.start()
+            self.addCleanup(p.stop)
+        _write_slot(self.dir, 4, [_ev(0, 'k', 'down')])
+        self.api._tearing_down = True
+
+    def test_button_starts_refuse_with_closing(self):
+        with mock.patch.object(self.ui, 'focus_game_window_ex',
+                               return_value=(1, '')) as focus:
+            self.assertEqual({'ok': False, 'reason': 'closing'},
+                             self.api.macro_toggle_record(False))
+            self.assertEqual('closing', self.api.macro_toggle_record(True)['reason'])
+            self.macro.apply_events([_ev(0, 'a', 'down')])
+            self.assertEqual('closing', self.api.macro_play(False)['reason'])
+            self.assertEqual('closing',
+                             self.api.macro_play_active(2, False)['reason'])
+        focus.assert_not_called()
+        self.kb_hook.assert_not_called()
+        self.assertEqual(MacroController.STATE_IDLE, self.macro.state())
+        self.assertEqual([], self.controller.calls)
+
+    def test_hotkey_starts_do_nothing(self):
+        self.api._hotkey_macro_record()
+        self.api._hotkey_macro_play()
+        self.api._hotkey_macro_active(2)
+        self.api._hotkey_macro_save()
+        self.api._hotkey_macro_load()
+        self.kb_hook.assert_not_called()
+        self.assertEqual(MacroController.STATE_IDLE, self.macro.state())
+        self.assertEqual('', self.macro.snapshot()['macro_pending'])
+        self.assertEqual([], self.controller.calls)
+
+    def test_stopping_a_recording_still_works(self):
+        self.api._tearing_down = False
+        self.assertTrue(self.api.macro_toggle_record(False)['ok'])
+        self.api._tearing_down = True
+        self.assertTrue(self.api.macro_toggle_record(False)['ok'])
+        self.assertEqual(MacroController.STATE_IDLE, self.macro.state())
 
 
 # ---- static frontend checks (U19 / M23) ------------------------------------

@@ -834,6 +834,13 @@ _MODIFIER_VKS_BY_NAME = (
 _get_async_key_state = None
 
 
+def _now_wall():
+    """Wall clock in the same base as keyboard / mouse event `.time` (both
+    packages stamp events with time.time() inside the hook callback).
+    Indirected so tests can drive it."""
+    return time.time()
+
+
 def _modifier_vks_by_scan_code():
     """{scan code: VKs} for every modifier, resolved through the keyboard
     package's own name tables. Built off the hot path (bind time)."""
@@ -867,8 +874,9 @@ def _async_key_down(vk):
 class KeybindManager:
     """Global hotkeys with foreground gating and rebind support. Each
     action has at most one binding. Bindings starting with 'mouse:<btn>'
-    route to `mouse.on_button`; everything else is matched by this class
-    on ONE non-suppressing `keyboard.hook` (see `_on_kb_event` for why
+    get a per-binding button filter on the mouse listener (see
+    `_mouse_press_handler`); everything else is matched by this class on
+    ONE non-suppressing `keyboard.hook` (see `_on_kb_event` for why
     `keyboard.add_hotkey` is no longer used)."""
 
     # A hotkey callback must NEVER run on the listener thread.
@@ -906,6 +914,20 @@ class KeybindManager:
     # long it has been held.
     _KB_MOD_RECHECK_AFTER_S = 1.0
 
+    # GetAsyncKeyState answers for NOW, so it is only a valid witness for
+    # an event processed promptly. A press processed later than this
+    # (listener backlog / delivery stall) is matched on the event-stream
+    # modifier state alone: Ctrl may have been released after F8 went down
+    # but before F8 reached us, and asking Windows then would turn
+    # Ctrl+F8 into bare F8. Stale modifiers are reconciled on the next
+    # fresh candidate press instead.
+    _KB_FRESH_EVENT_S = 0.05
+
+    # Closed suspension windows kept for late-delivered presses (see
+    # `_in_suspension_window`).
+    _SUSPENSION_WINDOWS_KEPT = 8
+    _SUSPENSION_WINDOW_TTL_S = 60.0
+
     def __init__(self, ui_hwnd_provider):
         # ui_hwnd_provider() returns the current UI HWND. Called per-key
         # so it stays correct if the underlying window is recreated.
@@ -919,16 +941,24 @@ class KeybindManager:
         # thread reads them without taking a lock. `_kb_held` is only ever
         # touched by the hook thread.
         self._bind_lock = threading.Lock()
+        self._apply_lock = threading.RLock()   # serializes apply()
         self._kb_hook = None     # remover returned by keyboard.hook
         self._kb_entries = {}    # action -> (action, requirements, main codes, gate)
         self._kb_index = {}      # scan code -> tuple of entries
         self._kb_held = {}       # scan code -> time of its latest KEY_DOWN
         self._kb_mod_vks = {}    # modifier scan code -> VKs (see HK5 note)
+        # Post-capture latches (see latch_until_release): key / button ->
+        # wall time of the latch. Written by bridge threads, read and
+        # popped by the hook threads (single dict ops, GIL-atomic).
+        self._kb_latched = {}    # scan code -> latch time
+        self._mouse_latched = {}  # button -> latch time
         # Capture suspension (see suspend/resume). Tokens order the
         # begin/end bridge calls, which pywebview runs on separate threads;
         # `_capture_lock` makes each check-and-update atomic. The gate only
-        # READS `_suspended_until` (one float), lock-free.
+        # READS `_suspended_until` (one float) and `_susp_windows` (an
+        # immutable tuple swapped whole), lock-free.
         self._capture_lock = threading.Lock()
+        self._susp_windows = ()  # ((wall start, wall end), ...) newest last
         self._suspended_until = 0.0
         self._capture_token = 0
         self._capture_ended_token = 0
@@ -963,7 +993,17 @@ class KeybindManager:
     # Python call, but the keyboard package already runs Python for every
     # key event (direct_callback + pre_process_event) whether or not we
     # hook, and key events are a few per second -- not the ~345/s of mouse
-    # moves above. Mouse bindings still use mouse.on_button only.
+    # moves above.
+    #
+    # Update 2: mouse bindings register `_mouse_press_handler` through
+    # mouse.hook instead of mouse.on_button. That is NOT an extra per-event
+    # cost: mouse.on_button is itself `_listener.add_handler(handler)` with
+    # a handler called for every mouse event (moves included) that filters
+    # on ButtonEvent -- exactly what this does. The difference is that
+    # on_button calls back WITHOUT the event, and the gate needs the
+    # event's own timestamp (see `_in_suspension_window`). One handler per
+    # bound button, as before; nothing is hooked until a mouse binding is
+    # set.
 
     def _dispatch_loop(self):
         while True:
@@ -1023,16 +1063,8 @@ class KeybindManager:
         handle = None
         try:
             if parsed is None:
-                btn = self._mouse_button(canonical)
-                # 'down' AND 'double'. The mouse package rewrites a press
-                # that lands within the double-click interval of the
-                # previous button event -- ANY button, press or release --
-                # into 'double' INSTEAD of 'down' (never both; see
-                # mouse/_winmouse.py), so 'down' alone silently ignored
-                # e.g. Stop on Mouse 5 right after an attack click.
-                # Release stays excluded: it would double-fire toggles.
-                handle = mouse.on_button(wrapped, buttons=[btn],
-                                         types=['down', 'double'])
+                handle = mouse.hook(self._mouse_press_handler(
+                    self._mouse_button(canonical), wrapped))
             else:
                 with self._bind_lock:
                     self._ensure_kb_hook_locked()
@@ -1073,6 +1105,99 @@ class KeybindManager:
         for action in list(self._bindings):
             self.clear(action)
 
+    def apply(self, desired):
+        """Make the installed bindings match `desired`, transactionally.
+
+        `desired` is {action: (hotkey, callback, scope)}. Actions absent
+        from it (or with an empty hotkey) are cleared; an action whose
+        canonical binding AND scope are already installed is left exactly
+        as it is (its callback is equivalent across reinstalls); every
+        other action goes through set(), which installs the new hook
+        before removing the old one. So a failing hook install -- even a
+        persistent one -- never takes down a binding that was working,
+        unlike the old clear_all()-then-set() reinstall. Returns True when
+        every desired binding is installed. Concurrent calls (API thread
+        vs hotkey dispatcher) are serialized."""
+        with self._apply_lock:
+            for action in list(self._bindings):
+                entry = desired.get(action)
+                if not entry or not entry[0]:
+                    self.clear(action)
+            ok = True
+            for action, (hotkey, callback, scope) in desired.items():
+                if not hotkey:
+                    continue
+                canonical, reason = validate_hotkey(action, hotkey)
+                if (reason is None
+                        and self._bindings.get(action) == canonical
+                        and self._scopes.get(action) == scope):
+                    continue
+                if not self.set(action, hotkey, callback, scope):
+                    ok = False
+            return ok
+
+    def latch_until_release(self, action):
+        """Ignore `action`'s main key / button for any press made at or
+        before now -- i.e. the press the capture prompt just recorded.
+
+        Called right after rebind / macro_set_active_hotkey installs a
+        binding. If that press is still in the listener backlog it would
+        otherwise reach the new binding and fire it (F8 captured -> F8
+        processed late -> Start/Stop). Presses stamped after the latch are
+        unaffected, and auto-repeats of the latched press are already
+        ignored by the held-key latch, so this can never swallow a NEW
+        press; the latch clears on the key's / button's release."""
+        binding = self._bindings.get(action)
+        if not binding:
+            return False
+        now = _now_wall()
+        if self._is_mouse(binding):
+            self._mouse_latched[self._mouse_button(binding)] = now
+            return True
+        entry = self._kb_entries.get(action)
+        if entry is None:
+            return False
+        for code in entry[2]:
+            self._kb_latched[code] = now
+        return True
+
+    def _mouse_press_handler(self, button, wrapped):
+        """Per-binding mouse listener callback (installed with mouse.hook).
+        Same filter as mouse.on_button(buttons=[button],
+        types=['down', 'double']), but it hands the event's own timestamp
+        to the gate.
+
+        'down' AND 'double': the mouse package rewrites a press that lands
+        within the double-click interval of the previous button event --
+        ANY button, press or release -- into 'double' INSTEAD of 'down'
+        (never both; see mouse/_winmouse.py), so 'down' alone silently
+        ignored e.g. Stop on Mouse 5 right after an attack click. Release
+        never fires (it would double-fire toggles); it only clears a
+        post-capture latch.
+
+        HOT PATH (mouse listener thread, every mouse event): isinstance +
+        compares only. Returns None so later handlers still run."""
+        latched = self._mouse_latched
+        button_event = mouse.ButtonEvent
+        press_types = (mouse.DOWN, mouse.DOUBLE)
+
+        def handler(event):
+            if not isinstance(event, button_event) or event.button != button:
+                return None
+            if event.event_type not in press_types:
+                if event.event_type == mouse.UP:
+                    latched.pop(button, None)
+                return None
+            since = latched.get(button)
+            if since is not None:
+                if event.time <= since:
+                    return None          # the press the capture recorded
+                latched.pop(button, None)  # its release never reached us
+            wrapped(event.time)
+            return None
+        handler.button = button          # for logs / tests
+        return handler
+
     def get_bindings(self):
         """Return {action: binding} snapshot — used by MacroController to
         build its excluded-keys set (so the record hotkey itself isn't
@@ -1096,7 +1221,16 @@ class KeybindManager:
     # Each check-and-write runs under `_capture_lock`: unlocked, resume(A)
     # could pass its token check, suspend(B) install B's suspension, and
     # then A's write of 0.0 leave B's prompt open with hotkeys live. The
-    # gate never takes this lock -- it only reads `_suspended_until`.
+    # gate never takes this lock -- it only reads `_suspended_until` and
+    # the `_susp_windows` tuple.
+    #
+    # Suspension is judged by WHEN THE PRESS HAPPENED, not only when it is
+    # processed. The browser sees F8 at once, the rebind completes and
+    # capture_end resumes hotkeys -- while the keyboard listener may still
+    # hold that same native F8 DOWN in its backlog. Each suspension is
+    # therefore also recorded as a wall-clock window, and a press whose
+    # event timestamp falls inside any recent window is dropped even if it
+    # is processed after resume.
 
     def suspend(self, token=None, seconds=None):
         limit = self.CAPTURE_SUSPEND_MAX_S
@@ -1110,6 +1244,14 @@ class KeybindManager:
                 if token <= self._capture_ended_token:
                     return False
                 self._capture_token = max(self._capture_token, token)
+            now = _now_wall()
+            windows = list(self._susp_windows)
+            if time.monotonic() < self._suspended_until and windows:
+                # Re-armed while open: extend the current window.
+                windows[-1] = (windows[-1][0], now + secs)
+            else:
+                windows.append((now, now + secs))
+            self._publish_windows_locked(windows, now)
             self._suspended_until = time.monotonic() + secs
         return True
 
@@ -1120,8 +1262,28 @@ class KeybindManager:
                     self._capture_ended_token, token)
                 if token < self._capture_token:
                     return False
+            now = _now_wall()
+            windows = list(self._susp_windows)
+            if windows and windows[-1][1] > now:
+                windows[-1] = (windows[-1][0], now)   # closes now
+                self._publish_windows_locked(windows, now)
             self._suspended_until = 0.0
         return True
+
+    def _publish_windows_locked(self, windows, now):
+        cutoff = now - self._SUSPENSION_WINDOW_TTL_S
+        self._susp_windows = tuple(
+            w for w in windows[-self._SUSPENSION_WINDOWS_KEPT:]
+            if w[1] >= cutoff)
+
+    def _in_suspension_window(self, event_time):
+        """True when a press stamped `event_time` happened while a capture
+        prompt had hotkeys suspended. Lock-free: one tuple read, <= 8
+        compares, and only for presses of bound keys / buttons."""
+        for start, end in self._susp_windows:
+            if start <= event_time <= end:
+                return True
+        return False
 
     def is_suspended(self):
         return time.monotonic() < self._suspended_until
@@ -1158,7 +1320,16 @@ class KeybindManager:
         Only on this candidate path -- a fresh press of a bound key whose
         decision depends on a modifier -- ask Windows (GetAsyncKeyState)
         about the modifiers involved. Never aged by time alone: a modifier
-        Windows reports down stays held however long it has been held."""
+        Windows reports down stays held however long it has been held.
+
+        The caller only gets here for a FRESH event (`_KB_FRESH_EVENT_S`):
+        GetAsyncKeyState is the state now, which for a backlogged press
+        can postdate a legitimate release. `_KB_MOD_RECHECK_AFTER_S` is
+        kept on top of that for the residual case -- a quick Ctrl+F8 whose
+        Ctrl release lands inside the few ms between F8 and its processing
+        -- and costs nothing real: a lost KEY_UP needs a secure-desktop
+        round trip, which never fits between a Ctrl press and an F8 less
+        than 1 s apart."""
         mod_vks = self._kb_mod_vks
         for entry in entries:
             for req in entry[1]:
@@ -1212,21 +1383,29 @@ class KeybindManager:
             held = self._kb_held
             if event.event_type == keyboard.KEY_UP:
                 held.pop(code, None)
+                self._kb_latched.pop(code, None)
                 return None
             if event.event_type != keyboard.KEY_DOWN:
                 return None
-            t = event.time or time.time()
+            t = event.time or _now_wall()
             last = held.get(code)
             held[code] = t
+            since = self._kb_latched.get(code)
+            if since is not None:
+                if t <= since:
+                    return None          # the press a capture just recorded
+                self._kb_latched.pop(code, None)
             if last is not None and (t - last) < self._KB_STALE_HOLD_S:
                 return None              # auto-repeat of a held key
             entries = self._kb_index.get(code)
             if not entries:
                 return None
-            for entry in entries:
-                if entry[1]:
-                    self._drop_lost_modifiers(held, entries, code, t)
-                    break
+            if _now_wall() - t < self._KB_FRESH_EVENT_S:
+                # Fresh press only: see _KB_FRESH_EVENT_S.
+                for entry in entries:
+                    if entry[1]:
+                        self._drop_lost_modifiers(held, entries, code, t)
+                        break
             best = []
             best_n = -1
             for entry in entries:
@@ -1244,13 +1423,16 @@ class KeybindManager:
                     else:
                         best.append(entry)
             for entry in best:
-                entry[3]()
+                entry[3](t)
         except Exception:
             pass
         return None
 
     def _gate(self, callback, scope, action='?'):
-        def wrapper(*_args, **_kwargs):
+        # `event_time`: the press's own hook timestamp (time.time() base),
+        # passed by the keyboard matcher and the mouse handler. None means
+        # "now" (direct calls).
+        def wrapper(event_time=None, *_args, **_kwargs):
             # NOTHING slow may happen here. This runs on the WH_MOUSE_LL /
             # WH_KEYBOARD_LL callback, and Windows permanently unhooks a
             # low-level hook whose callback exceeds LowLevelHooksTimeout.
@@ -1262,6 +1444,11 @@ class KeybindManager:
             self._last_hook_event = time.monotonic()
             if self._last_hook_event < self._suspended_until:
                 # Capture prompt open: dropped, not queued (see suspend).
+                return
+            if (event_time is not None
+                    and self._in_suspension_window(event_time)):
+                # Pressed while a prompt was open, processed after it
+                # closed (listener backlog): still the key being captured.
                 return
             if scope == 'game':
                 ok = is_allowed_game_only()
@@ -1560,6 +1747,15 @@ class BotController:
         # Last merged album_progress dict (None = no album run yet / reset
         # by Start). See _merge_album_progress.
         self._album_progress = None
+        # True from Start until the worker's finalizer has published
+        # 'idle'. Every state transition (Start, Stop, Pause, worker
+        # finalization) sets `state` AND emits it while holding `_lock`,
+        # and Stop / Pause decide on this flag (not thread liveness, which
+        # stays True for a moment after the finalizer ran). Otherwise
+        # Stop could publish 'stopping' after the finalizer's 'idle' (UI
+        # stuck on "Stopping…"), or Pause could publish 'paused' for a
+        # run that already ended.
+        self._run_active = False
         self._timer_boosted = False
         self.state = self.STATE_IDLE
         self._mode = ''
@@ -1600,6 +1796,7 @@ class BotController:
         self._mode = mode
         self._mode_options = dict(options)
         self._run_error_reported = False
+        self._run_active = True
         self.state = self.STATE_RUNNING
         # A new Start clears whatever the previous run reported:
         # last_error, the album progress strip (the album runner re-emits
@@ -1617,38 +1814,43 @@ class BotController:
         return True
 
     def stop(self):
-        """Request stop. Never blocks. Returns the new command generation
-        (see restart_in_mode)."""
+        """Request stop. Never blocks on anything but the short state lock
+        (never on a worker join). Returns the new command generation (see
+        restart_in_mode)."""
         with self._lock:
             self._generation += 1
             gen = self._generation
-        if not self.is_running():
-            self.state = self.STATE_IDLE
+            if not self._run_active:
+                # Nothing running — or the worker already published its
+                # final 'idle'; don't overwrite that with 'stopping'.
+                self.state = self.STATE_IDLE
+                self._emit({'state': self.state})
+                return gen
+            # Reflect "stopping" immediately so the UI updates on the next
+            # status tick instead of waiting for the worker thread to
+            # actually exit (which can take 100ms+ if it has to tear down a
+            # cv2 window or finish the current detector poll).
+            self._stop_evt.set()
+            self._pause_evt.clear()  # unblock any pause-waiters
+            self.state = self.STATE_STOPPING
             self._emit({'state': self.state})
             return gen
-        # Reflect "stopping" immediately so the UI updates on the next
-        # status tick instead of waiting for the worker thread to actually
-        # exit (which can take 100ms+ if it has to tear down a cv2 window
-        # or finish the current detector poll).
-        self._stop_evt.set()
-        self._pause_evt.clear()  # unblock any pause-waiters
-        self.state = self.STATE_STOPPING
-        self._emit({'state': self.state})
-        return gen
 
     def pause_toggle(self):
-        # Ignore while stopping: the thread is still alive, but flipping
-        # the pause event (and the status to "paused") would only confuse
-        # the UI — the run is already on its way out.
-        if not self.is_running() or self._stop_evt.is_set():
-            return
-        if self._pause_evt.is_set():
-            self._pause_evt.clear()
-            self.state = self.STATE_RUNNING
-            self._emit({'state': self.state})
-        else:
-            self._pause_evt.set()
-            self.state = self.STATE_PAUSED
+        # Ignore while stopping (flipping the pause event / publishing
+        # "paused" would only confuse the UI — the run is on its way out)
+        # and once the worker finalized. Decided under the state lock so
+        # a Pause can't lose a race to Stop + exit and publish 'paused'
+        # for a run that already ended.
+        with self._lock:
+            if not self._run_active or self._stop_evt.is_set():
+                return
+            if self._pause_evt.is_set():
+                self._pause_evt.clear()
+                self.state = self.STATE_RUNNING
+            else:
+                self._pause_evt.set()
+                self.state = self.STATE_PAUSED
             self._emit({'state': self.state})
 
     def set_debug(self, enabled):
@@ -1868,11 +2070,16 @@ class BotController:
                     pass
             self._report_crash()
         finally:
-            self.state = self.STATE_IDLE
-            # Re-emit debug too: after the run it is just the preset for
-            # the next Start (the viz window itself is gone).
-            self._emit({'state': self.state, 'fps': 0.0, 'song': '',
-                        'debug': self._debug_evt.is_set()})
+            # Final state under the state lock (see _run_active): after
+            # this, Stop / Pause see the run as over and can't publish a
+            # stale 'stopping' / 'paused' on top of this 'idle'.
+            with self._lock:
+                self._run_active = False
+                self.state = self.STATE_IDLE
+                # Re-emit debug too: after the run it is just the preset
+                # for the next Start (the viz window itself is gone).
+                self._emit({'state': self.state, 'fps': 0.0, 'song': '',
+                            'debug': self._debug_evt.is_set()})
 
 
 # --- macro tool -------------------------------------------------------------
@@ -2012,9 +2219,42 @@ class MacroController:
         # leave-the-game). One Event per armed picker.
         self._pending_cancel_evt = None
         # Suppressing keyboard hook for the picker + scan codes whose
-        # press it swallowed (their repeats / release are swallowed too).
+        # press it swallowed -> monotonic time swallowed (their repeats /
+        # release are swallowed too, until PICKER_SWALLOW_MAX_S).
         self._picker_hook = None
-        self._picker_swallowed = set()
+        self._picker_swallowed = {}
+        self._picker_expiry_timer = None
+        # Two-press guard for in-game Record / Load hotkeys over an
+        # unsaved buffer: (action, armed_at, hint) or None.
+        self._discard_armed = None
+        # Recording-session guard. Hook callbacks are installed with the
+        # id of the session they belong to and append only while that id
+        # is the live session, under `_rec_lock` — which start / stop take
+        # too. A callback that was paused inside the hook therefore can't
+        # append after the recording ended (or into the next recording),
+        # and stop waits for an append already in progress.
+        self._rec_lock = threading.Lock()
+        self._rec_session = 0            # last session id handed out
+        self._rec_live_session = None    # id of the recording in progress
+        # key id -> the recorded 'down' event dict of a key still held.
+        self._rec_down_objs = {}
+        # Record-hotkey chord (e.g. ctrl+y) as hook event names, and the
+        # exact event dicts of its most recent press (+ their releases),
+        # so a hotkey Stop removes exactly that press — see
+        # _note_chord_press_locked.
+        self._rec_chord_mod_parts = []   # one alias set per modifier part
+        self._rec_chord_mods = set()
+        self._rec_chord_main = set()
+        self._rec_chord_last = None
+        # Status publication order: every snapshot / live-count push gets
+        # a generation under `_lock`; `_publish` drops anything older than
+        # what was already handed to on_status.
+        self._status_gen = 0
+        self._published_gen = 0
+        self._publish_lock = threading.Lock()
+        # Set by shutdown() under `_lock`; record / play / picker starts
+        # refuse with reason 'closing' once it is set.
+        self._shut_down = False
         # Buffer revision — bumped whenever the buffer's contents or the
         # slot it belongs to change (record start/stop, load, editor
         # apply, loaded slot cleared). The JS events editor pins the
@@ -2075,26 +2315,54 @@ class MacroController:
         return names
 
     def snapshot(self):
-        """Status fields the UI drain pushes to JS."""
-        return {
-            'macro_state': self._state,
-            'macro_events': self._engine.event_count(),
-            'macro_slots': self.list_slots(),
-            'macro_slot_names': self.slot_names(),
-            'macro_loaded': self._engine.loaded_slot() or 0,
-            'macro_dirty': self._engine.is_dirty(),
-            'macro_pending': self._pending_action or '',
-            'macro_playing_slot': self._playing_slot or 0,
-            'macro_playing_name': self._playing_name,
-            'macro_playing_source': self._playing_source,
-            # Events in the macro that is playing — an active slot's count
-            # differs from the working buffer's. 0 when not playing.
-            'macro_playing_events': self._playing_events,
-            # Buffer revision for the events editor (see __init__).
-            'macro_rev': self._buffer_rev,
-            # Last user-actionable failure ('' = none).
-            'macro_error': self._error,
-        }
+        """Status fields the UI drain pushes to JS.
+
+        Every state field is read together under `_lock` and stamped with
+        a fresh `macro_status_gen`; the slot-file reads (grid names) come
+        after, outside the lock. `_emit` publishes through `_publish`,
+        which drops a snapshot older than one already published — so a
+        'recording' snapshot that lost the race to the slot-file reads can
+        never land after (and stick over) the newer 'idle' one."""
+        with self._lock:
+            self._status_gen += 1
+            pending, hint = self._pending_status_locked()
+            snap = {
+                'macro_status_gen': self._status_gen,
+                'macro_state': self._state,
+                'macro_events': self._engine.event_count(),
+                'macro_loaded': self._engine.loaded_slot() or 0,
+                'macro_dirty': self._engine.is_dirty(),
+                # 'save' / 'load' (slot picker armed) or 'confirm_record' /
+                # 'confirm_load' (hotkey discard guard armed); '' = none.
+                'macro_pending': pending,
+                # Ready-to-show text for macro_pending ('' = none).
+                'macro_pending_hint': hint,
+                'macro_playing_slot': self._playing_slot or 0,
+                'macro_playing_name': self._playing_name,
+                'macro_playing_source': self._playing_source,
+                # Events in the macro that is playing — an active slot's
+                # count differs from the working buffer's. 0 when idle.
+                'macro_playing_events': self._playing_events,
+                # Buffer revision for the events editor (see __init__).
+                'macro_rev': self._buffer_rev,
+                # Last user-actionable failure ('' = none).
+                'macro_error': self._error,
+            }
+        snap['macro_slots'] = self.list_slots()
+        snap['macro_slot_names'] = self.slot_names()
+        return snap
+
+    def _pending_status_locked(self):
+        action = self._pending_action
+        if action:
+            label = 'Save' if action == 'save' else 'Load'
+            return action, (f'{label} (in Genshin): 1-9 picks slots 1-9; '
+                            f'0 then 1-9 picks 10-18. Esc or leaving the '
+                            f'game cancels.')
+        armed = self._discard_armed
+        if armed and time.monotonic() - armed[1] <= self.DISCARD_CONFIRM_S:
+            return f'confirm_{armed[0]}', armed[2]
+        return '', ''
 
     def event_count(self):
         return self._engine.event_count()
@@ -2130,6 +2398,11 @@ class MacroController:
         self._error = ''
         return _macro_ok(**extra)
 
+    @staticmethod
+    def _closing_refusal():
+        print("[macro] start refused - the app is closing")
+        return _macro_refused('closing', 'The app is closing.')
+
     def _finish(self, result, err_before):
         """Emit after a command — outside every lock — when something the
         UI shows changed: success, or a new / cleared error. Plain
@@ -2147,7 +2420,7 @@ class MacroController:
     def get_events_snapshot(self):
         """Buffer copy plus the revision / loaded slot it belongs to,
         read together so the editor pins exactly what it is editing."""
-        with self._lock:
+        with self._lock, self._rec_lock:
             return {
                 'events': [dict(ev) for ev in self._engine.events],
                 'rev': self._buffer_rev,
@@ -2245,34 +2518,47 @@ class MacroController:
                 return _macro_refused(
                     'stale', 'The macro changed since the editor loaded it.',
                     rev=self._buffer_rev, loaded=loaded)
-        if expected_slot:
+        # expected_slot is checked whenever given — 0 included: an editor
+        # opened on an unassigned buffer must not persist=False over a
+        # buffer that has since been tied to a slot (Save-to-slot from the
+        # grid), or that slot silently keeps its old events.
+        if expected_slot is not None:
             try:
-                slot_ok = int(expected_slot) == loaded
+                expected = int(expected_slot)
             except (TypeError, ValueError):
-                slot_ok = False
-            if not slot_ok:
+                expected = None
+            if expected != loaded:
+                was = (f'slot {expected_slot}' if expected
+                       else 'an unsaved macro')
                 now = f'slot {loaded}' if loaded else 'no slot'
-                print(f"[macro] edit refused - editor was showing slot "
-                      f"{expected_slot}, {now} is loaded now")
+                print(f"[macro] edit refused - editor was showing {was}, "
+                      f"{now} is loaded now")
                 return _macro_refused(
-                    'stale', f'The editor was showing slot {expected_slot}, '
-                             f'but {now} is loaded now.',
+                    'stale', f'The editor was showing {was}, but {now} is '
+                             f'loaded now.',
                     rev=self._buffer_rev, loaded=loaded)
         return None
 
     # ---- record ----
 
-    def start_record(self, excluded_kb, excluded_mouse, chord=None):
-        """Install the capture hooks and start a fresh buffer. `chord` is
-        the record hotkey when recording was started from it (e.g.
-        'ctrl+y'): chord keys still held right now are ignored until
-        they come up, so the hotkey itself never lands in the macro."""
+    def start_record(self, excluded_kb, excluded_mouse, chord=None,
+                     track_chord=None):
+        """Install the capture hooks and start a fresh buffer.
+
+        `chord` is the record hotkey when recording was started FROM it
+        (e.g. 'ctrl+y'): chord keys still held right now are ignored until
+        they come up, so the hotkey itself never lands in the macro.
+        `track_chord` (defaults to `chord`) is the record hotkey binding
+        whichever way recording started: its presses during the recording
+        are tracked so a hotkey Stop can remove exactly the press that
+        stopped it (see stop_record)."""
         err_before = self._error
         return self._finish(
-            self._start_record(excluded_kb, excluded_mouse, chord),
+            self._start_record(excluded_kb, excluded_mouse, chord,
+                               chord if track_chord is None else track_chord),
             err_before)
 
-    def _start_record(self, excluded_kb, excluded_mouse, chord):
+    def _start_record(self, excluded_kb, excluded_mouse, chord, track_chord):
         with self._command('record start',
                            timeout=self._SLOT_CMD_WAIT_S) as ok:
             if not ok:
@@ -2280,6 +2566,8 @@ class MacroController:
                                           'running - try again.')
             hook_error = None
             with self._lock:
+                if self._shut_down:
+                    return self._closing_refusal()
                 if self._state != self.STATE_IDLE:
                     print(f"[macro] cannot record — state is {self._state}")
                     return _macro_refused(
@@ -2292,41 +2580,59 @@ class MacroController:
                 for b in excluded_kb:
                     self._excluded_kb |= _kb_name_variants(b)
                 self._excluded_mouse = {b.lower() for b in excluded_mouse if b}
-                self._rec_held_keys = {}
-                self._rec_held_mouse = set()
-                self._rec_ignore_parts = {}
+                self._rec_session += 1
+                sid = self._rec_session
                 try:
-                    self._kb_hook = keyboard.hook(self._on_kb_event)
-                    self._mouse_hook = mouse.hook(self._on_mouse_event)
+                    # Each callback carries its session id (see __init__).
+                    self._kb_hook = keyboard.hook(
+                        lambda e, sid=sid: self._on_kb_event(e, sid))
+                    self._mouse_hook = mouse.hook(
+                        lambda e, sid=sid: self._on_mouse_event(e, sid))
                 except Exception as e:
                     hook_error = e
                     self._unhook()
                 if hook_error is None:
-                    # Computed after the hooks are in, so a chord key
-                    # released in between is seen as up, not left pending.
-                    self._rec_ignore_parts = self._held_chord_parts(chord)
-                    # Engine clears the buffer, resets the start timestamp,
-                    # and detaches loaded-slot — see MacroEngine.begin_record.
-                    self._engine.begin_record()
+                    mod_parts, main = self._split_chord(track_chord)
+                    with self._rec_lock:
+                        self._rec_held_keys = {}
+                        self._rec_held_mouse = set()
+                        self._rec_down_objs = {}
+                        # Computed after the hooks are in, so a chord key
+                        # released in between is seen as up, not left
+                        # pending.
+                        self._rec_ignore_parts = self._held_chord_parts(chord)
+                        self._rec_chord_mod_parts = mod_parts
+                        self._rec_chord_mods = (set().union(*mod_parts)
+                                                if mod_parts else set())
+                        self._rec_chord_main = main
+                        self._rec_chord_last = None
+                        # Engine clears the buffer, resets the start
+                        # timestamp, and detaches loaded-slot — see
+                        # MacroEngine.begin_record.
+                        self._engine.begin_record()
+                        self._rec_live_session = sid
                     self._buffer_rev += 1
                     self._state = self.STATE_RECORDING
+                    self._discard_armed = None
                     self._start_record_ticker_locked()
             if hook_error is not None:
                 return self._fail('hook_failed', f"Couldn't start recording "
                                                  f"(input hook failed: "
                                                  f"{hook_error}).")
         if discarded:
-            # The UI confirms before this; an in-game hotkey can't.
+            # The UI confirms first; an in-game hotkey needs a second press
+            # (confirm_discard_hotkey) — log it either way.
             print(f"[macro] warning: recording replaced {discarded} "
                   f"unsaved event{'s' if discarded != 1 else ''}")
         print("[macro] recording started (capture only inside Genshin)")
         return self._succeed()
 
     def stop_record(self, chord=None):
-        """Remove the hooks and finish the buffer. `chord` is the record
-        hotkey when the stop came from it: its presses reach the recorder
-        before the hotkey callback does, so the trailing run of chord-key
-        presses is stripped — playback never re-presses the hotkey."""
+        """Remove the hooks and finish the buffer. Pass `chord` (the
+        record hotkey) when the stop came FROM that hotkey: the exact
+        press of it that stopped the recording — its key-downs and any
+        releases that already arrived — is removed, so playback never
+        re-presses the hotkey. Other uses of the same keys are kept."""
         err_before = self._error
         return self._finish(self._stop_record(chord), err_before)
 
@@ -2340,24 +2646,33 @@ class MacroController:
                 if self._state != self.STATE_RECORDING:
                     return _macro_refused('not_recording')
                 self._stop_record_ticker_locked()
+                with self._rec_lock:
+                    # From here on every in-flight hook callback drops its
+                    # event; one that was mid-append has finished (we hold
+                    # its lock), so the buffer below is final.
+                    self._rec_live_session = None
+                    stripped = (self._strip_record_chord_locked(chord)
+                                if chord else 0)
+                    # Engine marks the buffer dirty if anything was
+                    # captured.
+                    self._engine.end_record()
+                    count = self._engine.event_count()
                 self._unhook()
-                stripped = self._strip_trailing_chord_locked(chord)
-                # Engine marks the buffer dirty if anything was captured.
-                self._engine.end_record()
                 self._buffer_rev += 1
                 self._state = self.STATE_IDLE
-                count = self._engine.event_count()
         if stripped:
-            print(f"[macro] dropped {stripped} trailing record-hotkey "
-                  f"press{'es' if stripped != 1 else ''}")
+            print(f"[macro] dropped {stripped} record-hotkey "
+                  f"event{'s' if stripped != 1 else ''}")
         print(f"[macro] stopped recording — {count} events")
         return self._succeed(count=count)
 
-    def toggle_record(self, excluded_kb=(), excluded_mouse=(), chord=None):
+    def toggle_record(self, excluded_kb=(), excluded_mouse=(), chord=None,
+                      track_chord=None):
         if self._state == self.STATE_RECORDING:
             return self.stop_record(chord=chord)
         if self._state == self.STATE_IDLE:
-            return self.start_record(excluded_kb, excluded_mouse, chord=chord)
+            return self.start_record(excluded_kb, excluded_mouse, chord=chord,
+                                     track_chord=track_chord)
         print(f"[macro] cannot toggle record — state is {self._state}")
         return _macro_refused(self._state, f"Can't record while {self._state}.")
 
@@ -2376,26 +2691,92 @@ class MacroController:
                 held[part] = names
         return held
 
-    def _strip_trailing_chord_locked(self, chord):
+    @staticmethod
+    def _split_chord(chord):
+        """([alias set per modifier part], main-key event names) of a
+        chord binding; ([], set()) for single keys / mouse bindings."""
         parts = _hotkey_chord_parts(chord)
-        if not parts:
-            return 0
-        names = set().union(*parts.values())
+        mods, main = [], set()
+        items = list(parts.items())
+        if items and not any(p not in _CHORD_KEY_ALIASES for p, _ in items):
+            # Modifier-only chord: treat its last part as the trigger.
+            main = set(items[-1][1])
+            items = items[:-1]
+        for part, names in items:
+            if part in _CHORD_KEY_ALIASES:
+                mods.append(set(names))
+            else:
+                main.update(names)
+        return mods, main
+
+    def _note_chord_press_locked(self, key_id, obj):
+        """Hook thread, `_rec_lock` held. A record-chord main key was just
+        recorded going down (`obj`). If every chord modifier is held right
+        now this IS a press of the record hotkey: remember exactly it —
+        the main key's down plus the chord-modifier downs recorded
+        immediately before it that are still held — so a hotkey Stop can
+        remove them (and their releases, attached in _on_kb_event) by
+        identity. A bare press of the main key is an unrelated use and is
+        not tracked; neither are modifier downs separated from the main
+        key by any other event (e.g. Ctrl held for a Ctrl+click)."""
+        if self._rec_chord_mod_parts:
+            held = set(self._rec_held_keys.values())
+            for names in self._rec_ignore_parts.values():
+                held |= names        # held since before the recording
+            if not all(names & held for names in self._rec_chord_mod_parts):
+                return
         events = self._engine.events
-        n = 0
+        held = {id(o): kid for kid, o in self._rec_down_objs.items()}
+        objs, kids = [obj], {key_id}
+        i = len(events) - 2
+        while i >= 0:
+            ev = events[i]
+            kid = held.get(id(ev))
+            if (kid is None or ev.get('device') != 'keyboard'
+                    or ev.get('event_type') != 'down'
+                    or ev.get('key') not in self._rec_chord_mods):
+                break
+            objs.append(ev)
+            kids.add(kid)
+            i -= 1
+        self._rec_chord_last = {'objs': objs, 'key_ids': kids}
+
+    def _strip_record_chord_locked(self, chord):
+        """`_rec_lock` held, recording just ended by the hotkey `chord`.
+        Removes (1) the tracked press of the chord — downs and the ups
+        that already arrived — and (2) any trailing chord-key downs that
+        are still held: the hotkey callback can run before the recorder
+        sees the chord's main key, leaving just the modifier at the end.
+        Returns the number of events removed. Edits the engine's buffer
+        in place (no engine API for trimming yet)."""
+        events = self._engine.events
+        drop = set()
+        last = self._rec_chord_last
+        self._rec_chord_last = None
+        if last:
+            drop.update(id(o) for o in last['objs'])
+        names = self._rec_chord_mods | self._rec_chord_main
+        if not names:
+            # Recording started without a tracked chord: fall back to the
+            # stop chord's own key names.
+            for aliases in _hotkey_chord_parts(chord).values():
+                names |= aliases
+        held_ids = {id(o) for o in self._rec_down_objs.values()}
         for ev in reversed(events):
-            if (ev.get('device') == 'keyboard'
+            if id(ev) in drop:
+                continue
+            if (id(ev) in held_ids and ev.get('device') == 'keyboard'
                     and ev.get('event_type') == 'down'
                     and ev.get('key') in names):
-                n += 1
+                drop.add(id(ev))
                 continue
             break
-        if n:
-            # In place on the engine's buffer reference (no engine API for
-            # trimming yet). replace_events() would re-validate and could
-            # drop recorded names its canonicalizer doesn't know.
-            del events[-n:]
-        return n
+        if not drop:
+            return 0
+        kept = [ev for ev in events if id(ev) not in drop]
+        removed = len(events) - len(kept)
+        events[:] = kept
+        return removed
 
     def _start_record_ticker_locked(self):
         stop = threading.Event()
@@ -2409,10 +2790,11 @@ class MacroController:
             self._rec_ticker_stop = None
 
     def _record_ticker(self, stop):
-        """Live event count while recording. Pushes only `macro_events` —
-        the full snapshot re-reads every slot file. Holds `_lock` while
-        pushing so a tick can never land after stop_record's final
-        status (which may have trimmed the count)."""
+        """Live event count while recording. Pushes only `macro_events`
+        (the full snapshot re-reads every slot file), stamped with a
+        status generation taken under `_lock` — so a tick computed before
+        stop_record can never be published after stop's final snapshot
+        (which may have trimmed the count)."""
         last = -1
         while not stop.wait(self.LIVE_COUNT_INTERVAL_S):
             with self._lock:
@@ -2422,18 +2804,47 @@ class MacroController:
                 if n == last:
                     continue
                 last = n
-                try:
-                    self._on_status({'macro_events': n})
-                except Exception:
-                    pass
+                self._status_gen += 1
+                gen = self._status_gen
+            self._publish({'macro_events': n, 'macro_status_gen': gen})
 
     # ---- playback ----
 
-    def play(self):
-        err_before = self._error
-        return self._finish(self._play_buffer(), err_before)
+    # Playback start order (both entry points): resolve the input backend
+    # FIRST — the first Arduino connect can take ~2 s — and only then, as
+    # the very last check before the worker starts, verify Genshin is the
+    # foreground window when `require_foreground` is set (UI buttons after
+    # their focus switch, in-game hotkeys after waiting for the engine
+    # lock). Otherwise an alt-tab during the connect, or while a hotkey
+    # waited, typed the macro into whatever app was in front.
 
-    def _play_buffer(self):
+    _NOT_FOREGROUND_MSG = ("Genshin isn't the active window - playback was "
+                           "not started.")
+
+    def prepare_backend(self):
+        """Build / fetch the input backend ahead of a playback (may block
+        ~2 s on a first Arduino connect). Lets the bridge do the slow part
+        before it switches focus to the game."""
+        err_before = self._error
+        if self._resolve_controller() is None:
+            return self._finish(self._fail('no_backend', self._NO_BACKEND_MSG),
+                                err_before)
+        return _macro_ok()
+
+    @staticmethod
+    def _game_is_foreground():
+        if is_allowed_game_only():
+            return True
+        # The cached HWND refreshes once a second; a just-(re)started game
+        # may not be in it yet. Not a hook thread, so FindWindowW is fine.
+        refresh_game_hwnd()
+        return is_allowed_game_only()
+
+    def play(self, require_foreground=False):
+        err_before = self._error
+        return self._finish(self._play_buffer(require_foreground), err_before)
+
+    def _play_buffer(self, require_foreground):
         with self._command('play (buffer)') as ok:
             if not ok:
                 return _macro_refused('busy')
@@ -2448,6 +2859,8 @@ class MacroController:
             if old_thread is not None:
                 old_thread.join(timeout=2.0)
             with self._lock:
+                if self._shut_down:
+                    return self._closing_refusal()
                 if self._state == self.STATE_PLAYING:
                     return _macro_refused('playing')
                 if self._state != self.STATE_IDLE:
@@ -2456,19 +2869,31 @@ class MacroController:
                 if self._engine.event_count() == 0:
                     return self._fail('empty_buffer', 'Nothing to play - '
                                       'record or load a macro first.')
-                controller = self._resolve_controller()
-                if controller is None:
-                    return self._fail('no_backend', self._NO_BACKEND_MSG)
+            # Slow part outside `_lock`; the command hold keeps the buffer
+            # and state from changing meanwhile.
+            controller = self._resolve_controller()
+            if controller is None:
+                return self._fail('no_backend', self._NO_BACKEND_MSG)
+            if require_foreground and not self._game_is_foreground():
+                return self._fail('not_foreground', self._NOT_FOREGROUND_MSG)
+            with self._lock:
+                if self._shut_down:
+                    return self._closing_refusal()
+                if self._state != self.STATE_IDLE:
+                    return _macro_refused(self._state)
                 events = [dict(ev) for ev in self._engine.events]
                 self._start_playback_locked(
                     controller, events, slot=None, name='', source='buffer')
         return self._succeed()
 
-    def play_slot(self, n, conflict_policy=MACRO_CONFLICT_IGNORE):
+    def play_slot(self, n, conflict_policy=MACRO_CONFLICT_IGNORE,
+                  require_foreground=False):
         err_before = self._error
-        return self._finish(self._play_slot(n, conflict_policy), err_before)
+        return self._finish(
+            self._play_slot(n, conflict_policy, require_foreground),
+            err_before)
 
-    def _play_slot(self, n, conflict_policy):
+    def _play_slot(self, n, conflict_policy, require_foreground=False):
         with self._command(f'play slot {n}') as ok:
             if not ok:
                 return _macro_refused('busy')
@@ -2500,6 +2925,8 @@ class MacroController:
             while True:
                 old_thread = None
                 with self._lock:
+                    if self._shut_down:
+                        return self._closing_refusal()
                     if self._state == self.STATE_RECORDING:
                         print("[macro] cannot play active slot while recording")
                         return _macro_refused('recording')
@@ -2526,6 +2953,12 @@ class MacroController:
                                   f"{self._playing_slot} for slot {n_int}")
                             self._stop_play_evt.set()
                     else:
+                        # Last check before starting — after the backend
+                        # resolve and any interrupt hand-off wait above.
+                        if (require_foreground
+                                and not self._game_is_foreground()):
+                            return self._fail('not_foreground',
+                                              self._NOT_FOREGROUND_MSG)
                         self._start_playback_locked(
                             controller, [dict(ev) for ev in events],
                             slot=n_int, name=name, source='active')
@@ -2654,7 +3087,13 @@ class MacroController:
                                              f"{e}")
         with self._lock:
             if rev == self._buffer_rev:
+                prev = self._engine.loaded_slot() or 0
                 self._engine.mark_saved(n_int)
+                if prev != n_int:
+                    # The buffer now belongs to another slot: that is a
+                    # buffer-identity change, so an editor pinned to the
+                    # old association must re-pin.
+                    self._buffer_rev += 1
         label = f' as {final_name!r}' if final_name else ''
         print(f"[macro] saved {count} events to slot {n_int}{label}")
         return self._succeed(slot=n_int, name=final_name, count=count,
@@ -2694,6 +3133,7 @@ class MacroController:
                 else:
                     load_error = None
                     self._buffer_rev += 1
+                    self._discard_armed = None
                     count = self._engine.event_count()
             if load_error is not None:
                 return self._fail(*load_error)
@@ -2807,6 +3247,60 @@ class MacroController:
             return ''
         return str(name).strip()[:80]
 
+    # ---- in-game discard guard (Record / Load hotkeys) ----
+
+    DISCARD_CONFIRM_S = 3.0
+
+    def confirm_discard_hotkey(self, action, key_label=''):
+        """Two-press guard for the in-game Record / Load hotkeys, which
+        can't show a dialog. Returns True when `action` ('record' /
+        'load') may go ahead: nothing unsaved in the buffer, or this is
+        the second press of the same action within DISCARD_CONFIRM_S.
+        Otherwise it only ARMS: logs "press <key> again..." and publishes
+        it as macro_pending 'confirm_<action>' + macro_pending_hint, then
+        returns False. UI buttons don't use this (they confirm in-app)."""
+        now = time.monotonic()
+        verb = 'record over it' if action == 'record' else 'load a slot'
+        with self._lock:
+            unsaved = (self._state == self.STATE_IDLE
+                       and self._engine.is_dirty()
+                       and self._engine.event_count() > 0)
+            armed = self._discard_armed
+            fresh = (armed is not None and armed[0] == action
+                     and now - armed[1] <= self.DISCARD_CONFIRM_S)
+            if not unsaved or fresh:
+                self._discard_armed = None
+                token = None
+            else:
+                n = self._engine.event_count()
+                hint = (f"Unsaved macro ({n} event{'s' if n != 1 else ''}) - "
+                        f"press {key_label or 'the hotkey'} again within "
+                        f"{self.DISCARD_CONFIRM_S:g} s to discard it and "
+                        f"{verb}.")
+                token = (action, now, hint)
+                self._discard_armed = token
+        if token is None:
+            if fresh:
+                print(f"[macro] second press - discarding the unsaved macro "
+                      f"to {verb}")
+            if armed is not None:
+                self._emit()             # clear the hint
+            return True
+        print(f"[macro] {token[2]}")
+        t = threading.Timer(self.DISCARD_CONFIRM_S + 0.05,
+                            self._expire_discard_guard, args=(token,))
+        t.daemon = True
+        t.start()
+        self._emit()
+        return False
+
+    def _expire_discard_guard(self, token):
+        with self._lock:
+            if self._discard_armed is not token:
+                return
+            self._discard_armed = None
+        self._emit()
+
     # ---- save/load slot picker (driven by hotkeys) ----
 
     def begin_save_pending(self):
@@ -2822,14 +3316,16 @@ class MacroController:
                 self._fail('empty_buffer', 'Nothing to save - record or '
                                            'load a macro first.'),
                 err_before)
-        self._set_pending('save')
+        if not self._set_pending('save'):
+            return _macro_refused('closing', 'The app is closing.')
         return _macro_ok()
 
     def begin_load_pending(self):
         if self._state != self.STATE_IDLE:
             print(f"[macro] cannot load while {self._state}")
             return _macro_refused(self._state)
-        self._set_pending('load')
+        if not self._set_pending('load'):
+            return _macro_refused('closing', 'The app is closing.')
         return _macro_ok()
 
     # The picker listens with ONE suppressing `keyboard.hook` instead of
@@ -2858,6 +3354,11 @@ class MacroController:
 
     def _set_pending(self, action):
         with self._pending_lock:
+            if self._shut_down:
+                # shutdown() latches the flag before it clears the picker
+                # under this lock, so no picker hook can outlive it.
+                print("[macro] slot picker ignored - the app is closing")
+                return False
             self._clear_pending_locked()
             self._pending_action = action
             self._pending_slot_bank = 0
@@ -2877,6 +3378,7 @@ class MacroController:
               f"0 then 1-9 for slots 10-18, "
               f"ESC to cancel ({int(self.SLOT_TIMEOUT_S)}s, in Genshin only)")
         self._emit()
+        return True
 
     def _clear_pending_locked(self):
         for h in self._slot_hotkey_handles:
@@ -2895,18 +3397,50 @@ class MacroController:
         self._pending_slot_bank = 0
         # Keep the hook until every key it swallowed has been released,
         # so the game never sees a lone release or the auto-repeat of the
-        # chosen digit; the hook drops itself after that last release.
-        if not self._picker_swallowed:
+        # chosen digit; the hook drops itself after that last release, or
+        # the expiry timer drops it if a release never shows up.
+        if self._picker_swallowed:
+            self._arm_picker_expiry_locked()
+        else:
             self._drop_picker_hook_locked()
+
+    # A swallowed key whose release never arrives (focus games, a lost
+    # hook event) must not stay swallowed forever.
+    PICKER_SWALLOW_MAX_S = 5.0
 
     def _drop_picker_hook_locked(self):
         h = self._picker_hook
         self._picker_hook = None
+        if self._picker_expiry_timer is not None:
+            self._picker_expiry_timer.cancel()
+            self._picker_expiry_timer = None
         if h is not None:
             try:
                 keyboard.unhook(h)
             except Exception:
                 pass
+
+    def _arm_picker_expiry_locked(self):
+        if self._picker_expiry_timer is not None:
+            self._picker_expiry_timer.cancel()
+        t = threading.Timer(self.PICKER_SWALLOW_MAX_S + 0.05,
+                            self._expire_picker_swallow)
+        t.daemon = True
+        self._picker_expiry_timer = t
+        t.start()
+
+    def _expire_picker_swallow(self):
+        with self._pending_lock:
+            self._picker_expiry_timer = None
+            now = time.monotonic()
+            for scan, at in list(self._picker_swallowed.items()):
+                if now - at >= self.PICKER_SWALLOW_MAX_S:
+                    self._picker_swallowed.pop(scan, None)
+            if self._pending_action is None:
+                if self._picker_swallowed:
+                    self._arm_picker_expiry_locked()
+                else:
+                    self._drop_picker_hook_locked()
 
     def _drop_idle_picker_hook(self):
         with self._pending_lock:
@@ -2915,23 +3449,30 @@ class MacroController:
 
     def _picker_key_hook(self, event):
         # HOOK THREAD (see above). True = let the key through.
+        scan = event.scan_code
+        swallowed = self._picker_swallowed
+        # Keys this hook already swallowed come FIRST and are matched by
+        # scan code only: Shift pressed before the release turns '1' into
+        # '!', and a name filter used to let that release through while
+        # the scan code stayed "swallowed" — eating the next '1' anywhere.
+        at = swallowed.get(scan)
+        if at is not None:
+            if time.monotonic() - at < self.PICKER_SWALLOW_MAX_S:
+                if event.event_type == 'up':
+                    swallowed.pop(scan, None)
+                    if not swallowed and self._pending_action is None:
+                        # Unhooking from inside the hook would mutate the
+                        # list the package is iterating — do it off-thread.
+                        threading.Thread(target=self._drop_idle_picker_hook,
+                                         daemon=True).start()
+                return False         # its auto-repeat or its release
+            swallowed.pop(scan, None)    # expired: treat as a fresh key
+        if event.event_type == 'up':
+            return True
+        # Names only decide what a NEW press means.
         name = (event.name or '').lower() if event.name else ''
         if name not in self._PICKER_KEYS:
             return True
-        scan = event.scan_code
-        if event.event_type == 'up':
-            if scan in self._picker_swallowed:
-                self._picker_swallowed.discard(scan)
-                if (not self._picker_swallowed
-                        and self._pending_action is None):
-                    # Unhooking from inside the hook would mutate the
-                    # list the package is iterating — do it off-thread.
-                    threading.Thread(target=self._drop_idle_picker_hook,
-                                     daemon=True).start()
-                return False
-            return True
-        if scan in self._picker_swallowed:
-            return False                 # auto-repeat of a consumed key
         if self._pending_action is None:
             return True
         try:
@@ -2944,7 +3485,7 @@ class MacroController:
         if not is_allowed_game_only():
             self._slot_left_game_async()
             return True
-        self._picker_swallowed.add(scan)
+        swallowed[scan] = time.monotonic()
         if name == 'esc':
             self._slot_cancel_async()
         elif name == '0':
@@ -3040,7 +3581,16 @@ class MacroController:
     def shutdown(self):
         self._stop_play_evt.set()
         with self._lock:
+            # Latched under `_lock`: every record / play start checks it
+            # under the same lock, so a start queued behind app teardown
+            # can't install hooks or spawn a worker afterwards. A start
+            # that won the lock just before us is stopped by the event
+            # below (it may have replaced the one set above).
+            self._shut_down = True
+            self._stop_play_evt.set()
             self._stop_record_ticker_locked()
+            with self._rec_lock:
+                self._rec_live_session = None
             self._unhook()
             self._state = self.STATE_IDLE
             self._playing_slot = None
@@ -3148,38 +3698,75 @@ class MacroController:
                 return part
         return None
 
-    def _on_kb_event(self, event):
+    # Session guard: `session` is the id the hook was installed with
+    # (None = "the live one", for direct calls / tests). Everything that
+    # reads or writes recording state runs under `_rec_lock` after the
+    # session check; the foreground probe (GetForegroundWindow + an int
+    # compare) runs before it so the lock is held only for the append.
+
+    def _rec_session_ok_locked(self, session):
+        live = self._rec_live_session
+        return live is not None and (session is None or session == live)
+
+    def _append_locked(self, record, key, etype):
+        """Call an engine record_* and return the event dict it appended
+        (None when it dropped the event, e.g. an auto-repeat down)."""
+        events = self._engine.events
+        before = len(events)
+        record(key, etype)
+        return events[-1] if len(events) > before else None
+
+    def _on_kb_event(self, event, session=None):
         if self._state != self.STATE_RECORDING:
             return
         name = (event.name or '').lower() if event.name else ''
         if not name or name in self._excluded_kb:
             return
         etype = event.event_type
-        if self._rec_ignore_parts:
-            # Record-hotkey chord keys still held from the press that
-            # started this recording: ignore until they come up once.
-            part = self._chord_part_for(name)
-            if part is not None:
-                if etype == 'up':
-                    self._rec_ignore_parts.pop(part, None)
-                return
         # Key identity by scan code so a release whose name changed with
         # Shift ('1' down, '!' up) still matches its press.
         scan = getattr(event, 'scan_code', None)
         key_id = (scan, bool(getattr(event, 'is_keypad', False))) if scan \
             else name
-        if etype == 'up':
-            recorded = self._rec_held_keys.pop(key_id, None)
-            if recorded is not None:
-                self._engine.record_keyboard(recorded, 'up')
-            return
-        if not is_allowed_game_only():
-            return
-        recorded = self._rec_held_keys.setdefault(key_id, name)
-        # Engine applies the auto-repeat suppression rule + timestamp.
-        self._engine.record_keyboard(recorded, etype)
+        in_game = etype == 'up' or is_allowed_game_only()
+        with self._rec_lock:
+            if not self._rec_session_ok_locked(session):
+                return
+            if self._rec_ignore_parts:
+                # Record-hotkey chord keys still held from the press that
+                # started this recording: ignore until they come up once.
+                part = self._chord_part_for(name)
+                if part is not None:
+                    if etype == 'up':
+                        self._rec_ignore_parts.pop(part, None)
+                    return
+            if etype == 'up':
+                recorded = self._rec_held_keys.pop(key_id, None)
+                if recorded is None:
+                    return
+                self._rec_down_objs.pop(key_id, None)
+                obj = self._append_locked(self._engine.record_keyboard,
+                                          recorded, 'up')
+                last = self._rec_chord_last
+                if (obj is not None and last is not None
+                        and key_id in last['key_ids']):
+                    # Release of a key from the tracked hotkey press.
+                    last['objs'].append(obj)
+                    last['key_ids'].discard(key_id)
+                return
+            if not in_game:
+                return
+            recorded = self._rec_held_keys.setdefault(key_id, name)
+            # Engine applies the auto-repeat suppression rule + timestamp.
+            obj = self._append_locked(self._engine.record_keyboard,
+                                      recorded, etype)
+            if obj is None:
+                return
+            self._rec_down_objs.setdefault(key_id, obj)
+            if recorded in self._rec_chord_main:
+                self._note_chord_press_locked(key_id, obj)
 
-    def _on_mouse_event(self, event):
+    def _on_mouse_event(self, event, session=None):
         if self._state != self.STATE_RECORDING:
             return
         # Buttons only: cursor movement (MoveEvent) and the wheel
@@ -3190,18 +3777,36 @@ class MacroController:
         if not btn or btn in self._excluded_mouse:
             return
         etype = event.event_type
-        if etype == 'up':
-            if btn in self._rec_held_mouse:
-                self._rec_held_mouse.discard(btn)
-                self._engine.record_mouse(btn, 'up')
-            return
-        if not is_allowed_game_only():
-            return
-        self._rec_held_mouse.add(btn)        # 'down' or 'double'
-        self._engine.record_mouse(btn, etype)
+        in_game = etype == 'up' or is_allowed_game_only()
+        with self._rec_lock:
+            if not self._rec_session_ok_locked(session):
+                return
+            if etype == 'up':
+                if btn in self._rec_held_mouse:
+                    self._rec_held_mouse.discard(btn)
+                    self._engine.record_mouse(btn, 'up')
+                return
+            if not in_game:
+                return
+            self._rec_held_mouse.add(btn)        # 'down' or 'double'
+            self._engine.record_mouse(btn, etype)
 
     def _emit(self):
         try:
-            self._on_status(self.snapshot())
+            snap = self.snapshot()
         except Exception:
-            pass
+            return
+        self._publish(snap)
+
+    def _publish(self, update):
+        """Hand a status update to on_status unless a newer one (higher
+        macro_status_gen) already went out — see snapshot()."""
+        gen = update.get('macro_status_gen', 0)
+        with self._publish_lock:
+            if gen < self._published_gen:
+                return
+            self._published_gen = gen
+            try:
+                self._on_status(update)
+            except Exception:
+                pass

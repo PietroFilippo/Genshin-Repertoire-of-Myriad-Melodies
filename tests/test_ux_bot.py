@@ -604,6 +604,12 @@ class BridgeBackendTests(unittest.TestCase):
         api._arduino = None
         api._backend_error = ''
         api._theme_reminder_shown = True
+        api._tearing_down = False
+        api._restart_pending = 0
+        api._push_in_flight = False
+        api._stopping = False
+        api._detached = False
+        api._close_confirmed = False
         api._bot = _FakeBot()
         api._macro = _FakeMacro()
         p = mock.patch.object(ui, 'save_settings')
@@ -1047,6 +1053,281 @@ class DirectionABridgeTests(unittest.TestCase):
         ok = Event(None, True)
         ok += lambda: None
         self.assertFalse(ok.set())
+
+
+# --- review follow-ups: BU1 / BU2 / BU3 / BU8 --------------------------------
+
+class StateLockTests(_BotTestBase):
+    """BU3: Stop / Pause / worker finalization publish state under one
+    lock and decide on the run flag, not thread liveness."""
+
+    def _finished_bot_with_lingering_thread(self):
+        """A bot whose run already finalized ('idle' published) but whose
+        thread object still reports alive — the window the race lived in."""
+        with mock.patch.object(ui_core, 'run_standalone',
+                               lambda *a, **k: None):
+            bot = self.make_bot(lambda: object())
+            bot.start('standalone', {})
+            self.wait_idle(bot)
+        linger = threading.Event()
+        t = threading.Thread(target=linger.wait, args=(2.0,), daemon=True)
+        t.start()
+        self.addCleanup(linger.set)
+        bot._thread = t
+        self.assertTrue(bot.is_running())
+        return bot
+
+    def test_stop_after_finalizer_does_not_publish_stopping(self):
+        bot = self._finished_bot_with_lingering_thread()
+        bot.stop()
+        self.assertEqual(self.sink.get('state'), 'idle')
+        self.assertFalse(bot._stop_evt.is_set())
+
+    def test_pause_after_finalizer_does_not_publish_paused(self):
+        bot = self._finished_bot_with_lingering_thread()
+        n = len(self.sink.updates)
+        bot.pause_toggle()
+        self.assertEqual(len(self.sink.updates), n)
+        self.assertFalse(bot._pause_evt.is_set())
+        self.assertEqual(self.sink.get('state'), 'idle')
+
+    def test_racing_stop_and_pause_always_end_idle(self):
+        for i in range(25):
+            self.sink = _StatusSink()
+
+            def runner(stop_evt, *a, **k):
+                stop_evt.wait(0.002 * (i % 4))
+            with mock.patch.object(ui_core, 'run_standalone', runner):
+                bot = self.make_bot(lambda: object())
+                bot.start('standalone', {})
+                hammer = [threading.Thread(target=bot.stop),
+                          threading.Thread(target=bot.pause_toggle),
+                          threading.Thread(target=bot.pause_toggle)]
+                for t in hammer:
+                    t.start()
+                for t in hammer:
+                    t.join(2.0)
+                self.wait_idle(bot)
+                time.sleep(0.01)
+            states = [u['state'] for u in self.sink.updates if 'state' in u]
+            self.assertEqual(states[-1], 'idle', f'iteration {i}: {states}')
+
+
+@unittest.skipIf(ui is None, 'ui.py not importable headless')
+class ReviewBridgeTests(unittest.TestCase):
+    def make_api(self):
+        api = BridgeBackendTests.make_api(self)
+        api._hwnd_cache = 0
+        api._window = None
+        return api
+
+    # -- BU2: Stop wins over a pending mode switch at the bridge -------------
+
+    def _real_bot(self, api, exit_delay):
+        for name in ('set_dpi_aware', 'boost_timer', 'restore_timer'):
+            p = mock.patch.object(ui_core, name, return_value=False)
+            p.start()
+            self.addCleanup(p.stop)
+        started = threading.Event()
+        p = mock.patch.object(ui_core, 'run_standalone',
+                              _blocking_standalone(started, exit_delay))
+        p.start()
+        self.addCleanup(p.stop)
+        album = mock.Mock()
+        p = mock.patch.object(ui_core, 'AlbumRunner', album)
+        p.start()
+        self.addCleanup(p.stop)
+        sink = _StatusSink()
+        api._enqueue_status = sink
+        api._bot = BotController(sink, controller_provider=lambda: object())
+        self.addCleanup(_BotTestBase._shutdown, api._bot)
+        return started, album, sink
+
+    def test_f8_during_restart_join_stops_without_waiting(self):
+        api = self.make_api()
+        started, album, sink = self._real_bot(api, exit_delay=0.4)
+        self.assertTrue(api.start_stop())
+        self.assertTrue(started.wait(2.0))
+        result = {}
+        t = threading.Thread(
+            target=lambda: result.setdefault('ok', api.restart_in_mode('album')))
+        t.start()
+        self.assertTrue(_wait_until(lambda: api._bot._stop_evt.is_set()))
+        time.sleep(0.05)                       # restart is joining now
+        t0 = time.monotonic()
+        self.assertTrue(api.start_stop())      # F8
+        self.assertLess(time.monotonic() - t0, 0.2,
+                        'Stop waited for the engine lock')
+        t.join(5.0)
+        self.assertFalse(result['ok'])
+        self.assertTrue(_wait_until(lambda: not api._bot.is_running()))
+        album.assert_not_called()
+
+    def test_f8_while_restart_waits_for_engine_lock(self):
+        api = self.make_api()
+        started, album, sink = self._real_bot(api, exit_delay=0.2)
+        api.start_stop()
+        self.assertTrue(started.wait(2.0))
+        holder_go = threading.Event()
+        holding = threading.Event()
+
+        def holder():
+            with api._engine_lock:
+                holding.set()
+                holder_go.wait(2.0)
+        h = threading.Thread(target=holder)
+        h.start()
+        self.assertTrue(holding.wait(1.0))
+        t = threading.Thread(target=lambda: api.restart_in_mode('album'))
+        t.start()
+        self.assertTrue(_wait_until(lambda: api._restart_pending > 0))
+        t0 = time.monotonic()
+        api.start_stop()                       # F8 → Stop, lock-free
+        self.assertLess(time.monotonic() - t0, 0.2)
+        holder_go.set()
+        h.join(2.0)
+        t.join(5.0)
+        self.assertTrue(_wait_until(lambda: not api._bot.is_running()))
+        album.assert_not_called()
+
+    # -- BU1: teardown refuses / serializes ownership transitions ------------
+
+    def test_start_paths_and_backend_refuse_while_tearing_down(self):
+        api = self.make_api()
+        api._tearing_down = True
+        with mock.patch.object(ui, 'make_input_backend') as factory:
+            self.assertIsNone(api._get_arduino())
+            factory.assert_not_called()
+        self.assertFalse(api.start_stop())
+        self.assertEqual(api.start_stop_force(),
+                         {'ok': False, 'reason': 'closing'})
+        self.assertEqual(api.set_input_backend('arduino'),
+                         {'ok': False, 'reason': 'closing'})
+        api._bot = _FakeBot(running=True)
+        self.assertFalse(api.restart_in_mode('album'))
+        self.assertEqual(api._bot.started, [])
+
+    def _detach_ready(self, api, order):
+        api._drain_stop = threading.Event()
+        api._drain_thread = None
+        api._orig_stdout = sys.stdout
+        api._orig_stderr = sys.stderr
+        api._keybinds = mock.Mock()
+        api._keybinds.clear_all.side_effect = lambda: order.append('keybinds')
+        api._macro.shutdown = lambda: order.append('macro.shutdown')
+        bot = api._bot
+        bot.shutdown = lambda: order.append('bot.shutdown')
+        old_stop = bot.stop
+        bot.stop = lambda: (order.append('bot.stop'), old_stop())[1]
+        ard = mock.Mock()
+        ard.close.side_effect = lambda: order.append('backend.close')
+        api._arduino = ard
+        for target, name in ((ui, '_release_ll_hooks'),
+                             (ui.keyboard, 'unhook_all'),
+                             (ui.mouse, 'unhook_all')):
+            p = mock.patch.object(
+                target, name,
+                side_effect=lambda n=name, t=target: order.append(
+                    'hooks' if n == '_release_ll_hooks' else
+                    f'{t.__name__}.unhook_all'))
+            p.start()
+            self.addCleanup(p.stop)
+        return ard
+
+    def test_queued_start_cannot_resume_after_teardown(self):
+        api = self.make_api()
+        order = []
+        ard = self._detach_ready(api, order)
+        holder_go = threading.Event()
+        holding = threading.Event()
+
+        def holder():                          # a transition in progress
+            with api._engine_lock:
+                holding.set()
+                holder_go.wait(3.0)
+                order.append('holder.release')
+        h = threading.Thread(target=holder)
+        h.start()
+        self.assertTrue(holding.wait(1.0))
+        starter = threading.Thread(target=api.start_stop)   # queued Start
+        starter.start()
+        time.sleep(0.05)
+        closer = threading.Thread(target=api.detach)
+        closer.start()
+        self.assertTrue(_wait_until(lambda: api._tearing_down))
+        time.sleep(0.05)
+        self.assertNotIn('backend.close', order)   # waits for the holder
+        holder_go.set()
+        for t in (h, starter, closer):
+            t.join(3.0)
+        self.assertEqual(api._bot.started, [])
+        ard.close.assert_called_once()
+        self.assertLess(order.index('holder.release'),
+                        order.index('backend.close'))
+
+    def test_teardown_lock_wait_is_bounded(self):
+        api = self.make_api()
+        order = []
+        self._detach_ready(api, order)
+        release = threading.Event()
+
+        def stuck():
+            with api._engine_lock:
+                release.wait(3.0)
+        s = threading.Thread(target=stuck)
+        s.start()
+        self.addCleanup(lambda: (release.set(), s.join(3.0)))
+        time.sleep(0.02)
+        with mock.patch.object(ui, 'TEARDOWN_ENGINE_LOCK_TIMEOUT_S', 0.1):
+            t0 = time.monotonic()
+            api.detach()
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertIn('backend.close', order)
+
+    # -- BU8: hooks first, drain can't block the close -----------------------
+
+    def test_detach_order_hooks_first_then_stop_pushing(self):
+        api = self.make_api()
+        order = []
+        self._detach_ready(api, order)
+        drain = mock.Mock()
+        drain.join.side_effect = lambda timeout=None: order.append(
+            ('drain.join', api._stopping, api._drain_stop.is_set()))
+        api._drain_thread = drain
+        api.detach()
+        self.assertEqual(order[0], 'hooks')
+        join = [o for o in order if isinstance(o, tuple)]
+        self.assertEqual(join, [('drain.join', True, True)])
+        self.assertLess(order.index('hooks'), order.index(join[0]))
+        self.assertLess(order.index(join[0]), order.index('backend.close'))
+        self.assertLess(order.index('bot.shutdown'),
+                        order.index('backend.close'))
+        self.assertTrue(api._tearing_down)
+
+    def test_detach_does_not_wait_on_in_flight_push(self):
+        api = self.make_api()
+        order = []
+        self._detach_ready(api, order)
+        drain = mock.Mock()
+        api._drain_thread = drain
+        api._push_in_flight = True
+        api.detach()
+        drain.join.assert_not_called()
+
+    def test_push_skips_evaluate_once_stopping_and_tracks_in_flight(self):
+        api = self.make_api()
+        seen = {}
+        win = mock.Mock()
+        win.evaluate_js.side_effect = lambda s: seen.setdefault(
+            'in_flight', api._push_in_flight)
+        api._window = win
+        self.assertTrue(api._push({'state': 'idle'}, ''))
+        self.assertTrue(seen['in_flight'])
+        self.assertFalse(api._push_in_flight)
+        api._stopping = True
+        self.assertFalse(api._push({'state': 'idle'}, ''))
+        self.assertEqual(win.evaluate_js.call_count, 1)
+        self.assertFalse(api._push_in_flight)
 
 
 if __name__ == '__main__':

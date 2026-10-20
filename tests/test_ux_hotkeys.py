@@ -51,25 +51,53 @@ class _Harness(unittest.TestCase):
         p = mock.patch.object(ui_core, '_async_key_down', return_value=True)
         self.async_down = p.start()
         self.addCleanup(p.stop)
+        # Fake wall clock shared by events, suspension windows and latches.
+        self.clock = 1000.0
+        p = mock.patch.object(ui_core, '_now_wall',
+                              side_effect=lambda: self.clock)
+        p.start()
+        self.addCleanup(p.stop)
+        # No real WH_MOUSE_LL hook: record the per-binding handlers.
+        self.mouse_handlers = []
+        self.mouse_fail = False
+
+        def fake_mouse_hook(handler):
+            if self.mouse_fail:
+                raise RuntimeError('mouse hook install failed')
+            self.mouse_handlers.append(handler)
+            return handler
+        for attr, kwargs in (('hook', {'side_effect': fake_mouse_hook}),
+                             ('unhook', {})):
+            p = mock.patch.object(ui_core.mouse, attr, **kwargs)
+            p.start()
+            self.addCleanup(p.stop)
         self.km = KeybindManager(lambda: 0)
         self.fired = []
-        self.clock = 1000.0
 
     def bind(self, action, hotkey, scope='app'):
         return self.km.set(action, hotkey,
                            lambda a=action: self.fired.append(a), scope)
 
-    def _event(self, kind, name, t):
+    def _event(self, kind, name, t, now):
+        """`t` = when the key moved (event stamp); `now` = when the
+        listener processes it (defaults to t: a fresh event)."""
         if t is None:
             self.clock += 0.25
             t = self.clock
+        self.clock = t if now is None else now
         return keyboard.KeyboardEvent(kind, _sc(name), name, time=t)
 
-    def down(self, name, t=None):
-        return self.km._on_kb_event(self._event(keyboard.KEY_DOWN, name, t))
+    def down(self, name, t=None, now=None):
+        return self.km._on_kb_event(
+            self._event(keyboard.KEY_DOWN, name, t, now))
 
-    def up(self, name, t=None):
-        return self.km._on_kb_event(self._event(keyboard.KEY_UP, name, t))
+    def up(self, name, t=None, now=None):
+        return self.km._on_kb_event(
+            self._event(keyboard.KEY_UP, name, t, now))
+
+    def click(self, handler, kind, button, t):
+        """Feed one mouse button event, stamped `t`, to a mouse handler."""
+        return handler(mouse.ButtonEvent(kind, button, t))
 
     def tap(self, name):
         self.down(name)
@@ -187,29 +215,39 @@ class MouseDoubleIsAPress(_Harness):
     double-click interval of ANY previous button event as 'double'
     instead of 'down', so Stop (Mouse 5) right after a click was lost."""
 
-    def _bind_with_real_on_button(self, action, binding):
-        handlers = []
-        with mock.patch.object(ui_core.mouse._listener, 'add_handler',
-                               side_effect=handlers.append):
-            self.assertTrue(self.bind(action, binding, scope='game'))
-        self.assertEqual(len(handlers), 1)
-        return handlers[0]
+    def _bind_mouse(self, action, binding):
+        """Bind and return the handler the listener would call with every
+        mouse event (registered through mouse.hook)."""
+        self.assertTrue(self.bind(action, binding, scope='game'))
+        self.assertEqual(len(self.mouse_handlers), 1)
+        return self.mouse_handlers[0]
 
     def test_double_typed_press_fires(self):
-        handler = self._bind_with_real_on_button('macro_stop', 'mouse:x2')
+        handler = self._bind_mouse('macro_stop', 'mouse:x2')
         handler(mouse.ButtonEvent(mouse.DOUBLE, mouse.X2, time.time()))
         self.assertEqual(self.settle(), ['macro_stop'])
 
     def test_down_fires_and_release_does_not(self):
-        handler = self._bind_with_real_on_button('macro_play', 'mouse:x')
+        handler = self._bind_mouse('macro_play', 'mouse:x')
         handler(mouse.ButtonEvent(mouse.DOWN, mouse.X, time.time()))
         handler(mouse.ButtonEvent(mouse.UP, mouse.X, time.time()))
         self.assertEqual(self.settle(), ['macro_play'])
 
-    def test_other_buttons_ignored(self):
-        handler = self._bind_with_real_on_button('macro_play', 'mouse:x')
+    def test_other_buttons_and_moves_ignored(self):
+        handler = self._bind_mouse('macro_play', 'mouse:x')
         handler(mouse.ButtonEvent(mouse.DOUBLE, mouse.LEFT, time.time()))
+        handler(mouse.MoveEvent(10, 20, time.time()))
+        handler(mouse.WheelEvent(1, time.time()))
         self.assertEqual(self.settle(), [])
+
+    def test_handler_never_returns_truthy(self):
+        """GenericListener stops at the first truthy handler -- that would
+        starve MacroController's recording hook."""
+        handler = self._bind_mouse('macro_play', 'mouse:x')
+        for kind in (mouse.DOWN, mouse.UP, mouse.DOUBLE):
+            self.assertFalse(
+                handler(mouse.ButtonEvent(kind, mouse.X, time.time())))
+        self.settle()
 
 
 class LeftClickIsNeverABinding(_Harness):
@@ -227,11 +265,9 @@ class LeftClickIsNeverABinding(_Harness):
                              (None, 'left_click_reserved'), action)
 
     def test_set_refuses_left_click_and_keeps_old_binding(self):
-        with mock.patch.object(ui_core.mouse, 'on_button',
-                               return_value='mouse-hook') as on_button:
-            self.assertTrue(self.bind('macro_play', 'mouse:x'))
-            self.assertFalse(self.bind('macro_play', 'mouse:left'))
-        on_button.assert_called_once()
+        self.assertTrue(self.bind('macro_play', 'mouse:x'))
+        self.assertFalse(self.bind('macro_play', 'mouse:left'))
+        self.assertEqual(len(self.mouse_handlers), 1)   # nothing new hooked
         self.assertEqual(self.km.get_bindings()['macro_play'], 'mouse:x')
 
     def test_other_mouse_buttons_still_allowed(self):
@@ -454,28 +490,161 @@ class SetKeepsOldBindingOnInstallFailure(_Harness):
     remove the binding that was working."""
 
     def test_mouse_install_failure_keeps_previous(self):
-        def on_button(cb, buttons, types):
-            if buttons == ['right']:
-                raise RuntimeError('hook failed')
-            return ('handle', tuple(buttons))
-        with mock.patch.object(ui_core.mouse, 'on_button',
-                               side_effect=on_button), \
-                mock.patch.object(ui_core.mouse, 'unhook') as unhook:
-            self.assertTrue(self.bind('macro_play', 'mouse:x'))
-            self.assertFalse(self.bind('macro_play', 'mouse:right'))
-        unhook.assert_not_called()
+        self.assertTrue(self.bind('macro_play', 'mouse:x'))
+        self.mouse_fail = True
+        self.assertFalse(self.bind('macro_play', 'mouse:right'))
+        ui_core.mouse.unhook.assert_not_called()
         self.assertEqual(self.km.get_bindings()['macro_play'], 'mouse:x')
         self.assertIn('macro_play', self.km._mouse_hooks)
 
     def test_keyboard_hook_failure_keeps_previous(self):
-        with mock.patch.object(ui_core.mouse, 'on_button',
-                               return_value='handle'), \
-                mock.patch.object(ui_core.mouse, 'unhook'):
-            self.assertTrue(self.bind('macro_play', 'mouse:x'))
+        self.assertTrue(self.bind('macro_play', 'mouse:x'))
         with mock.patch.object(ui_core.keyboard, 'hook',
                                side_effect=RuntimeError('hook failed')):
             self.assertFalse(self.bind('macro_play', 'f6'))
         self.assertEqual(self.km.get_bindings()['macro_play'], 'mouse:x')
+
+
+class TransactionalApply(_Harness):
+    """BU4: _install_keybinds used clear_all() then set(); with the mouse
+    hook failing, install AND rollback failed and Play/Stop vanished."""
+
+    def desired(self, **bindings):
+        return {a: (hk, (lambda a=a: self.fired.append(a)), 'game')
+                for a, hk in bindings.items()}
+
+    def test_unchanged_bindings_are_not_reinstalled(self):
+        want = self.desired(macro_play='mouse:x', macro_stop='mouse:x2',
+                            macro_record='y')
+        self.assertTrue(self.km.apply(want))
+        self.assertEqual(len(self.mouse_handlers), 2)
+        handles = dict(self.km._mouse_hooks)
+        self.assertTrue(self.km.apply(dict(want)))
+        self.assertEqual(len(self.mouse_handlers), 2)      # no re-hook
+        self.assertEqual(self.km._mouse_hooks, handles)
+        ui_core.mouse.unhook.assert_not_called()
+
+    def test_persistent_mouse_hook_failure_keeps_play_and_stop(self):
+        self.assertTrue(self.km.apply(self.desired(
+            macro_play='mouse:x', macro_stop='mouse:x2', macro_record='y')))
+        self.mouse_fail = True                  # every mouse.hook raises now
+        self.assertFalse(self.km.apply(self.desired(
+            macro_play='mouse:right', macro_stop='mouse:x2',
+            macro_record='y')))
+        self.assertEqual(self.km.get_bindings()['macro_play'], 'mouse:x')
+        self.assertEqual(self.km.get_bindings()['macro_stop'], 'mouse:x2')
+        # Rolling back to the old map is a no-op that succeeds.
+        self.assertTrue(self.km.apply(self.desired(
+            macro_play='mouse:x', macro_stop='mouse:x2', macro_record='y')))
+        h_play = self.km._mouse_hooks['macro_play']
+        self.click(h_play, mouse.DOWN, mouse.X, self.clock)
+        self.assertEqual(self.settle(), ['macro_play'])
+
+    def test_only_removed_actions_are_cleared(self):
+        self.km.apply(self.desired(macro_play='mouse:x', macro_save='u'))
+        self.km.apply(self.desired(macro_play='mouse:x'))
+        self.assertEqual(self.km.get_bindings(), {'macro_play': 'mouse:x'})
+        self.km.apply(self.desired(macro_play=''))
+        self.assertEqual(self.km.get_bindings(), {})
+
+
+class CapturedPressDeliveredLate(_Harness):
+    """BU5: the browser captures F8, rebind + capture_end complete, and
+    only THEN does the listener process that native F8 DOWN -- which used
+    to fire Start/Stop."""
+
+    def test_keyboard_press_inside_window_dropped_after_resume(self):
+        self.bind('start_stop', 'f8')
+        self.km.suspend(token=1)                 # prompt opens at 1000.0
+        self.clock = 1000.6
+        self.km.resume(token=1)                  # prompt closed
+        self.down('f8', t=1000.4, now=1000.7)    # pressed inside, seen late
+        self.up('f8', t=1000.5, now=1000.75)
+        self.assertEqual(self.settle(), [])
+        self.down('f8', t=1001.5)                # a real press afterwards
+        self.assertEqual(self.settle(), ['start_stop'])
+
+    def test_mouse_press_inside_window_dropped_after_resume(self):
+        self.bind('macro_stop', 'mouse:x2', scope='game')
+        handler = self.mouse_handlers[0]
+        self.km.suspend(token=1)
+        self.clock = 1000.6
+        self.km.resume(token=1)
+        self.click(handler, mouse.DOWN, mouse.X2, 1000.4)
+        self.click(handler, mouse.UP, mouse.X2, 1000.5)
+        self.assertEqual(self.settle(), [])
+        self.click(handler, mouse.DOWN, mouse.X2, 1001.0)
+        self.assertEqual(self.settle(), ['macro_stop'])
+
+    def test_expired_window_still_covers_presses_inside_it(self):
+        self.bind('pause', 'f9')
+        self.km.suspend(token=1, seconds=0.0)    # expires immediately
+        self.down('f9', t=1000.0, now=1005.0)    # stamped at the edge
+        self.assertEqual(self.settle(), [])
+
+    def test_windows_are_bounded(self):
+        for i in range(50):
+            self.clock = 1000.0 + i
+            self.km.suspend(token=2 * i + 1)
+            self.clock += 0.5
+            self.km.resume(token=2 * i + 1)
+        self.assertLessEqual(len(self.km._susp_windows),
+                             KeybindManager._SUSPENSION_WINDOWS_KEPT)
+
+    def test_latch_ignores_the_captured_key_until_release(self):
+        self.bind('start_stop', 'f8')
+        self.clock = 2000.0
+        self.assertTrue(self.km.latch_until_release('start_stop'))
+        self.down('f8', t=1999.9, now=2000.2)     # the captured press
+        for i in range(10):                       # its auto-repeat
+            self.down('f8', t=2000.3 + i * 0.03)
+        self.assertEqual(self.settle(), [])
+        self.up('f8', t=2001.0)
+        self.down('f8', t=2001.5)
+        self.assertEqual(self.settle(), ['start_stop'])
+
+    def test_latch_never_swallows_a_new_press(self):
+        self.bind('start_stop', 'f8')
+        self.clock = 2000.0
+        self.km.latch_until_release('start_stop')   # key already released
+        self.down('f8', t=2000.5)
+        self.assertEqual(self.settle(), ['start_stop'])
+
+    def test_mouse_latch(self):
+        self.bind('macro_stop', 'mouse:x2', scope='game')
+        handler = self.mouse_handlers[0]
+        self.clock = 2000.0
+        self.km.latch_until_release('macro_stop')
+        self.click(handler, mouse.DOWN, mouse.X2, 1999.9)    # captured
+        self.assertEqual(self.settle(), [])
+        self.click(handler, mouse.DOWN, mouse.X2, 2000.5)    # new press
+        self.assertEqual(self.settle(), ['macro_stop'])
+
+
+class BackloggedPressUsesEventStreamModifiers(_Harness):
+    """BU6: GetAsyncKeyState is the state NOW. Hold Ctrl 2 s, press F8,
+    release Ctrl while processing lags: asking Windows when F8 is finally
+    processed turned Ctrl+F8 into bare F8."""
+
+    def setUp(self):
+        super().setUp()
+        self.bind('start_stop', 'f8')
+        self.bind('pause', 'ctrl+f8')
+        self.async_down.return_value = False      # Ctrl is up by now
+        self.async_down.reset_mock()
+
+    def test_backlogged_press_trusts_the_event_stream(self):
+        self.down('ctrl', t=100.0)
+        self.down('f8', t=102.0, now=102.5)       # processed 0.5 s late
+        self.assertEqual(self.settle(), ['pause'])
+        self.async_down.assert_not_called()
+
+    def test_stale_modifier_reconciled_on_next_fresh_press(self):
+        self.down('ctrl', t=100.0)
+        self.down('f8', t=102.0, now=102.5)       # backlog: Ctrl+F8
+        self.up('f8', t=102.6)
+        self.down('f8', t=400.0)                  # fresh: Windows asked
+        self.assertEqual(self.settle(), ['pause', 'start_stop'])
 
 
 @unittest.skipIf(ui_mod is None, 'ui.py not importable here')
@@ -492,16 +661,22 @@ class BridgeRebindValidatesBeforeSaving(unittest.TestCase):
         self.save = p.start()
         self.addCleanup(p.stop)
         # No real WH_MOUSE_LL hook in tests; buttons listed in
-        # `fail_buttons` simulate a transient install failure.
+        # `fail_buttons` simulate a transient install failure,
+        # `fail_all_mouse` a persistent one.
         self.fail_buttons = set()
+        self.fail_all_mouse = False
 
-        def on_button(cb, buttons, types):
-            if set(buttons) & self.fail_buttons:
+        def mouse_hook(handler):
+            if (self.fail_all_mouse
+                    or getattr(handler, 'button', None) in self.fail_buttons):
                 raise RuntimeError('hook install failed')
-            return ('mouse-handle', tuple(buttons))
-        for attr, kwargs in (('on_button', {'side_effect': on_button}),
-                             ('unhook', {})):
-            p = mock.patch.object(ui_core.mouse, attr, **kwargs)
+            return handler
+        for target, attr, kwargs in (
+                (ui_core.mouse, 'hook', {'side_effect': mouse_hook}),
+                (ui_core.mouse, 'unhook', {}),
+                (ui_core, 'is_allowed_foreground', {'return_value': True}),
+                (ui_core, 'is_allowed_game_only', {'return_value': True})):
+            p = mock.patch.object(target, attr, **kwargs)
             p.start()
             self.addCleanup(p.stop)
         api = mock.MagicMock()
@@ -523,18 +698,10 @@ class BridgeRebindValidatesBeforeSaving(unittest.TestCase):
                      '_active_macro_index'):
             setattr(api, name, functools.partial(getattr(bridge, name), api))
         api._capture_token = bridge._capture_token
-
-        def install():                     # mirrors BridgeApi._install_keybinds
-            api._keybinds.clear_all()
-            for action, hk in api._settings['keybinds'].items():
-                api._keybinds.set(action, hk, lambda: None)
-            for pos, item in enumerate(api._settings['macro_active_macros'],
-                                       start=1):
-                if item.get('slot') and item.get('hotkey'):
-                    api._keybinds.set(f'macro_active_{pos}', item['hotkey'],
-                                      lambda: None, scope='game')
-        api._install_keybinds.side_effect = install
-        install()
+        # The REAL _install_keybinds (BU4 is about its transactionality).
+        api._install_keybinds = functools.partial(
+            bridge._install_keybinds, api)
+        api._install_keybinds()
         self.api = api
         self.bridge = bridge
 
@@ -623,6 +790,74 @@ class BridgeRebindValidatesBeforeSaving(unittest.TestCase):
         self.assertTrue(self.api._keybinds.is_suspended())
         self.assertTrue(self.bridge.capture_end(self.api, 10))
         self.assertFalse(self.api._keybinds.is_suspended())
+
+    # BU4: persistent mouse-hook failure.
+
+    def mouse_bindings(self):
+        b = self.api._keybinds.get_bindings()
+        return {a: b.get(a) for a in ('macro_play', 'macro_stop',
+                                      'macro_active_1')}
+
+    KEPT = {'macro_play': 'mouse:x', 'macro_stop': 'mouse:x2',
+            'macro_active_1': 'mouse:middle'}
+
+    def test_rebind_with_mouse_hook_down_keeps_play_and_stop(self):
+        self.fail_all_mouse = True
+        res = self.rebind('macro_play', {'mouseButton': 'right'})
+        self.assertEqual(res, {'ok': False, 'reason': 'install_failed'})
+        self.assertEqual(self.mouse_bindings(), self.KEPT)
+        self.assertEqual(self.api._settings['keybinds']['macro_play'],
+                         'mouse:x')
+        self.save.assert_not_called()
+
+    def test_active_rebind_with_mouse_hook_down_keeps_everything(self):
+        self.fail_all_mouse = True
+        res = self.bridge.macro_set_active_hotkey(
+            self.api, 1, {'mouseButton': 'right'})
+        self.assertEqual(res, {'ok': False, 'reason': 'install_failed'})
+        self.assertEqual(self.mouse_bindings(), self.KEPT)
+        self.save.assert_not_called()
+
+    def test_keyboard_rebind_while_mouse_hook_down_leaves_mouse_alone(self):
+        self.fail_all_mouse = True
+        self.assertEqual(self.rebind('start_stop', {'key': 'F7'}), 'f7')
+        self.assertEqual(self.mouse_bindings(), self.KEPT)
+
+    # BU5: the captured press, delivered to the listener only after the
+    # rebind and capture_end, must not fire the new binding.
+
+    def _late_press(self, name, stamp):
+        km = self.api._keybinds
+        km._on_kb_event(keyboard.KeyboardEvent(
+            keyboard.KEY_DOWN, _sc(name), name, time=stamp))
+        km._dispatch_q.join()
+
+    def _release(self, name):
+        self.api._keybinds._on_kb_event(keyboard.KeyboardEvent(
+            keyboard.KEY_UP, _sc(name), name, time=time.time()))
+
+    def test_captured_press_processed_late_does_not_fire_rebind(self):
+        self.assertTrue(self.bridge.capture_begin(self.api, 20))
+        pressed = time.time()                     # native F7 DOWN stamp
+        self.assertEqual(self.rebind('start_stop', {'key': 'F7'}), 'f7')
+        self.assertTrue(self.bridge.capture_end(self.api, 20))
+        self._late_press('f7', pressed)           # listener catches up
+        self.api._hotkey_start_stop.assert_not_called()
+        self._release('f7')
+        self._late_press('f7', time.time())       # a real press later
+        self.api._hotkey_start_stop.assert_called_once()
+
+    def test_captured_press_processed_late_does_not_fire_active(self):
+        self.assertTrue(self.bridge.capture_begin(self.api, 30))
+        pressed = time.time()
+        res = self.bridge.macro_set_active_hotkey(self.api, 1, {'key': 'F6'})
+        self.assertEqual(res, {'ok': True, 'hotkey': 'f6'})
+        self.assertTrue(self.bridge.capture_end(self.api, 30))
+        self._late_press('f6', pressed)
+        self.api._hotkey_macro_active.assert_not_called()
+        self._release('f6')
+        self._late_press('f6', time.time())
+        self.api._hotkey_macro_active.assert_called_once_with(1)
 
 
 _NODE = shutil.which('node')
