@@ -359,7 +359,7 @@ const MAIN = {
     modeRequest: false,   // a mode-switch confirm is open
     tipDismissed: false,
     runStartedAt: 0,      // epoch seconds from Python
-    runEndedAt: 0,        // local epoch seconds when the run went idle
+    runEndedAt: 0,        // local epoch seconds when the run went idle (-1: ended unseen)
     lanesSig: '',
     progSig: '',
     debug: false,
@@ -554,9 +554,15 @@ function clearStartPending() {
     MAIN.startPending = null;
 }
 
-function beginStartPending() {
+// `hideError`: this click is a Start — hide the previous last_error for
+// the life of the attempt (see renderBotNotice / endStartPendingNow).
+function beginStartPending(hideError) {
     clearStartPending();
     const s = STATE.lastStatus || {};
+    if (hideError) {
+        MAIN.suppressError = String(s.last_error || '').trim();
+        renderBotNotice();
+    }
     MAIN.startPending = {
         state: s.state || 'idle',
         lastError: s.last_error || '',
@@ -582,8 +588,17 @@ function settleStartPending() {
     p.timer = setTimeout(endStartPendingNow, wait);
 }
 
+// The attempt resolved (state moved, the bridge refused, or the pending
+// timeout ran out): whatever last_error says now is this attempt's
+// answer. Python can clear and re-set the SAME error inside one 50 ms
+// drain tick, so waiting for the text to change could hide a repeated
+// failure forever.
 function endStartPendingNow() {
     clearStartPending();
+    if (MAIN.suppressError !== null) {
+        MAIN.suppressError = null;
+        renderBotNotice();
+    }
     renderStartButtons(STATE.lastStatus || {});
 }
 
@@ -608,11 +623,11 @@ function macroIsBusy() {
 $('#btn-start').addEventListener('click', async () => {
     if (!acceptStartClick()) return;
     const s = STATE.lastStatus || {};
-    if (!botIsRunning()) {
-        // A retry must never show the previous failure next to "Playing":
-        // hide the notice now and keep it hidden until last_error moves.
-        MAIN.suppressError = s.last_error || '';
-        renderBotNotice();
+    // A retry must never show the previous failure next to "Playing":
+    // a Start hides the notice until the attempt resolves (or last_error
+    // moves) — see beginStartPending / endStartPendingNow.
+    const starting = !botIsRunning();
+    if (starting) {
         // If a macro is busy and the bot is currently idle, this click
         // would start the bot. Confirm so the user knows the macro will
         // be killed.
@@ -622,7 +637,7 @@ $('#btn-start').addEventListener('click', async () => {
                 `A macro is ${verb}. Stop it and start the bot?`,
                 { ok: 'Stop macro and start' });
             if (!ok) return;
-            beginStartPending();
+            beginStartPending(true);
             const res = await callApi('start_stop_force');
             if (res && res.ok === false) {
                 endStartPendingNow();
@@ -635,7 +650,7 @@ $('#btn-start').addEventListener('click', async () => {
             return;
         }
     }
-    beginStartPending();
+    beginStartPending(starting);
     const ok = await callApi('start_stop');
     if (ok === false) endStartPendingNow();
 });
@@ -703,8 +718,8 @@ function renderStageText() {
     renderLaneHint();
 }
 
-// Bot error notice (last_error). Hidden since the last Start click until
-// Python reports a different value.
+// Bot error notice (last_error). Hidden from a Start click until Python
+// reports a different value or the start attempt resolves.
 function renderBotNotice() {
     const s = STATE.lastStatus || {};
     const err = String(s.last_error || '').trim();
@@ -799,7 +814,8 @@ function fmtElapsed(secs) {
 
 function renderElapsed() {
     const el = $('#st-elapsed');
-    if (!MAIN.runStartedAt) {
+    // runEndedAt < 0: the run ended before it was ever seen live.
+    if (!MAIN.runStartedAt || MAIN.runEndedAt < 0) {
         setText(el, '—');
         return;
     }
@@ -1285,7 +1301,7 @@ const MACRO = {
     lastActionAt: 0,
     noticeLead: '',
     noticeErr: '',
-    localErr: null,        // {lead, msg, until} shown from a bridge refusal
+    localErr: null,        // {lead, msg, until, state, seen} shown from a bridge refusal
     localErrTimer: null,
     hint: { text: '', until: 0, timer: null },
 };
@@ -1304,6 +1320,9 @@ const _MACRO_REFUSAL_TEXT = {
     busy: 'Another macro command is still running — try again.',
     empty_buffer: 'Nothing to play — record or load a macro first.',
     empty_slot: 'That slot is empty.',
+    // Active Play during playback with the Ignore policy.
+    playing: 'Another macro is playing and Ignore keeps it running — choose Interrupt to switch.',
+    already_playing: 'That macro is already playing.',
 };
 
 // Show a bridge refusal in the macro notice right away instead of
@@ -1311,6 +1330,7 @@ const _MACRO_REFUSAL_TEXT = {
 // as macro_error). Returns true when something was shown. `bot_running`
 // is handled by the caller's confirm; `closing` needs no notice.
 function explainMacroRefusal(action, res) {
+    if (res && res.ok === true) clearMacroLocalErr();
     if (!res || res.ok !== false) return false;
     const reason = String(res.reason || '');
     if (reason === 'bot_running' || reason === 'closing' || reason === 'stale') return false;
@@ -1322,12 +1342,31 @@ function explainMacroRefusal(action, res) {
 }
 
 function showMacroError(lead, msg) {
-    MACRO.localErr = { lead, msg, until: Date.now() + LOCAL_ERR_MS };
+    const s = STATE.lastStatus || {};
+    // `state` / `seen` let the status retire it (see renderMacroNotice).
+    MACRO.localErr = { lead, msg, until: Date.now() + LOCAL_ERR_MS,
+        state: s.macro_state || 'idle', seen: false };
     clearTimeout(MACRO.localErrTimer);
     MACRO.localErrTimer = setTimeout(() => {
         MACRO.localErr = null;
+        MACRO.localErrTimer = null;
         renderMacroNotice(STATE.lastStatus || {});
     }, LOCAL_ERR_MS + 50);
+    renderMacroNotice(STATE.lastStatus || {});
+}
+
+// The bridge refusal is only a stand-in until the status catches up, so
+// it must never outlive a later success: "Play didn't start" next to
+// "Playing". Called on every successful macro command.
+function dropMacroLocalErr() {
+    clearTimeout(MACRO.localErrTimer);
+    MACRO.localErrTimer = null;
+    MACRO.localErr = null;
+}
+
+function clearMacroLocalErr() {
+    if (!MACRO.localErr) return;
+    dropMacroLocalErr();
     renderMacroNotice(STATE.lastStatus || {});
 }
 
@@ -1501,12 +1540,18 @@ function renderActiveMacroRows(status) {
 
         const slotReady = !!item.slot && occupied.has(item.slot);
         const isRecording = s.macro_state === 'recording';
+        // While a macro plays, Play stays usable (Interrupt policy) but
+        // the row's configuration waits until playback ends. (Recording
+        // locks the whole card instead, see renderMacroState.)
+        const isPlaying = s.macro_state === 'playing';
         const isPlayingThis = playingActive && playingSlot && playingSlot === item.slot;
         setClass(row, 'active-playing', !!isPlayingThis);
         setClass(row, 'assigned', !!item.slot || !!item.hotkey);
         setDisabled(row.querySelector('.active-play'), !slotReady || isRecording);
-        setDisabled(cap, isRecording);
-        setDisabled(row.querySelector('.active-clear'), !item.slot && !item.hotkey);
+        setDisabled(select, isPlaying);
+        setDisabled(cap, isRecording || isPlaying);
+        setDisabled(row.querySelector('.active-clear'),
+            isPlaying || (!item.slot && !item.hotkey));
     });
 }
 
@@ -1530,6 +1575,7 @@ $$('.active-macro-row').forEach((row) => {
     row.querySelector('.active-slot').addEventListener('change', (ev) => {
         callApi('macro_set_active_slot', pos, parseInt(ev.target.value, 10))
             .then((res) => {
+                if (res && res.ok === true) clearMacroLocalErr();
                 if (res && res.ok === false) {
                     STATE.activeRenderSig = '';
                     renderActiveMacroRows(STATE.lastStatus || {});
@@ -1642,17 +1688,37 @@ async function slotAction(act, n) {
             showMacroHint(`Slot ${n} is empty — use "Save here" to store the current macro there.`);
             return;
         }
-        const loss = macroUnsavedSummary();
-        if (loss) {
-            const ok = await dlgConfirm(`Load slot ${n}${label}?`,
-                `This replaces the current macro, and you have ${loss} that will be lost.`,
-                { ok: 'Load and discard', danger: true, focusCancel: true });
-            if (!ok) return;
+        // The buffer revision is pinned when the confirm opens: a macro
+        // recorded meanwhile (in-game hotkey) makes Python refuse with
+        // 'stale' instead of discarding work the user never saw. Each
+        // refusal asks again about what is there now.
+        let note = '';
+        for (;;) {
+            if (macroIsBusy()) {
+                const st = (STATE.lastStatus || {}).macro_state;
+                showMacroHint(`Stop ${st === 'recording' ? 'recording' : 'playback'} before using the slots.`);
+                return;
+            }
+            const cur = STATE.lastStatus || {};
+            const loss = macroUnsavedSummary();
+            let expected = null;
+            if (loss) {
+                expected = typeof cur.macro_rev === 'number' ? cur.macro_rev : null;
+                const ok = await dlgConfirm(`Load slot ${n}${label}?`,
+                    `This replaces the current macro, and you have ${loss} that will be lost.`,
+                    { ok: 'Load and discard', danger: true, focusCancel: true, note });
+                if (!ok) return;
+            }
+            noteMacroAction('load');
+            const res = await callApi('macro_load_slot', n, expected);
+            if (res && res.ok === false && res.reason === 'stale' && expected !== null) {
+                note = 'The macro changed while the last question was open, so nothing was loaded.';
+                continue;
+            }
+            if (res && res.ok) discardEditorEdits();
+            explainMacroRefusal('load', res);
+            return;
         }
-        noteMacroAction('load');
-        const res = await callApi('macro_load_slot', n);
-        if (res && res.ok) discardEditorEdits();
-        else explainMacroRefusal('load', res);
     } else if (act === 'save') {
         openSaveDialog(n);
     } else if (act === 'rename') {
@@ -1664,7 +1730,9 @@ async function slotAction(act, n) {
             { label: 'Name', value: existing, ok: 'Rename' });
         if (name === null) return;
         noteMacroAction('rename');
-        callApi('macro_rename_slot', n, name);
+        callApi('macro_rename_slot', n, name).then((res) => {
+            if (res && res.ok === true) clearMacroLocalErr();
+        });
     } else if (act === 'clear') {
         if (!occupied) {
             showMacroHint(`Slot ${n} is already empty.`);
@@ -1689,7 +1757,7 @@ async function slotAction(act, n) {
         noteMacroAction('clear');
         const res = await callApi('macro_clear_slot', n);
         if (res && res.ok) noteUnassigned(n, res);
-        else explainMacroRefusal('clear', res);
+        explainMacroRefusal('clear', res);
     }
 }
 
@@ -1839,6 +1907,7 @@ async function openSaveDialog(preSlot) {
         explainMacroRefusal('save', res);
         return;
     }
+    clearMacroLocalErr();
     // Saving to a new slot changes the buffer's identity (rev + loaded
     // slot) without touching its events. An editor that fetched this
     // same revision can simply follow: its local edits still apply, and
@@ -1871,6 +1940,7 @@ $('#macro-record').addEventListener('click', async () => {
     const after = (res) => {
         if (starting && res && res.ok) discardEditorEdits();
         if (starting) explainMacroRefusal('record', res);
+        else if (res && res.ok === true) clearMacroLocalErr();
     };
     const res = await callApi('macro_toggle_record', false);
     if (res && res.ok === false && res.reason === 'bot_running') {
@@ -1904,10 +1974,26 @@ $('#macro-play').addEventListener('click', async () => {
     explainMacroRefusal('play', res);
 });
 
-$('#macro-stop-play').addEventListener('click', () => callApi('macro_stop'));
+$('#macro-stop-play').addEventListener('click', () => {
+    callApi('macro_stop').then((res) => {
+        if (res && res.ok === true) clearMacroLocalErr();
+    });
+});
 
 function renderMacroNotice(s) {
     const err = String(s.macro_error || '').trim();
+    const le = MACRO.localErr;
+    if (le) {
+        // The status contradicts the cached refusal: the macro went on
+        // to play / record after all (in-game hotkey, retry), or Python
+        // published the error and has cleared it since.
+        const st = s.macro_state || 'idle';
+        if (err) le.seen = true;
+        if ((!err && le.seen)
+                || (st !== le.state && (st === 'playing' || st === 'recording'))) {
+            dropMacroLocalErr();
+        }
+    }
     const local = (MACRO.localErr && Date.now() < MACRO.localErr.until)
         ? MACRO.localErr : null;
     if (!err && !local) {
@@ -1999,14 +2085,19 @@ function renderMacroState(s) {
     setDisabled($('#macro-play'), stateLabel !== 'idle' || bufferEvents === 0);
     setDisabled($('#macro-stop-play'), !playing);
 
-    // Locks (#26): saved + active cards while recording or playing.
+    // Locks (#26): the saved card locks while recording or playing (see
+    // renderMacroSlots); the active card only while recording. During
+    // playback its Play buttons and the Ignore / Interrupt policy stay
+    // live — Interrupt exists to switch macros mid-playback — and only
+    // the configuration (slot, Bind, Clear) is disabled per row in
+    // renderActiveMacroRows.
     const busy = recording || playing;
     const activeCard = $('#active-macros-card');
-    setClass(activeCard, 'locked', busy);
-    activeCard.setAttribute('aria-disabled', busy ? 'true' : 'false');
+    setClass(activeCard, 'locked', recording);
+    activeCard.setAttribute('aria-disabled', recording ? 'true' : 'false');
     const activeSub = activeCard.querySelector('.card-sub');
     if (activeSub && STATE.activeCapturing === null) {
-        setText(activeSub, busy ? `unavailable while ${stateLabel}`
+        setText(activeSub, recording ? 'unavailable while recording'
             : ((activeSub.dataset && activeSub.dataset.default) || ''));
     }
     if (busy && captureArmed()) cancelCapture();
@@ -2170,7 +2261,22 @@ function renderEvtCount() {
     setText($('#evt-count'), `${n} in the working macro`);
 }
 
+// Alt+F4 / taskbar Close are answered by Python's native close guard,
+// which can't see these local edits (its buffer is clean until Save).
+// Mirror the flag whenever it flips; every jsDirty change (edit, save,
+// discard, hide, re-fetch) ends in updateEvtButtons. Not cached until
+// the bridge exists, so a reload re-sends it.
+let _editorDirtySent = null;
+
+function syncEditorDirty() {
+    const dirty = !!(evtState.visible && evtState.jsDirty);
+    if (dirty === _editorDirtySent || !api()) return;
+    _editorDirtySent = dirty;
+    callApi('macro_set_editor_dirty', dirty).catch(() => {});
+}
+
 function updateEvtButtons() {
+    syncEditorDirty();
     const visible = evtState.visible;
     const s = STATE.lastStatus || {};
     const busy = s.macro_state === 'recording' || s.macro_state === 'playing';
@@ -2309,6 +2415,7 @@ $('#evt-discard').addEventListener('click', async () => {
     if (!ok) return;
     evtState.jsDirty = false;
     evtState.editRev += 1;          // an in-flight fetch must not be skipped
+    updateEvtButtons();
     fetchAndShowEvents();
 });
 
@@ -2439,6 +2546,7 @@ $('#evt-save').addEventListener('click', () => {
                     res.message || res.reason || 'See the Logs tab.');
                 return;
             }
+            clearMacroLocalErr();
             const dropped = parseInt(res.dropped, 10) || 0;
             if (dropped > 0) {
                 dlgAlert('Some rows were dropped',
@@ -2495,6 +2603,7 @@ const LOG_KNOWN_TAGS = new Set(['album', 'bot', 'macro', 'serial', 'ui']);
 const LOG = {
     lines: 0,       // line elements in the pane
     stick: true,    // follow new output (last known, survives tab hides)
+    userOff: false, // Follow switched off with the toggle: only the toggle (or Clear) turns it back on
     partial: null,  // trailing line element not yet terminated by '\n'
     partialText: '',
     filter: '',
@@ -2558,6 +2667,7 @@ $('#btn-clear-log').addEventListener('click', () => {
     LOG.lines = 0;
     LOG.partial = null;
     LOG.partialText = '';
+    LOG.userOff = false;
     setLogFollow(true);
     callApi('clear_log');
 });
@@ -2565,12 +2675,16 @@ $('#btn-clear-log').addEventListener('click', () => {
 $('#log-pane').addEventListener('scroll', () => {
     const pane = $('#log-pane');
     if (pane.clientHeight === 0) return;   // hidden tab — keep last value
+    // An explicit "Follow off" wins over the view sitting at the bottom
+    // (also over the late scroll event of our own scroll-to-bottom).
+    if (LOG.userOff) return;
     const at = logPaneAtBottom(pane);
     if (at !== LOG.stick) setLogFollow(at);
 });
 
 $('#log-follow').addEventListener('click', () => {
     const next = !LOG.stick;
+    LOG.userOff = !next;
     setLogFollow(next);
     if (next) {
         const pane = $('#log-pane');
@@ -2640,7 +2754,13 @@ $('#btn-copy-log').addEventListener('click', () => {
 window.appendLog = function appendLog(text) {
     if (!text) return;
     const pane = $('#log-pane');
-    const stick = pane.clientHeight > 0 ? logPaneAtBottom(pane) : LOG.stick;
+    // Follow is authoritative: once it is off an append never turns it
+    // back on, even with the view at the bottom. Only the toggle does —
+    // or, when Follow went off by scrolling up, scrolling back down to
+    // the end by hand (scroll listener). While on, a view the user is
+    // scrolling away from (scroll event not dispatched yet) is not
+    // yanked back.
+    const stick = LOG.stick && (pane.clientHeight === 0 || logPaneAtBottom(pane));
     // A chunk may end mid-line; the open line is re-rendered when the
     // rest arrives so its time / tag columns parse correctly.
     let buf = LOG.partialText + text;
@@ -2683,10 +2803,7 @@ window.appendLog = function appendLog(text) {
             LOG.lines -= 1;
         }
     }
-    if (stick) {
-        pane.scrollTop = pane.scrollHeight;
-        if (!LOG.stick) setLogFollow(true);
-    }
+    if (stick) pane.scrollTop = pane.scrollHeight;
 };
 
 window.updateStatus = function updateStatus(data) {
@@ -2708,11 +2825,15 @@ window.updateStatus = function updateStatus(data) {
         const started = parseFloat(data.run_started_at) || 0;
         if (started !== MAIN.runStartedAt) {
             MAIN.runStartedAt = started;
-            MAIN.runEndedAt = 0;
+            // A start that first arrives while the bot is not live was
+            // never seen running (a run that failed within one drain
+            // tick, or a page reload): its end is unknown, show '—'.
+            MAIN.runEndedAt = (started && !botLive) ? -1 : 0;
         }
     }
-    const wasLive = prev.state === 'running' || prev.state === 'paused';
-    if (wasLive && !botLive && MAIN.runStartedAt && !MAIN.runEndedAt) {
+    // Any non-live state freezes an unfinalized clock — whether or not a
+    // live state was ever observed in between.
+    if (!botLive && MAIN.runStartedAt && !MAIN.runEndedAt) {
         MAIN.runEndedAt = Date.now() / 1000;   // freeze the final elapsed
     }
     if (!botLive && !MAIN.runStartedAt) MAIN.runEndedAt = 0;

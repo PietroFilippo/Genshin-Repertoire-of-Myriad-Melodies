@@ -1043,6 +1043,61 @@ class DirectionABridgeTests(unittest.TestCase):
         api._ask_discard_unsaved_macro.assert_called_once()
         self.assertFalse(api._detached)
 
+    def test_allow_close_asks_for_unsaved_editor_edits(self):
+        """G1: Alt+F4 / taskbar Close never reach the page's confirm, and
+        the editor's local edits are not in Python's (clean) buffer — the
+        native gate must count the mirrored editor flag."""
+        api = self.make_api()
+        api._macro = self._macro_with()               # clean buffer
+        api._ask_discard_unsaved_macro = mock.Mock(return_value=False)
+        self.assertIs(api.macro_set_editor_dirty(True), True)
+        self.assertFalse(api.allow_close())           # No → cancel
+        api._ask_discard_unsaved_macro.assert_called_once()
+        api.macro_set_editor_dirty(False)             # saved / discarded
+        api._ask_discard_unsaved_macro.reset_mock()
+        self.assertTrue(api.allow_close())
+        api._ask_discard_unsaved_macro.assert_not_called()
+
+    def test_close_confirmed_skips_prompt_for_editor_edits(self):
+        api = self.make_api()
+        api._macro = self._macro_with()
+        api.macro_set_editor_dirty(True)
+        api._ask_discard_unsaved_macro = mock.Mock(return_value=False)
+
+        class FakeWindow:
+            def destroy(self_inner):
+                if api.allow_close():
+                    api._detached = True
+
+        api._window = FakeWindow()
+        self.assertTrue(api.close(True))
+        api._ask_discard_unsaved_macro.assert_not_called()
+
+    def test_native_prompt_text_names_editor_edits(self):
+        seen = []
+
+        def message_box(owner, text, title, flags):
+            seen.append(text)
+            return 7                              # IDNO
+
+        # A function takes the argtypes / restype assignments.
+        fake_user32 = mock.NonCallableMock(MessageBoxW=message_box)
+        for dirty, head in ((False, 'Discard unsaved macro changes and '
+                                    'close?'),
+                            (True, 'Discard the unsaved macro and close?')):
+            with self.subTest(buffer_dirty=dirty):
+                seen.clear()
+                api = self.make_api()
+                api._hwnd_cache = 1
+                api._macro = self._macro_with(dirty=dirty)
+                api.macro_set_editor_dirty(True)
+                with mock.patch.object(ui.ctypes, 'WinDLL',
+                                       return_value=fake_user32):
+                    self.assertFalse(api._ask_discard_unsaved_macro())
+                self.assertEqual(len(seen), 1)
+                self.assertTrue(seen[0].startswith(head), seen[0])
+                self.assertIn('events editor', seen[0])
+
     def test_pywebview_closing_false_cancels(self):
         """The installed pywebview must treat a False return from a
         `closing` handler as cancel — the close gate relies on it."""

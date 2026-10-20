@@ -543,6 +543,10 @@ class BridgeApi:
         # dialog → close(confirmed=True), or the native prompt) so the
         # close isn't asked about twice. See allow_close.
         self._close_confirmed = False
+        # The page's events editor holds local edits Python's buffer
+        # doesn't have yet (mirrored by macro_set_editor_dirty) — the
+        # native close guard must count them too.
+        self._editor_dirty = False
         # Set first thing in detach(): every start path, the backend
         # switch and _get_arduino refuse from then on.
         self._tearing_down = False
@@ -1208,6 +1212,15 @@ class BridgeApi:
             events, expected_rev=expected_rev, expected_slot=expected_slot,
             persist=bool(persist)))
 
+    def macro_set_editor_dirty(self, dirty):
+        """The events editor gained / lost local edits that are not in
+        the macro buffer yet (JS mirrors its flag on every flip; cleared
+        on save, discard and hide). Only the titlebar close can ask about
+        them in the page; Alt+F4 / taskbar Close reach allow_close
+        without JS, so it reads this mirror."""
+        self._editor_dirty = bool(dirty)
+        return True
+
     def macro_get_active_config(self):
         with self._lock:
             return {
@@ -1578,8 +1591,14 @@ class BridgeApi:
         return False
 
     def _macro_has_unsaved_work(self):
-        """Recording in progress, or the macro buffer is dirty (unsaved
-        changes) — the same rule the page's in-app close confirm uses."""
+        """Recording in progress, the macro buffer is dirty (unsaved
+        changes), or the events editor holds unsaved edits — the same
+        rule the page's in-app close confirm uses."""
+        return (self._macro_buffer_unsaved()
+                or bool(getattr(self, '_editor_dirty', False)))
+
+    def _macro_buffer_unsaved(self):
+        """Recording in progress, or the macro buffer is dirty."""
         try:
             if self._macro.state() == MacroController.STATE_RECORDING:
                 return True
@@ -1604,10 +1623,20 @@ class BridgeApi:
                          == MacroController.STATE_RECORDING)
         except Exception:
             recording = False
-        detail = ('A macro recording is still in progress.' if recording
-                  else 'The current macro has unsaved changes — save it '
-                       'to a slot first to keep it.')
-        text = f'Discard the unsaved macro and close?\n\n{detail}'
+        buffer_unsaved = recording or self._macro_buffer_unsaved()
+        details = []
+        if recording:
+            details.append('A macro recording is still in progress.')
+        elif buffer_unsaved:
+            details.append('The current macro has unsaved changes — save '
+                           'it to a slot first to keep it.')
+        if getattr(self, '_editor_dirty', False):
+            details.append('The events editor has edits that were not '
+                           'saved — press Save changes in the editor to '
+                           'keep them.')
+        head = ('Discard the unsaved macro and close?' if buffer_unsaved
+                else 'Discard unsaved macro changes and close?')
+        text = head + ('\n\n' + '\n'.join(details) if details else '')
         MB_YESNO, MB_ICONWARNING, MB_DEFBUTTON2 = 0x4, 0x30, 0x100
         MB_SETFOREGROUND, MB_TOPMOST = 0x10000, 0x40000
         IDYES = 6

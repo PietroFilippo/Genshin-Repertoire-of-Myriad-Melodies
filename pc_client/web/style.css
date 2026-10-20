@@ -1206,6 +1206,8 @@ button.key:disabled { color: var(--ink-3); }
 .active-macro-row.active-playing .am-letter { color: var(--gold-ink); background: var(--ok); border-color: var(--ok); }
 .active-macro-row .sel, .active-macro-row .sel select { width: 100%; min-width: 0; }
 .active-macro-row .sel select { height: 28px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+/* slot choice locked while a macro plays (the row's Play stays live) */
+.active-macro-row .sel select:disabled { color: var(--ink-3); cursor: not-allowed; }
 .active-macro-row .key { display: block; height: 28px; line-height: 22px; max-width: none; }
 
 .hint { font-size: 12px; color: var(--ink-2); margin-top: 8px; line-height: 1.35; }
