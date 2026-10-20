@@ -156,6 +156,11 @@ class AlbumRunner:
         # cleared). Lets a generic failure message avoid overwriting a
         # specific one already on screen (e.g. "window closed").
         self._last_error = ''
+        # album_progress state (reset + first emitted at run() start).
+        self._progress = {'index': 0, 'total': 0,
+                          'difficulty': self.difficulties[0],
+                          'difficulties': list(self.difficulties),
+                          'results': []}
         # Set before anything can raise so close() is always safe.
         self._saved_mouse = None
         self._owns_controller = False
@@ -381,12 +386,14 @@ class AlbumRunner:
     def _next_song(self):
         """Click the next song on the album wheel. One retry if the
         click didn't land (the Arduino backend's `move_to` can miss
-        convergence). Returns True once a click went through; False on
-        stop or a second miss (reported as last_error)."""
+        convergence). Returns True once a click went through and the
+        wheel settled; False on stop (including during the settle wait)
+        or a second miss (reported as last_error)."""
         for attempt in range(2):
             if self.watcher.click_ref(*ALBUM_NEXT_SONG_XY):
-                self.watcher.stop_wait(0.8)
-                return True
+                # Settle wait — Stop here must propagate, otherwise the
+                # final wheel reset would report the run as completed.
+                return not self.watcher.stop_wait(0.8)
             if self.stop_evt.is_set():
                 return False
             if attempt == 0:
@@ -465,6 +472,8 @@ class AlbumRunner:
             print("\nrolling wheel back to first song")
             if not self._next_song():
                 return self._halt_result()
+        if self.stop_evt.is_set():
+            return RESULT_STOPPED
         return RESULT_COMPLETED
 
     # --- main loop ----------------------------------------------------------
@@ -502,6 +511,53 @@ class AlbumRunner:
                           "coords).",
                           None if self._last_error else MSG_SONG_FAILED)
 
+    # --- album_progress (UI progress bar; see ui-data-contract.md) ----------
+    #
+    # status_cb({'album_progress': {index, total, difficulty,
+    # difficulties, results}}): `index` is the 1-based position being
+    # played (0 before the first), `results` has one entry per FINISHED
+    # position: 'played' (>=1 difficulty actually played), 'skipped'
+    # (every chosen difficulty skipped at Canorus) or 'failed'. A position
+    # cut short by Stop isn't finished, so it gets no entry. Emitted at
+    # run start, when each position starts, when each further difficulty
+    # within it starts, and when it finishes. Every emit is a fresh copy,
+    # so later appends can't mutate a snapshot the UI already holds.
+
+    def _progress_reset(self, total):
+        self._progress = {'index': 0, 'total': total,
+                          'difficulty': self.difficulties[0],
+                          'difficulties': list(self.difficulties),
+                          'results': []}
+        self._emit_progress()
+
+    def _emit_progress(self):
+        p = self._progress
+        self._emit({'album_progress': {
+            'index': p['index'], 'total': p['total'],
+            'difficulty': p['difficulty'],
+            'difficulties': list(p['difficulties']),
+            'results': list(p['results'])}})
+
+    def _progress_position(self, index, difficulty):
+        self._progress['index'] = index
+        self._progress['difficulty'] = difficulty
+        self._emit_progress()
+
+    def _progress_difficulty(self, difficulty):
+        self._progress['difficulty'] = difficulty
+        self._emit_progress()
+
+    def _progress_finish(self, outcome):
+        self._progress['results'].append(outcome)
+        self._emit_progress()
+
+    def _position_halted(self, result, position_open=True):
+        """A started position ended early: record 'failed' unless it was
+        a Stop (unfinished positions get no entry). Returns `result`."""
+        if position_open and result == RESULT_FAILED:
+            self._progress_finish('failed')
+        return result
+
     def _await_resume(self):
         """Block while pause_evt is set; bail out if stop fires. Called at
         safe boundaries between songs."""
@@ -521,6 +577,7 @@ class AlbumRunner:
         if songs_count is None:
             songs_count = ALBUM_SONG_COUNT
         songs_count = max(1, min(int(songs_count), ALBUM_SONG_COUNT))
+        self._progress_reset(songs_count)
 
         # The UI tags any Standalone→Album switch made while Standalone
         # was running as a mid-song hand-off, but the user may already
@@ -607,6 +664,8 @@ class AlbumRunner:
             print(f"\n--- Song {i+1}/{songs_count} "
                   f"[{self.difficulty}] ---")
             self._emit({'song': f'{i+1}/{songs_count}'})
+            # One difficulty: position start == difficulty start.
+            self._progress_position(i + 1, self.difficulty)
             skipped = False
             if not self.replay_canorus and not mid_song_iter:
                 frame = self.watcher.grab()
@@ -618,10 +677,11 @@ class AlbumRunner:
                 print("  playing")
                 if not self.song_player.play(self.difficulty,
                                              skip_intro=mid_song_iter):
-                    return self._song_failed()
+                    return self._position_halted(self._song_failed())
                 halt = self._after_song()
                 if halt is not None:
-                    return halt
+                    return self._position_halted(halt)
+            self._progress_finish('skipped' if skipped else 'played')
 
             # Advance to the next song — not after the last one (see
             # the wheel rule above; _finish_wheel handles the 12th).
@@ -666,9 +726,12 @@ class AlbumRunner:
                 print("\nstop requested — exiting album loop")
                 return RESULT_STOPPED
 
+            position_open = False
+            played_any = False
             for d_idx, diff in enumerate(diffs):
                 if not self._song_boundary():
-                    return self._halt_result()
+                    return self._position_halted(self._halt_result(),
+                                                 position_open)
 
                 self.difficulty = diff
                 mid_song_iter = (i == 0 and d_idx == 0
@@ -676,6 +739,11 @@ class AlbumRunner:
 
                 print(f"\n--- Song {i+1}/{songs_count} [{diff}] ---")
                 self._emit({'song': f'{i+1}/{songs_count} [{diff}]'})
+                if not position_open:
+                    self._progress_position(i + 1, diff)
+                    position_open = True
+                else:
+                    self._progress_difficulty(diff)
 
                 if not self.replay_canorus and not mid_song_iter:
                     frame = self.watcher.grab()
@@ -685,15 +753,18 @@ class AlbumRunner:
 
                 print("  playing")
                 if not self.song_player.play(self.difficulty, skip_intro=mid_song_iter):
-                    return self._song_failed()
+                    return self._position_halted(self._song_failed())
 
                 # Mid-song pause may have left the results screen up.
                 halt = self._after_song()
                 if halt is not None:
-                    return halt
+                    return self._position_halted(halt)
+                played_any = True
 
                 # Intentionally NO _next_song here — next iter of the
                 # difficulty loop plays the same song at the next diff.
+
+            self._progress_finish('played' if played_any else 'skipped')
 
             # All difficulties for this position done. Advance wheel to
             # the next position UNLESS this was the last one.

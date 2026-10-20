@@ -27,7 +27,11 @@ threads.
 Geometry: region + scales live in one tuple swapped atomically by
 `update_geometry()`, so the end-of-song watcher thread never reads a
 new `scale_x` paired with an old `region` while the album thread is
-tracking a windowed game that was moved or resized.
+tracking a windowed game that was moved or resized. Each swap bumps
+`generation`; a caller that matched on a frame and clicks later passes
+the generation it captured at, and the click is refused if the
+geometry changed in between (its local coords would be for the old
+window — e.g. landing outside a game that just shrank).
 """
 import ctypes
 import ctypes.wintypes
@@ -82,7 +86,8 @@ class ScreenWatcher:
             raise ValueError("ScreenWatcher requires a stop_evt — "
                              "use threading.Event() if there's no "
                              "external one to thread through")
-        self._geom = (dict(region), scale_x, scale_y)
+        # (region, scale_x, scale_y, generation) — see module docstring.
+        self._geom = (dict(region), scale_x, scale_y, 0)
         self.controller = controller
         self.stop_evt = stop_evt
         self.templates = templates
@@ -105,13 +110,20 @@ class ScreenWatcher:
     def scale_y(self):
         return self._geom[2]
 
+    @property
+    def generation(self):
+        """Bumped by every `update_geometry`. Read it BEFORE `grab()` and
+        pass it to `click_local(..., generation=)` so a click computed
+        from a frame of the old geometry is refused."""
+        return self._geom[3]
+
     def update_geometry(self, region, scale_x, scale_y):
         """Swap in a new capture region + scales (game window moved or
         resized). Single tuple assignment, so concurrent readers see
         either the old geometry or the new one, never a mix. Templates
         are caller-owned: on a resolution change the caller rescales its
         `templates` dict in place."""
-        self._geom = (dict(region), scale_x, scale_y)
+        self._geom = (dict(region), scale_x, scale_y, self._geom[3] + 1)
 
     # --- capture + coord helpers -------------------------------------------
 
@@ -128,14 +140,14 @@ class ScreenWatcher:
     def ref_to_screen(self, x, y):
         """Convert 1080p reference (x, y) to absolute screen coords
         (suitable for `controller.move_to`)."""
-        region, sx, sy = self._geom
+        region, sx, sy, _ = self._geom
         return (int(x * sx) + region['left'],
                 int(y * sy) + region['top'])
 
     def ref_rect_to_local(self, ref_x, ref_y, ref_w, ref_h):
         """Convert a 1080p reference rectangle to capture-region-
         local coords (suitable as a ROI for `match()`)."""
-        _, sx, sy = self._geom
+        _, sx, sy, _ = self._geom
         return (int(ref_x * sx), int(ref_y * sy),
                 int(ref_w * sx), int(ref_h * sy))
 
@@ -174,16 +186,21 @@ class ScreenWatcher:
 
     # --- clicks -------------------------------------------------------------
 
-    def click_screen(self, sx, sy):
+    def click_screen(self, sx, sy, generation=None):
         """Move cursor to absolute screen coords (sx, sy), then click.
         Cancellable: bails after `move_to` if stop_evt is set so the
         Arduino backend's iterative convergence can abort cleanly.
 
         Returns True if the click was issued, False if it wasn't — stop
-        fired, or `move_to` didn't converge (clicking wherever the
-        cursor happened to stop could hit the wrong UI element). Callers
-        treat False like a missed click; check `stop_evt.is_set()` to
-        tell the two apart (same escape hatch as `move_to`)."""
+        fired, `move_to` didn't converge (clicking wherever the cursor
+        happened to stop could hit the wrong UI element), or
+        `generation` was given and the geometry changed before the
+        button went down (target computed for the old window). Callers
+        treat False like a missed click; check `stop_evt.is_set()` /
+        `generation` to tell the cases apart (same escape hatch as
+        `move_to`)."""
+        if self._stale(generation):
+            return False
         converged = self.controller.move_to(int(sx), int(sy),
                                             stop_evt=self.stop_evt)
         if self.stop_evt.is_set():
@@ -200,6 +217,10 @@ class ScreenWatcher:
         # the Arduino doesn't end the run with the button held.
         if self.stop_wait(CLICK_HOVER_S):
             return False
+        # Last chance to notice the window moved / resized while the
+        # cursor travelled (Arduino move_to can take ~600 ms).
+        if self._stale(generation):
+            return False
         self.controller.mouse_down('left')
         self.stop_wait(CLICK_HOLD_S)
         self.controller.mouse_up('left')
@@ -211,12 +232,26 @@ class ScreenWatcher:
         result."""
         return self.click_screen(*self.ref_to_screen(ref_x, ref_y))
 
-    def click_local(self, lx, ly):
+    def click_local(self, lx, ly, generation=None):
         """Click at a capture-region-local position (e.g. the (cx, cy)
-        a `match()` call returned). Returns `click_screen`'s result."""
-        region = self._geom[0]
+        a `match()` call returned). Pass the `generation` read before
+        the `grab()` that produced (lx, ly): if the geometry has changed
+        since, the click is refused (returns False) and the caller
+        should re-capture and re-match. Returns `click_screen`'s result."""
+        region, _, _, current = self._geom
+        if generation is not None and generation != current:
+            self._stale(generation)
+            return False
         return self.click_screen(lx + region['left'],
-                                 ly + region['top'])
+                                 ly + region['top'],
+                                 generation=generation)
+
+    def _stale(self, generation):
+        if generation is None or generation == self._geom[3]:
+            return False
+        print("    click SKIPPED — game window moved/resized since the "
+              "frame was captured")
+        return True
 
     # --- waits --------------------------------------------------------------
 

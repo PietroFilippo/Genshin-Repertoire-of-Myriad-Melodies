@@ -478,10 +478,21 @@ class SongPlayer:
                         print("  game window resized — rebuilding the "
                               "detector for the new lane layout")
                     stop_detection()
+                    # Teardown joins threads (up to ~0.5 s per lane +
+                    # 2 s viz) — Stop, Pause or the song ending may have
+                    # landed meanwhile. Re-check at the loop top instead
+                    # of starting a detector that would press keys after
+                    # Stop.
+                    if (self.stop_evt.is_set() or self.pause_evt.is_set()
+                            or watcher_evt.is_set()):
+                        continue
                     start_detection(layout)
                 elif (st['viz_thread'] is not None
                       and self.region != st['viz_region']):
                     stop_viz()
+                    if (self.stop_evt.is_set() or self.pause_evt.is_set()
+                            or watcher_evt.is_set()):
+                        continue
                     start_viz()
 
                 watcher_evt.wait(GEOMETRY_POLL_S)
@@ -514,7 +525,7 @@ class SongPlayer:
                     stop_evt=vs, debug_evt=self.debug_evt,
                     fps_callback=(lambda f: self._emit({'fps': f}))
                                   if self.status_cb else None,
-                    pin_console=False)
+                    pin_console=False, game_hwnd=self.hwnd)
             except Exception as e:
                 print(f"[viz] worker died: {e}")
 
@@ -538,16 +549,37 @@ class SongPlayer:
                     return
                 if self.stop_evt.is_set():
                     return
+            if self._click_select_song_if_shown():
+                local_stop.set()
+                return
+
+    def _click_select_song_if_shown(self, max_recaptures=3):
+        """Match Select Song and click it. Returns True once clicked.
+
+        The album thread can swap the watcher's geometry (window moved /
+        resized) between our grab and our click; the match's local
+        coords would then be applied to the new window — a resize could
+        put the click outside the game. Tag the capture with the
+        watcher's geometry generation (read BEFORE grabbing), let
+        `click_local` refuse a stale click, and re-capture right away."""
+        for _ in range(max_recaptures):
+            gen = self.watcher.generation
             res = self._find_select_song()
-            if res is not None:
-                _, (cx, cy) = res
-                if self.watcher.click_local(cx, cy):
-                    local_stop.set()
-                    return
-                if self.stop_evt.is_set():
-                    return
-                print("  WARN: Select Song click didn't land — retrying "
-                      "on the next poll")
+            if res is None:
+                return False
+            _, (cx, cy) = res
+            if self.watcher.click_local(cx, cy, generation=gen):
+                return True
+            if self.stop_evt.is_set():
+                return False
+            if self.watcher.generation != gen:
+                print("  game window moved/resized before the Select Song "
+                      "click — re-capturing")
+                continue
+            print("  WARN: Select Song click didn't land — retrying "
+                  "on the next poll")
+            return False
+        return False
 
     def _find_select_song(self, frame=None):
         if frame is None:

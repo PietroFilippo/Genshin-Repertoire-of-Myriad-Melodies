@@ -83,6 +83,28 @@ def _foreground_hwnd():
     return _user32.GetForegroundWindow() or 0
 
 
+# The most recently started NoteDetector that hasn't been stopped — the
+# UI's live lane strip reads it via `active_lanes()`. Plain module global:
+# set in start(), cleared in stop() only if it still points at that
+# detector, so when detectors are recycled (pause/resume, geometry
+# rebuild) and two exist briefly, the newest wins.
+_active_detector = None
+
+
+def active_lanes():
+    """Live held state of the six lanes, in KEYS order (a s d j k l), from
+    the currently running detector; all False when none is running.
+
+    Called by the UI drain every ~50 ms. Lock-free and Win32-free: one
+    global read plus six dict lookups of bools the key threads write — it
+    adds nothing to the per-key 5 ms loops."""
+    det = _active_detector
+    if det is None:
+        return [False] * len(KEYS)
+    pressed = det.pressed
+    return [bool(pressed.get(k, False)) for k in KEYS]
+
+
 def _window_pid(hwnd):
     """Owning process id of `hwnd`, 0 on failure. Doesn't message the
     window, so it can't block on a busy game."""
@@ -127,7 +149,9 @@ class NoteDetector:
         self._game_pid = 0
 
     def start(self):
+        global _active_detector
         self._stop.clear()
+        _active_detector = self
         # Resolve the initial focus state synchronously so the key loops
         # never see a stale default before the focus thread's first tick.
         self._game_pid = _window_pid(self.hwnd)
@@ -152,7 +176,13 @@ class NoteDetector:
             self._threads.append(t)
 
     def stop(self):
+        global _active_detector
         self._stop.set()
+        # Unregister first so the lane strip goes dark immediately instead
+        # of showing stale lanes during the joins. Only if we're still the
+        # newest — a replacement may already have registered itself.
+        if _active_detector is self:
+            _active_detector = None
         for t in self._threads:
             t.join(timeout=0.5)
         self._threads.clear()

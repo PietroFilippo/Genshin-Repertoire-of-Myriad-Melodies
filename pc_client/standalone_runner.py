@@ -12,6 +12,7 @@ own detector + DEBUG_MODE-branch loop. See `pc_client/main.py`.
 import inspect
 import time
 import ctypes
+import ctypes.wintypes
 from collections import deque
 
 import cv2
@@ -23,7 +24,8 @@ from config import (KEYS, PIXEL_THRESHOLD, KEY_POLL_DELAY_S,
 from detector import NoteDetector
 from controller import ArduinoHIDController
 from game_window import (MSG_WINDOW_NOT_FOUND, find_game_window, auto_detect,
-                         get_game_geometry, scaled_layout)
+                         get_game_geometry, read_game_geometry,
+                         scaled_layout)
 
 try:
     from controller import ArduinoConnectionError
@@ -41,6 +43,205 @@ MSG_ARDUINO_UNAVAILABLE = ("Arduino not connected — plug it in or switch the "
 VIZ_EXIT_STOP = 'stop'
 VIZ_EXIT_PAUSE = 'pause'
 VIZ_EXIT_QUIT = 'quit'
+# The game window was resized (lane layout changed) — rebuild the detector
+# and re-enter with the new geometry. A plain move is handled in place.
+VIZ_EXIT_GEOMETRY = 'geometry'
+
+# Non-blocking geometry poll cadence during active play (window moved /
+# resized while a song runs) — same cadence as the album's SongPlayer.
+GEOMETRY_POLL_S = 0.5
+
+VIZ_WINDOW_TITLE = "Vision Context"
+# How often the preview re-asserts topmost (non-activating) and checks it
+# hasn't ended up as the foreground window. Off the detector hot path.
+VIZ_FOCUS_CHECK_S = 0.25
+
+
+# --- debug-preview window: never take focus from the game -----------------
+#
+# OpenCV's Win32 HighGUI shows its windows with activating calls
+# (namedWindow -> ShowWindow(SW_SHOW); setWindowProperty(TOPMOST) ->
+# SetWindowPos without SWP_NOACTIVATE). The detector only types while
+# Genshin is the foreground window, so a preview that grabs focus would
+# pause the bot — every time Debug is toggled on, and every song in album
+# mode (the preview is recreated per song / geometry change). So:
+#   1. After creating the preview, look up its HWND by title, add
+#      WS_EX_NOACTIVATE and keep it topmost with SetWindowPos +
+#      SWP_NOACTIVATE. OpenCV's activating TOPMOST setter is only used as
+#      a one-off fallback when the HWND can't be found.
+#   2. Safety net: if the preview is foreground anyway (creation already
+#      activated it, or a backend quirk), hand focus straight back — to
+#      whoever had it before the preview opened, later to the game.
+#      Same restore -> SetForegroundWindow -> SwitchToThisWindow pattern
+#      as ui_core.focus_game_window. Rate-limited to VIZ_FOCUS_CHECK_S in
+#      the viz loop; never on the detector's per-key hot path.
+# Side effect: keys typed "into" the preview no longer reach it, so 'q'
+# only works if the user explicitly focuses it; the window's X button
+# (and the UI's Debug toggle) still close it.
+#
+# Private user32 handle so these prototypes don't leak into the process-
+# global `ctypes.windll.user32` that ui.py / ui_core.py rely on.
+try:
+    _vu32 = ctypes.WinDLL('user32', use_last_error=True)
+    _H = ctypes.wintypes.HWND
+    _vu32.FindWindowW.argtypes = [ctypes.wintypes.LPCWSTR,
+                                  ctypes.wintypes.LPCWSTR]
+    _vu32.FindWindowW.restype = _H
+    _vu32.GetForegroundWindow.argtypes = []
+    _vu32.GetForegroundWindow.restype = _H
+    _vu32.GetWindowLongPtrW.argtypes = [_H, ctypes.c_int]
+    _vu32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    _vu32.SetWindowLongPtrW.argtypes = [_H, ctypes.c_int, ctypes.c_ssize_t]
+    _vu32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+    _vu32.SetWindowPos.argtypes = [_H, _H, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint]
+    _vu32.SetWindowPos.restype = ctypes.wintypes.BOOL
+    _vu32.IsWindow.argtypes = [_H]
+    _vu32.IsWindow.restype = ctypes.wintypes.BOOL
+    _vu32.IsIconic.argtypes = [_H]
+    _vu32.IsIconic.restype = ctypes.wintypes.BOOL
+    _vu32.ShowWindow.argtypes = [_H, ctypes.c_int]
+    _vu32.ShowWindow.restype = ctypes.wintypes.BOOL
+    _vu32.SetForegroundWindow.argtypes = [_H]
+    _vu32.SetForegroundWindow.restype = ctypes.wintypes.BOOL
+    _vu32.SwitchToThisWindow.argtypes = [_H, ctypes.wintypes.BOOL]
+    _vu32.SwitchToThisWindow.restype = None
+except (AttributeError, OSError):
+    _vu32 = None
+
+_GWL_EXSTYLE = -20
+_WS_EX_NOACTIVATE = 0x08000000
+_HWND_TOPMOST = -1
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_SWP_NOACTIVATE = 0x0010
+_SW_RESTORE = 9
+
+
+def _viz_hwnd():
+    """HWND of our preview window, 0 if not found."""
+    if _vu32 is None:
+        return 0
+    try:
+        return _vu32.FindWindowW(None, VIZ_WINDOW_TITLE) or 0
+    except Exception:
+        return 0
+
+
+def _foreground_window():
+    if _vu32 is None:
+        return 0
+    try:
+        return _vu32.GetForegroundWindow() or 0
+    except Exception:
+        return 0
+
+
+def _keep_topmost(hwnd):
+    """Topmost without activating (unlike cv2's WND_PROP_TOPMOST)."""
+    if _vu32 is None or not hwnd:
+        return
+    try:
+        _vu32.SetWindowPos(hwnd, _HWND_TOPMOST, 0, 0, 0, 0,
+                           _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE)
+    except Exception:
+        pass
+
+
+def _make_non_activating(hwnd):
+    if _vu32 is None or not hwnd:
+        return
+    try:
+        ex = _vu32.GetWindowLongPtrW(hwnd, _GWL_EXSTYLE)
+        _vu32.SetWindowLongPtrW(hwnd, _GWL_EXSTYLE, ex | _WS_EX_NOACTIVATE)
+    except Exception as e:
+        print(f"[viz] couldn't make the preview non-activating: {e}")
+    _keep_topmost(hwnd)
+
+
+def _give_focus_to(hwnd):
+    """Hand the foreground back to `hwnd` (restore if minimized ->
+    SetForegroundWindow -> SwitchToThisWindow fallback). Windows allows it
+    because it only runs right after OUR preview became foreground.
+    Returns True if a focus change was requested."""
+    if _vu32 is None or not hwnd:
+        return False
+    try:
+        if not _vu32.IsWindow(hwnd):
+            return False
+        if _vu32.IsIconic(hwnd):
+            _vu32.ShowWindow(hwnd, _SW_RESTORE)
+        if not _vu32.SetForegroundWindow(hwnd):
+            _vu32.SwitchToThisWindow(hwnd, True)
+        return True
+    except Exception:
+        return False
+
+
+def _guard_viz_focus(viz_hwnd, game_hwnd):
+    """Safety net (rate-limited by the caller): keep the preview topmost
+    and, if it is the foreground window, give focus back to the game."""
+    if not viz_hwnd:
+        return
+    _keep_topmost(viz_hwnd)
+    if _foreground_window() != viz_hwnd:
+        return
+    target = game_hwnd or find_game_window()
+    if target and _give_focus_to(target):
+        print("[viz] debug preview took focus — handing it back to the game")
+
+
+def layout_changed(old, new):
+    """`old` / `new` are (capture_region, column_centers, hit_line_y).
+    True when the lane layout differs (resize) — the detector must be
+    rebuilt; False for a plain move."""
+    o_region, o_cols, o_hit = old
+    n_region, n_cols, n_hit = new
+    return (list(o_cols) != list(n_cols) or o_hit != n_hit
+            or o_region['width'] != n_region['width']
+            or o_region['height'] != n_region['height'])
+
+
+class GeometryTracker:
+    """Non-blocking tracker for a windowed game being moved / resized
+    during active play. `poll()` is cheap (`read_game_geometry` never
+    messages the game) — call it every ~GEOMETRY_POLL_S. Returns the new
+    (capture_region, column_centers, hit_line_y) when anything changed,
+    else None (no change, or the window isn't usable right now — keep
+    the last-known geometry)."""
+
+    def __init__(self, hwnd, capture_region, column_centers, hit_line_y,
+                 tag='[standalone]'):
+        self.hwnd = hwnd
+        self.tag = tag
+        self.set(capture_region, column_centers, hit_line_y)
+
+    def set(self, capture_region, column_centers, hit_line_y):
+        self.capture_region = dict(capture_region)
+        self.column_centers = list(column_centers)
+        self.hit_line_y = hit_line_y
+
+    @property
+    def current(self):
+        return self.capture_region, self.column_centers, self.hit_line_y
+
+    def poll(self):
+        geom = read_game_geometry(self.hwnd)
+        if geom is None:
+            return None
+        region, scale_x, scale_y = geom
+        cols, hit = scaled_layout(scale_x, scale_y)
+        new = (dict(region), cols, hit)
+        old = self.current
+        if new[0] == old[0] and new[1] == old[1] and new[2] == old[2]:
+            return None
+        what = 'resized' if layout_changed(old, new) else 'moved'
+        self.set(*new)
+        print(f"{self.tag} game window {what} — now "
+              f"{region['width']}x{region['height']} @ "
+              f"({region['left']},{region['top']})")
+        return self.current
 
 
 def make_fallback_arduino(cancel_evt=None):
@@ -72,7 +273,8 @@ def _accepts_kwarg(fn, name):
 
 def run_visualization(capture_region, column_centers, hit_line_y, detector,
                       stop_evt=None, debug_evt=None, fps_callback=None,
-                      pin_console=True, pause_evt=None):
+                      pin_console=True, pause_evt=None, game_hwnd=None,
+                      geometry_poll=None):
     """Debug visualization loop. Decoupled from detection — purely shows
     state. The detector threads update detector.pressed independently.
 
@@ -92,9 +294,17 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
         pause_evt: when set, exit cleanly so the caller can take down the
             detector and idle. Treated as a soft stop — caller decides
             whether to resume (re-enter this function) or quit.
+        game_hwnd: Genshin's HWND — where focus goes back to if the
+            preview ever ends up foreground (see the focus note above).
+        geometry_poll: optional callable() -> None | (capture_region,
+            column_centers, hit_line_y), e.g. `GeometryTracker.poll`.
+            Called every GEOMETRY_POLL_S whether debug is on or off. A
+            move retargets the capture in place; a resize returns
+            VIZ_EXIT_GEOMETRY so the caller rebuilds the detector.
 
     Returns why the loop exited: VIZ_EXIT_STOP (stop_evt), VIZ_EXIT_PAUSE
-    (pause_evt) or VIZ_EXIT_QUIT ('q' / window closed with no debug_evt).
+    (pause_evt), VIZ_EXIT_QUIT ('q' / window closed with no debug_evt) or
+    VIZ_EXIT_GEOMETRY (game window resized; see geometry_poll).
     """
     window_open = False
 
@@ -145,15 +355,32 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
     log_lines = deque(maxlen=LOG_MAX)
     prev_pressed = {k: False for k in KEYS}
 
+    viz = {'hwnd': 0, 'next_focus_check': 0.0}
+
     def open_window():
-        cv2.namedWindow("Vision Context", cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty("Vision Context", cv2.WND_PROP_TOPMOST, 1)
-        cv2.resizeWindow("Vision Context", *initial_window_size)
-        cv2.moveWindow("Vision Context", 0, 0)
+        prev_fg = _foreground_window()
+        cv2.namedWindow(VIZ_WINDOW_TITLE, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(VIZ_WINDOW_TITLE, *initial_window_size)
+        cv2.moveWindow(VIZ_WINDOW_TITLE, 0, 0)
+        hwnd = _viz_hwnd()
+        viz['hwnd'] = hwnd
+        viz['next_focus_check'] = 0.0   # check right after the 1st imshow
+        if hwnd:
+            _make_non_activating(hwnd)
+            # namedWindow's ShowWindow(SW_SHOW) may already have activated
+            # the preview — give focus back to whoever had it (the game, or
+            # the UI if the user just ticked Debug there).
+            if prev_fg and prev_fg != hwnd and _foreground_window() == hwnd:
+                _give_focus_to(prev_fg)
+        else:
+            # Preview HWND not found (non-Win32 HighGUI backend?) — fall
+            # back to OpenCV's own topmost flag, once, not per frame.
+            cv2.setWindowProperty(VIZ_WINDOW_TITLE, cv2.WND_PROP_TOPMOST, 1)
 
     def close_window():
+        viz['hwnd'] = 0
         try:
-            cv2.destroyWindow("Vision Context")
+            cv2.destroyWindow(VIZ_WINDOW_TITLE)
         except cv2.error:
             pass
         # Window gone → no more frames → zero the UI's FPS readout instead
@@ -166,6 +393,7 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
 
     exit_reason = VIZ_EXIT_STOP
     last_time = time.time()
+    next_geom_poll = time.time() + GEOMETRY_POLL_S
     with mss.mss() as sct:
         while True:
             if stop_evt is not None and stop_evt.is_set():
@@ -177,6 +405,22 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
                     window_open = False
                 exit_reason = VIZ_EXIT_PAUSE
                 break
+
+            # Track a windowed game being moved / resized mid-play.
+            if geometry_poll is not None and time.time() >= next_geom_poll:
+                next_geom_poll = time.time() + GEOMETRY_POLL_S
+                new_geom = geometry_poll()
+                if new_geom is not None:
+                    if layout_changed(
+                            (capture_region, column_centers, hit_line_y),
+                            new_geom):
+                        if window_open:
+                            close_window()
+                            window_open = False
+                        exit_reason = VIZ_EXIT_GEOMETRY
+                        break
+                    # Moved only: same layout, capture the new rectangle.
+                    capture_region = dict(new_geom[0])
 
             # Debug toggle: when off, drop the window and idle until on.
             if debug_evt is not None and not debug_evt.is_set():
@@ -200,7 +444,9 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             if pin_console:
                 hwnd_console = ctypes.windll.kernel32.GetConsoleWindow()
                 if hwnd_console:
-                    ctypes.windll.user32.SetWindowPos(hwnd_console, -1, 0, 0, 0, 0, 3)
+                    # 0x13 = NOSIZE|NOMOVE|NOACTIVATE: pin topmost without
+                    # pulling focus off the game (detector pauses then).
+                    ctypes.windll.user32.SetWindowPos(hwnd_console, -1, 0, 0, 0, 0, 0x13)
 
             screenshot = sct.grab(capture_region)
             frame = np.ascontiguousarray(np.array(screenshot)[:, :, :3])
@@ -284,15 +530,22 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
                             (log_x, 36 + n * 16),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
 
-            cv2.setWindowProperty("Vision Context", cv2.WND_PROP_TOPMOST, 1)
-            cv2.imshow("Vision Context", canvas)
+            cv2.imshow(VIZ_WINDOW_TITLE, canvas)
 
             key = cv2.waitKey(1) & 0xFF
+
+            # Topmost re-assert (non-activating) + focus safety net — see
+            # the note at the top of this module. Rate-limited.
+            now = time.time()
+            if now >= viz['next_focus_check']:
+                viz['next_focus_check'] = now + VIZ_FOCUS_CHECK_S
+                _guard_viz_focus(viz['hwnd'], game_hwnd)
+
             # X-button close — cv2 destroys the window; getWindowProperty
             # returns < 1 once it's gone. Treat the same as 'q'.
             try:
                 visible = cv2.getWindowProperty(
-                    "Vision Context", cv2.WND_PROP_VISIBLE)
+                    VIZ_WINDOW_TITLE, cv2.WND_PROP_VISIBLE)
             except cv2.error:
                 visible = 0
             user_closed = (key == ord('q')) or (visible < 1)
@@ -344,7 +597,9 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
     If pause_evt is provided and gets set, the detector is stopped
     (releasing all keys) and the function idles until pause_evt is
     cleared. On resume the game geometry is re-read (the window may have
-    moved / resized) and a fresh detector is spun up.
+    moved / resized) and a fresh detector is spun up. During play the
+    geometry is polled every GEOMETRY_POLL_S: a resize rebuilds the
+    detector, a move retargets the viz capture.
 
     `controller` lets the UI inject a long-lived InputBackend
     shared across bot runs + the macro tool (only one process can hold
@@ -391,8 +646,17 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
     if status_cb:
         fps_cb = lambda f: status_cb({'fps': f})
 
+    # Windowed Genshin can be moved / resized mid-play: the viz loop polls
+    # this every GEOMETRY_POLL_S (non-blocking). A move retargets the viz
+    # capture in place (the detector reads client-relative pixels, so it
+    # doesn't care); a resize exits the viz with VIZ_EXIT_GEOMETRY and we
+    # rebuild the detector for the new lane layout below.
+    tracker = GeometryTracker(hwnd, capture_region, column_centers,
+                              hit_line_y)
+
     try:
         while not _stopped():
+            capture_region, column_centers, hit_line_y = tracker.current
             detector = NoteDetector(hwnd, column_centers, hit_line_y,
                                     controller)
             if status_cb:
@@ -409,13 +673,20 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
                     capture_region, column_centers, hit_line_y,
                     detector, stop_evt=stop_evt,
                     debug_evt=debug_evt, fps_callback=fps_cb,
-                    pin_console=False, pause_evt=pause_evt)
+                    pin_console=False, pause_evt=pause_evt,
+                    game_hwnd=hwnd, geometry_poll=tracker.poll)
             finally:
                 print("Stopping detector")
                 detector.stop()
 
+            if _stopped():
+                break
+            if reason == VIZ_EXIT_GEOMETRY:
+                # Resized mid-play — tracker holds the new layout; loop
+                # back to build a detector for it.
+                continue
             # If we exited because of stop (not pause), we're done.
-            if _stopped() or reason != VIZ_EXIT_PAUSE:
+            if reason != VIZ_EXIT_PAUSE:
                 break
 
             # --- paused: idle until resume or stop ---
@@ -450,8 +721,9 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
                 print(f"[standalone] game window moved/resized — now "
                       f"{new_region['width']}x{new_region['height']} @ "
                       f"({new_region['left']},{new_region['top']})")
-            hwnd, capture_region = new_hwnd, new_region
-            column_centers, hit_line_y = new_cols, new_hit
+            hwnd = new_hwnd
+            tracker.hwnd = hwnd
+            tracker.set(new_region, new_cols, new_hit)
             # Loop back to spin up a fresh detector.
     finally:
         if own_controller:

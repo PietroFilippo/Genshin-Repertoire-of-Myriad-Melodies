@@ -18,7 +18,9 @@ from config import (DEBUG_MODE, KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS,
                     INPUT_BACKEND_DEFAULT)
 from detector import NoteDetector
 from game_window import find_game_window, auto_detect
-from standalone_runner import run_visualization
+from standalone_runner import (GEOMETRY_POLL_S, VIZ_EXIT_GEOMETRY,
+                               GeometryTracker, run_visualization,
+                               layout_changed)
 from system_setup import boost_timer, restore_timer, set_dpi_aware
 from ui_core import make_input_backend
 
@@ -81,18 +83,45 @@ def main():
           f"(poll {KEY_POLL_DELAY_S*1000:.0f}ms, strip {Y_SAMPLE_OFFSETS})")
     detector.start()
 
+    # Windowed Genshin can be moved / resized while we run. A move needs
+    # nothing (the detector reads client-relative pixels; the viz retargets
+    # its capture itself); a resize changes the lane layout, so rebuild the
+    # detector for it.
+    tracker = GeometryTracker(hwnd, capture_region, column_centers,
+                              hit_line_y, tag='[cli]')
+
+    def _rebuild_detector():
+        nonlocal detector
+        detector.stop()
+        _, cols, hit = tracker.current
+        detector = NoteDetector(hwnd, cols, hit, controller)
+        detector.start()
+
     try:
         if DEBUG_MODE:
-            print("DEBUG_MODE on - visualization window will open. Press 'q' to exit.")
-            run_visualization(capture_region, column_centers, hit_line_y, detector,
-                              pin_console=True)
+            print("DEBUG_MODE on - visualization window will open. Close it "
+                  "(X) or press Ctrl+C to exit.")
+            while True:
+                region, cols, hit = tracker.current
+                reason = run_visualization(region, cols, hit, detector,
+                                           pin_console=True, game_hwnd=hwnd,
+                                           geometry_poll=tracker.poll)
+                if reason != VIZ_EXIT_GEOMETRY:
+                    break
+                _rebuild_detector()
         else:
             print("DEBUG_MODE off - running headless. Ctrl+C to exit.")
             while True:
                 hwnd_console = ctypes.windll.kernel32.GetConsoleWindow()
                 if hwnd_console:
-                    ctypes.windll.user32.SetWindowPos(hwnd_console, -1, 0, 0, 0, 0, 3)
-                time.sleep(0.5)
+                    # 0x13 = NOSIZE|NOMOVE|NOACTIVATE: pin topmost without
+                    # pulling focus off the game (detector pauses then).
+                    ctypes.windll.user32.SetWindowPos(hwnd_console, -1, 0, 0, 0, 0, 0x13)
+                old = tracker.current
+                new = tracker.poll()
+                if new is not None and layout_changed(old, new):
+                    _rebuild_detector()
+                time.sleep(GEOMETRY_POLL_S)
     except KeyboardInterrupt:
         print("\nCtrl+C received")
     finally:
