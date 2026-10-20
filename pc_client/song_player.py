@@ -35,6 +35,7 @@ from config import (ALBUM_BEGIN_PERFORMANCE_XY, ALBUM_DIFFICULTY_COORDS,
                     PIXEL_THRESHOLD, Y_SAMPLE_OFFSETS)
 from detector import NoteDetector
 from game_window import scaled_layout
+from screen_watcher import REFUSED_NOT_IN_FRONT
 from standalone_runner import run_visualization
 
 
@@ -88,6 +89,10 @@ MSG_BEGIN_FAILED = ("The song didn't start after Begin Performance — check "
                     "the game, then press Start.")
 MSG_CLICK_FAILED = ("The mouse couldn't reach the {what} button — keep the "
                     "game window fully on screen, then press Start.")
+# A click refused because another window was over the target right before
+# mouse-down (alt-tab during the hover) — see ScreenWatcher.target_check_fn.
+MSG_GAME_NOT_IN_FRONT = ("Genshin wasn't in front — keep the game focused "
+                         "during Album mode, then press Start.")
 MSG_NO_RHYTHM = ("Rhythm minigame not detected — open a country album page, "
                  "then press Start.")
 MSG_UNKNOWN_SCREEN = ("Couldn't recognise the game screen after resuming — "
@@ -350,13 +355,20 @@ class SongPlayer:
         return SCREEN_RHYTHM
 
     def _click_failed(self, what, dump_tag):
-        """A click the watcher refused to issue (stop, or the cursor
-        never reached the target). Treated like a missed click."""
+        """A click the watcher refused to issue (stop, the cursor never
+        reached the target, or another window was in front of the game
+        at the target). Treated like a missed click."""
         if self.stop_evt.is_set():
             return None
-        print(f"  ERROR: {what} click skipped — the cursor never reached "
-              f"the button. Aborting song.")
-        self._fail(MSG_CLICK_FAILED.format(what=what))
+        if (getattr(self.watcher, 'last_refusal', None)
+                == REFUSED_NOT_IN_FRONT):
+            print(f"  ERROR: {what} click skipped — another window was in "
+                  f"front of the game. Aborting song.")
+            self._fail(MSG_GAME_NOT_IN_FRONT)
+        else:
+            print(f"  ERROR: {what} click skipped — the cursor never "
+                  f"reached the button. Aborting song.")
+            self._fail(MSG_CLICK_FAILED.format(what=what))
         self._dump(dump_tag)
         return None
 

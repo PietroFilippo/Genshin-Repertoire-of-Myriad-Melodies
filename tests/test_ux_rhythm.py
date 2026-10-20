@@ -499,6 +499,65 @@ class ScreenWatcherClicks(unittest.TestCase):
                                           generation=w.generation))
         self.assertIn('mouse_down', [c[0] for c in ctrl.snapshot()])
 
+    def _target_watcher(self, ctrl, check):
+        return screen_watcher.ScreenWatcher(
+            REGION_1080, 1.0, 1.0, ctrl, self.stop, templates={},
+            target_check_fn=check)
+
+    def test_no_mouse_down_when_another_window_is_in_front(self):
+        """RG9 — the receiver check runs right before mouse-down."""
+        ctrl = FakeInput()
+        w = self._target_watcher(ctrl, lambda x, y: False)
+        with _quiet():
+            self.assertFalse(w.click_ref(100, 100))
+        self.assertNotIn('mouse_down', [c[0] for c in ctrl.snapshot()])
+        self.assertEqual(w.last_refusal, screen_watcher.REFUSED_NOT_IN_FRONT)
+
+    def test_alt_tab_during_hover_blocks_mouse_down(self):
+        """RG9 — the game was in front when the cursor arrived; another app
+        covered the target during the hover."""
+        ctrl = FakeInput()
+        front = ['game']
+        w = self._target_watcher(ctrl, lambda x, y: front[0] == 'game')
+        real_wait = w.stop_wait
+
+        def hover(secs):
+            front[0] = 'browser'                     # alt-tab mid-hover
+            return real_wait(secs)
+
+        w.stop_wait = hover
+        with _quiet():
+            self.assertFalse(w.click_local(100, 100))
+        self.assertNotIn('mouse_down', [c[0] for c in ctrl.snapshot()])
+
+    def test_failing_target_check_refuses(self):
+        ctrl = FakeInput()
+
+        def broken(x, y):
+            raise OSError('boom')
+
+        w = self._target_watcher(ctrl, broken)
+        with _quiet():
+            self.assertFalse(w.click_ref(100, 100))
+        self.assertNotIn('mouse_down', [c[0] for c in ctrl.snapshot()])
+
+    def test_refusal_reason_is_per_click_and_per_thread(self):
+        ctrl = FakeInput()
+        ok = [False]
+        w = self._target_watcher(ctrl, lambda x, y: ok[0])
+        with _quiet():
+            w.click_ref(100, 100)
+            seen = []
+            t = threading.Thread(target=lambda: seen.append(w.last_refusal))
+            t.start()
+            t.join(2.0)
+            self.assertEqual(seen, [None])           # other thread: unset
+            ok[0] = True
+            self.assertTrue(w.click_ref(100, 100))
+        self.assertIsNone(w.last_refusal)
+        self.assertEqual([c[0] for c in ctrl.snapshot()].count('mouse_down'),
+                         1)
+
     def test_geometry_change_during_cursor_travel_aborts_click(self):
         """RR1 — resized while move_to was in flight."""
         ctrl = FakeInput()
@@ -521,6 +580,7 @@ class ScreenWatcherClicks(unittest.TestCase):
 
 GAME_PID = 7100      # the game process a run is bound to
 FOREIGN_PID = 9900   # some other app
+FOREIGN_HWND = 6464  # ... and its top-level window
 
 
 class FakeUser32:
@@ -549,6 +609,8 @@ class FakeUser32:
         self.open_fails = False
         self.opened = []
         self.closed = []
+        # What WindowFromPoint returns (None: the game window, if alive).
+        self.front = None
 
     @staticmethod
     def _h(hwnd):
@@ -610,6 +672,14 @@ class FakeUser32:
         if self.windows is not None:
             return self._h(hwnd) in self.windows
         return self.exists
+
+    def WindowFromPoint(self, point):
+        if self.front is not None:
+            return self.front
+        return self.find if self.find and self.IsWindow(self.find) else 0
+
+    def GetAncestor(self, hwnd, flags):
+        return self._h(hwnd)              # every modelled window is top-level
 
     def GetWindowThreadProcessId(self, hwnd, ref):
         ref._obj.value = self.owner(hwnd) if self.IsWindow(hwnd) else 0
@@ -824,16 +894,71 @@ class GameWindowGeometry(unittest.TestCase):
             r.classify(stop)
         self.assertLess(time.time() - started, 1.0)
 
-    def test_unreadable_pid_never_follows_anything(self):
+    def test_unreadable_pid_refuses_to_bind_a_run(self):
+        """RG7 — no established PID, no run (after the retries)."""
         fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
         fake.owners[GAME_HWND] = 0                    # PID unreadable
-        with mock.patch.object(game_window, '_PID_READ_RETRY_S', 0):
-            r = self.ref(fake)
-        self.assertEqual((r.pid, r.handle), (0, None))
-        self.assertTrue(r.alive())                    # IsWindow alone
-        fake.recreate(NEW_HWND, (1280, 720))
+        self._patch(fake)
+        with mock.patch.object(game_window, '_PID_READ_RETRY_S', 0), \
+                _quiet(), \
+                self.assertRaises(game_window.GameWindowUnavailable) as ctx:
+            game_window.GameWindowRef(GAME_HWND)
+        self.assertEqual(str(ctx.exception),
+                         game_window.MSG_WINDOW_NOT_FOUND)
+        self.assertEqual(fake.opened, [])
+
+    def test_unreadable_owner_later_is_not_ours(self):
+        """RG4 — once bound, an owner that can't be read is NOT the game:
+        no click, the run ends (only an exact PID match is ALIVE)."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        r = self.ref(fake)
+        fake.owners[GAME_HWND] = 0
+        fake.exited = False
+        self.assertFalse(r.alive())
         self.assertEqual(r.classify(), self.CHANGED)
-        self.assertEqual(r.hwnd, GAME_HWND)
+
+    def test_open_process_falls_back_to_synchronize_only(self):
+        """RG5 — the anti-cheat denies the query right: SYNCHRONIZE alone
+        still gives a handle that can be waited on (and pins the PID)."""
+        asked = []
+
+        class K32:
+            def OpenProcess(self, access, inherit, pid):
+                asked.append(access)
+                return 77 if access == game_window._SYNCHRONIZE else None
+
+        with mock.patch.object(game_window, '_k32', K32()):
+            self.assertEqual(game_window._open_process(GAME_PID), 77)
+        self.assertEqual(asked, [game_window._SYNCHRONIZE
+                                 | game_window._PROCESS_QUERY_LIMITED_INFORMATION,
+                                 game_window._SYNCHRONIZE])
+
+        class Denied:
+            def OpenProcess(self, access, inherit, pid):
+                return None
+
+        with mock.patch.object(game_window, '_k32', Denied()):
+            self.assertIsNone(game_window._open_process(GAME_PID))
+
+    def test_owns_point_checks_the_window_under_the_cursor(self):
+        """RG9 — the receiver of a click at a point is the top-level window
+        under it; it must belong to the game's process."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080),
+                                   NEW_HWND: (800, 600)})
+        fake.recycle(NEW_HWND)                        # another app
+        r = self.ref(fake)
+        self.assertTrue(r.owns_point(500, 500))
+        fake.front = NEW_HWND
+        self.assertFalse(r.owns_point(500, 500))
+        fake.front = 0                                # nothing there
+        self.assertFalse(r.owns_point(500, 500))
+
+    def test_window_pid_at_on_real_win32(self):
+        """Real user32 (WindowFromPoint / GetAncestor through the shared
+        DLL, no prototypes touched): a PID, never an exception."""
+        pid = game_window.window_pid_at(0, 0)
+        self.assertIsInstance(pid, int)
+        self.assertGreaterEqual(pid, 0)
 
     def test_pid_read_is_retried(self):
         fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
@@ -1193,6 +1318,44 @@ class StandaloneRunner(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.25)
         self.assertEqual(self.rec.values('last_error'), [])
         self.assertEqual(len(FakeDetector.instances), 1)
+
+    def test_unreadable_window_owner_refuses_to_start(self):
+        """RG7 — no established PID: last_error, no detector, and no
+        backend built (the Arduino isn't even opened)."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        fake.owners[GAME_HWND] = 0
+
+        class NeverBuilt:
+            def __init__(self, *a, **k):
+                raise AssertionError('backend built for an unusable window')
+
+        with win32(fake), \
+                mock.patch.object(game_window, '_PID_READ_RETRY_S', 0), \
+                mock.patch.object(standalone_runner, 'ArduinoHIDController',
+                                  NeverBuilt), _quiet():
+            standalone_runner.run_standalone(
+                self.stop, self.debug, status_cb=self.rec,
+                pause_evt=self.pause, controller=None)
+        self.assertEqual(self.rec.values('last_error'),
+                         [game_window.MSG_WINDOW_NOT_FOUND])
+        self.assertEqual(FakeDetector.instances, [])
+        self.assertEqual(fake.opened, [])
+
+    def test_backend_failure_releases_the_process_handle(self):
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+
+        class Failing:
+            def __init__(self, cancel_evt=None):
+                raise standalone_runner.ArduinoConnectionError('no board')
+
+        with win32(fake), \
+                mock.patch.object(standalone_runner, 'ArduinoHIDController',
+                                  Failing), _quiet():
+            standalone_runner.run_standalone(
+                self.stop, self.debug, status_cb=self.rec,
+                pause_evt=self.pause, controller=None)
+        self.assertEqual(len(fake.opened), 1)
+        self.assertEqual(fake.closed, fake.opened)
 
     def test_fallback_arduino_failure_reports_last_error(self):
         message = "No Arduino found — plug in the Leonardo"
@@ -1587,6 +1750,20 @@ class AlbumRunnerSetup(AlbumRunnerBase):
         self.assertEqual(self.set_mouse.call_args_list[-1],
                          mock.call(6, 10, 1))
         self.assertTrue(own.closed)
+
+    def test_unreadable_window_owner_refuses_to_start(self):
+        """RG7 — no established PID: AlbumSetupError + MSG_WINDOW_NOT_FOUND,
+        nothing touched (no handle, no EPP, no controller)."""
+        self.fake.owners[GAME_HWND] = 0
+        with mock.patch.object(game_window, '_PID_READ_RETRY_S', 0), \
+                mock.patch.object(album, 'make_fallback_arduino') as build:
+            with self.assertRaises(album.AlbumSetupError):
+                self.make_runner(controller=None)
+        build.assert_not_called()
+        self.assertEqual(self.fake.opened, [])
+        self.set_mouse.assert_not_called()
+        self.assertEqual(self.rec.values('last_error'),
+                         [game_window.MSG_WINDOW_NOT_FOUND])
 
     def test_setup_failure_releases_the_process_handle(self):
         with mock.patch.object(album.AlbumRunner, '_load_tpl',
@@ -2144,6 +2321,56 @@ class AlbumWindowChanged(AlbumWindowFixture):
                          [c[0] for c in r.controller.snapshot()])
         self.assert_not_followed(r)
 
+    def _foreign_in_front(self):
+        self.fake.windows[FOREIGN_HWND] = (800, 600)
+        self.fake.recycle(FOREIGN_HWND)
+        self.fake.front = FOREIGN_HWND
+
+    def _no_click_delays(self):
+        for name in ('CLICK_HOVER_S', 'CLICK_HOLD_S', 'CLICK_SETTLE_S'):
+            p = mock.patch.object(screen_watcher, name, 0)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_intro_click_with_another_app_in_front(self):
+        """RG9 — another app covers Go Perform: no mouse-down, and the
+        song fails with MSG_GAME_NOT_IN_FRONT (not a generic miss)."""
+        self._no_click_delays()
+        r = self.runner()
+        self._foreign_in_front()
+        with _quiet():
+            self.assertFalse(r.song_player.play('legendary'))
+        self.assertNotIn('mouse_down',
+                         [c[0] for c in r.controller.snapshot()])
+        self.assertEqual(self.rec.values('last_error'),
+                         [song_player.MSG_GAME_NOT_IN_FRONT])
+
+    def test_next_song_with_another_app_in_front(self):
+        self._no_click_delays()
+        r = self.runner()
+        self._foreign_in_front()
+        with _quiet():
+            self.assertFalse(r._next_song())
+        moves = [c for c in r.controller.snapshot() if c[0] == 'move_to']
+        self.assertEqual(len(moves), 2)                 # tried twice
+        self.assertNotIn('mouse_down',
+                         [c[0] for c in r.controller.snapshot()])
+        self.assertEqual(self.rec.values('last_error'),
+                         [song_player.MSG_GAME_NOT_IN_FRONT])
+
+    def test_end_watcher_click_with_another_app_in_front_retries_later(self):
+        """RG9 — the end watcher just doesn't click (retries next poll);
+        nothing is reported."""
+        self._no_click_delays()
+        r = self.runner()
+        self._foreign_in_front()
+        r.song_player._find_select_song = lambda frame=None: (0.99, (10, 10))
+        with _quiet():
+            self.assertFalse(r.song_player._click_select_song_if_shown())
+        self.assertNotIn('mouse_down',
+                         [c[0] for c in r.controller.snapshot()])
+        self.assertEqual(self.rec.values('last_error'), [])
+
     def test_next_song_click_on_changed_window(self):
         r = self.runner()
         r.watcher.click_ref = mock.MagicMock(
@@ -2654,14 +2881,21 @@ class MainCliGameClosed(unittest.TestCase):
     backend closed, timer restored, exit 1 + message) when Genshin is
     closed mid-run, headless or with the debug viz."""
 
-    def _run(self, debug_mode, fake=None, on_sleep=None):
+    def _run(self, debug_mode, fake=None, on_sleep=None,
+             detector_cls=FakeDetector, before_viz=None):
         import main as cli
         FakeDetector.instances = []
         ctrl = FakeInput()
         restore = mock.MagicMock()
         sleeps = []
         if fake is None:
-            fake = FakeUser32(exists=False)
+            fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+
+        def viz(*args, **kwargs):
+            if before_viz is not None:
+                before_viz()
+            return (kwargs['geometry_poll']()
+                    and standalone_runner.VIZ_EXIT_WINDOW_GONE)
 
         def sleep(secs):                  # bounds a regression: Ctrl+C
             sleeps.append(secs)
@@ -2679,31 +2913,70 @@ class MainCliGameClosed(unittest.TestCase):
                 dict(REGION_1080), [417, 628, 844, 1061, 1277, 1493], 921)),
             find_game_window=mock.MagicMock(return_value=GAME_HWND),
             make_input_backend=mock.MagicMock(return_value=ctrl),
-            NoteDetector=FakeDetector,
+            NoteDetector=detector_cls,
             ctypes=mock.MagicMock(),
             cv2=mock.MagicMock(),
             time=mock.MagicMock(sleep=sleep),
-            run_visualization=mock.MagicMock(
-                side_effect=lambda *a, **k: k['geometry_poll']() and (
-                    standalone_runner.VIZ_EXIT_WINDOW_GONE)))
+            run_visualization=mock.MagicMock(side_effect=viz))
         code = None
+        self.raised = None
         with mock.patch.multiple(cli, **patches), win32(fake), \
+                mock.patch.object(game_window, '_PID_READ_RETRY_S', 0), \
                 _quiet() as out:
             try:
                 cli.main()
             except SystemExit as e:
                 code = e.code
+            except Exception as e:                  # noqa: BLE001
+                self.raised = e
         return code, out.getvalue(), ctrl, restore
 
     def test_game_closed_exits_cleanly(self):
         for debug_mode in (False, True):
-            code, out, ctrl, restore = self._run(debug_mode)
+            fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+            code, out, ctrl, restore = self._run(
+                debug_mode, fake=fake,
+                on_sleep=lambda n: n == 1 and fake.quit(),
+                before_viz=fake.quit)
             self.assertEqual(code, 1, debug_mode)
             self.assertIn(game_window.MSG_WINDOW_CLOSED, out)
             self.assertIn('Shutdown complete', out)
             self.assertTrue(all(d.stopped for d in FakeDetector.instances))
             self.assertTrue(ctrl.closed)
             restore.assert_called_once()
+            self.assertEqual(fake.closed, fake.opened)
+
+    def test_unreadable_window_owner_refuses_to_start(self):
+        """RG7 — exit 1 with MSG_WINDOW_NOT_FOUND; backend closed, no
+        detector, no process handle."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        fake.owners[GAME_HWND] = 0
+        code, out, ctrl, restore = self._run(False, fake=fake)
+        self.assertEqual(code, 1)
+        self.assertIn(game_window.MSG_WINDOW_NOT_FOUND, out)
+        self.assertEqual(FakeDetector.instances, [])
+        self.assertTrue(ctrl.closed)
+        self.assertEqual(fake.opened, [])
+        restore.assert_called_once()
+
+    def test_half_started_detector_is_cleaned_up(self):
+        """RG10 — the detector fails while starting: the half-started one is
+        stopped, the backend and the game's process handle released."""
+        class FailsToStart(FakeDetector):
+            def start(self):
+                super().start()
+                raise RuntimeError("can't start new thread")
+
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        code, out, ctrl, restore = self._run(False, fake=fake,
+                                             detector_cls=FailsToStart)
+        self.assertIsInstance(self.raised, RuntimeError)
+        self.assertTrue(FakeDetector.instances[0].stopped)
+        self.assertTrue(ctrl.closed)
+        self.assertEqual(len(fake.opened), 1)
+        self.assertEqual(fake.closed, fake.opened)
+        restore.assert_called_once()
+        self.assertIn('Shutdown complete', out)
 
     def test_headless_exits_on_changed_window(self):
         """The game recreated its window: the CLI shuts down cleanly with

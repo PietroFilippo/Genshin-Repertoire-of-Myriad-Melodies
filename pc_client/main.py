@@ -18,7 +18,8 @@ from config import (DEBUG_MODE, KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS,
                     INPUT_BACKEND_DEFAULT)
 from detector import NoteDetector
 from game_window import (MSG_WINDOW_CHANGED, MSG_WINDOW_CLOSED,
-                         find_game_window, auto_detect)
+                         GameWindowUnavailable, find_game_window,
+                         auto_detect)
 from standalone_runner import (GEOMETRY_POLL_S, VIZ_EXIT_GEOMETRY,
                                VIZ_EXIT_WINDOW_CHANGED, VIZ_EXIT_WINDOW_GONE,
                                WINDOW_CHANGED, WINDOW_GONE, GeometryTracker,
@@ -85,15 +86,11 @@ def main():
     # its capture itself); a resize changes the lane layout, so rebuild the
     # detector for it. The tracker holds the game's window + PID + process
     # handle for the run: a closed game or a changed window (destroyed /
-    # recycled — never followed) ends the CLI with a message.
-    tracker = GeometryTracker(hwnd, capture_region, column_centers,
-                              hit_line_y, tag='[cli]')
-    detector = NoteDetector(hwnd, column_centers, hit_line_y, controller,
-                            pid=tracker.pid)
-
-    print(f"Starting per-key detection threads "
-          f"(poll {KEY_POLL_DELAY_S*1000:.0f}ms, strip {Y_SAMPLE_OFFSETS})")
-    detector.start()
+    # recycled — never followed) ends the CLI with a message. Both are
+    # created inside the try below, so any startup failure (an unreadable
+    # window owner, a detector that fails half-started) is cleaned up.
+    tracker = None
+    detector = None
 
     def _rebuild_detector():
         nonlocal detector
@@ -111,6 +108,15 @@ def main():
                       WINDOW_GONE: MSG_WINDOW_CLOSED,
                       WINDOW_CHANGED: MSG_WINDOW_CHANGED}
     try:
+        tracker = GeometryTracker(hwnd, capture_region, column_centers,
+                                  hit_line_y, tag='[cli]')
+        detector = NoteDetector(hwnd, column_centers, hit_line_y, controller,
+                                pid=tracker.pid)
+        print(f"Starting per-key detection threads "
+              f"(poll {KEY_POLL_DELAY_S*1000:.0f}ms, "
+              f"strip {Y_SAMPLE_OFFSETS})")
+        detector.start()
+
         if DEBUG_MODE:
             print("DEBUG_MODE on - visualization window will open. Close it "
                   "(X) or press Ctrl+C to exit.")
@@ -142,15 +148,20 @@ def main():
                 if new is not None and layout_changed(old, new):
                     _rebuild_detector()
                 time.sleep(GEOMETRY_POLL_S)
+    except GameWindowUnavailable as e:
+        # The window's owning process can't be read: no window to run on.
+        lost = str(e)
     except KeyboardInterrupt:
         print("\nCtrl+C received")
     finally:
         if lost:
             print(f"ERROR: {lost}")
         print("Shutting down")
-        detector.stop()
+        if detector is not None:
+            detector.stop()        # also joins a half-started detector
         controller.close()
-        tracker.close()
+        if tracker is not None:
+            tracker.close()
         cv2.destroyAllWindows()
         if timer_boosted:
             restore_timer()

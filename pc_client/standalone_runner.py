@@ -25,6 +25,7 @@ from detector import NoteDetector
 from controller import ArduinoHIDController
 from game_window import (MSG_WINDOW_CHANGED, MSG_WINDOW_CLOSED,
                          MSG_WINDOW_NOT_FOUND, GameWindowRef,
+                         GameWindowUnavailable,
                          find_game_window, auto_detect, read_game_geometry,
                          same_hwnd, scaled_layout, wait_game_geometry)
 from game_window import WINDOW_CHANGED as _GW_CHANGED
@@ -230,7 +231,9 @@ class GeometryTracker:
 
     Holds the run's `game_window.GameWindowRef` (HWND + PID + process
     handle, fixed for the run — never re-pointed); `close()` it when the
-    run ends. `stop_evt` makes the closed-vs-changed look stop-aware."""
+    run ends. `stop_evt` makes the closed-vs-changed look stop-aware.
+    Raises game_window.GameWindowUnavailable when the window's owning
+    process can't be read (refuse to start)."""
 
     def __init__(self, hwnd, capture_region, column_centers, hit_line_y,
                  tag='[standalone]', pid=None, stop_evt=None):
@@ -697,10 +700,31 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
         _error(MSG_WINDOW_NOT_FOUND)
         return
 
+    # Windowed Genshin can be moved / resized mid-play: the viz loop polls
+    # this every GEOMETRY_POLL_S (non-blocking). A move retargets the viz
+    # capture in place (the detector reads client-relative pixels, so it
+    # doesn't care); a resize exits the viz with VIZ_EXIT_GEOMETRY and we
+    # rebuild the detector for the new lane layout below; a closed game /
+    # changed window exits it with VIZ_EXIT_WINDOW_GONE / _CHANGED and
+    # ends the run. The tracker binds the run to the window's process
+    # (PID + process handle — closed in the finally below); a window whose
+    # owner can't be read is no window to run on.
+    try:
+        tracker = GeometryTracker(hwnd, capture_region, column_centers,
+                                  hit_line_y, stop_evt=stop_evt)
+    except GameWindowUnavailable as e:
+        _error(str(e))
+        return
+
     own_controller = controller is None
     if own_controller:
-        controller, failure = make_fallback_arduino(cancel_evt=stop_evt)
+        try:
+            controller, failure = make_fallback_arduino(cancel_evt=stop_evt)
+        except BaseException:
+            tracker.close()
+            raise
         if controller is None:
+            tracker.close()
             if not _stopped():
                 _error(failure)
             return
@@ -708,17 +732,6 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
     fps_cb = None
     if status_cb:
         fps_cb = lambda f: status_cb({'fps': f})
-
-    # Windowed Genshin can be moved / resized mid-play: the viz loop polls
-    # this every GEOMETRY_POLL_S (non-blocking). A move retargets the viz
-    # capture in place (the detector reads client-relative pixels, so it
-    # doesn't care); a resize exits the viz with VIZ_EXIT_GEOMETRY and we
-    # rebuild the detector for the new lane layout below; a closed game /
-    # changed window exits it with VIZ_EXIT_WINDOW_GONE / _CHANGED and
-    # ends the run. The tracker holds the game's process handle for the
-    # run (closed in the finally below).
-    tracker = GeometryTracker(hwnd, capture_region, column_centers,
-                              hit_line_y, stop_evt=stop_evt)
 
     # Set when a pause interrupted the previous detector, so the resume path
     # (geometry re-read) runs even if pause_evt was already cleared again

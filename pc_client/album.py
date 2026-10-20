@@ -32,10 +32,12 @@ from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
                     ALBUM_SONG_COUNT, INPUT_BACKEND_DEFAULT,
                     KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS)
 from game_window import (MSG_WINDOW_NOT_FOUND, WINDOW_ALIVE, GameWindowRef,
-                         find_game_window, lost_message, read_game_geometry,
+                         GameWindowUnavailable, find_game_window,
+                         lost_message, read_game_geometry,
                          wait_game_geometry)
-from screen_watcher import ScreenWatcher
-from song_player import ROI_GO_PERFORM, ROI_SELECT_SONG, SongPlayer
+from screen_watcher import REFUSED_NOT_IN_FRONT, ScreenWatcher
+from song_player import (MSG_GAME_NOT_IN_FRONT, ROI_GO_PERFORM,
+                         ROI_SELECT_SONG, SongPlayer)
 from standalone_runner import MSG_ARDUINO_UNAVAILABLE, make_fallback_arduino
 
 # How often the album's pause waits check that the game still exists.
@@ -189,7 +191,12 @@ class AlbumRunner:
         # The run is bound to this window, the game PROCESS owning it and
         # a handle to that process (held until close(); it also keeps the
         # PID from being reused). Never re-pointed at another window.
-        self._game = GameWindowRef(hwnd)
+        try:
+            self._game = GameWindowRef(hwnd)
+        except GameWindowUnavailable as e:
+            # Its owning process can't be read: not a window to run on.
+            self._emit({'last_error': str(e)})
+            raise AlbumSetupError(str(e)) from None
         # From here on any failure must close() — releases the process
         # handle, restores EPP if touched, closes a controller we opened.
         try:
@@ -247,13 +254,16 @@ class AlbumRunner:
             # _live_geometry).
             # `window_gone_fn` ends the watcher's waits as soon as the
             # game is closed or its window changed (reported once, by
-            # _window_gone).
+            # _window_gone). `target_check_fn`: right before mouse-down,
+            # the window under the cursor must belong to the game (an
+            # app alt-tabbed over the target never gets the click).
             self.watcher = ScreenWatcher(
                 region=self.region, scale_x=self.scale_x, scale_y=self.scale_y,
                 controller=self.controller, stop_evt=self.stop_evt,
                 templates=self.tpl, match_threshold=ALBUM_MATCH_THRESHOLD,
                 live_geometry_fn=self._live_geometry,
-                window_gone_fn=self._window_gone)
+                window_gone_fn=self._window_gone,
+                target_check_fn=self._game.owns_point)
 
             # Per-song state machine: intro click chain → detector + viz +
             # end-watcher → pause-resume → cleanup. AlbumRunner stays as
@@ -493,8 +503,12 @@ class AlbumRunner:
                 return False
             if attempt == 0:
                 print("  WARN: next-song click didn't land; retrying")
-        self._fail("  ERROR: couldn't click the next song on the album "
-                   "wheel; stopping", MSG_NEXT_SONG_FAILED)
+        if self.watcher.last_refusal == REFUSED_NOT_IN_FRONT:
+            self._fail("  ERROR: another window was in front of the game "
+                       "at the album wheel; stopping", MSG_GAME_NOT_IN_FRONT)
+        else:
+            self._fail("  ERROR: couldn't click the next song on the album "
+                       "wheel; stopping", MSG_NEXT_SONG_FAILED)
         return False
 
     def _wait_for_album_page(self, timeout=60.0):

@@ -214,6 +214,7 @@ _PID_READ_RETRY_S = 0.05
 _SYNCHRONIZE = 0x00100000
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _WAIT_OBJECT_0 = 0
+_GA_ROOT = 2
 
 try:
     # Private handle (own prototypes) so nothing leaks onto the
@@ -245,17 +246,38 @@ def window_pid(hwnd):
     return int(pid.value or 0)
 
 
+def window_pid_at(x, y):
+    """PID owning the top-level window that would receive a click at
+    screen (x, y): WindowFromPoint -> GetAncestor(GA_ROOT) -> its owner.
+    Kernel-side reads, no window messages. 0 if unknown."""
+    try:
+        user32 = _user32()
+        hwnd = user32.WindowFromPoint(ctypes.wintypes.POINT(int(x), int(y)))
+        if not hwnd:
+            return 0
+        root = user32.GetAncestor(ctypes.wintypes.HWND(hwnd), _GA_ROOT)
+    except Exception:
+        return 0
+    return window_pid(root or hwnd)
+
+
 def _open_process(pid):
-    """SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION handle, or None
-    (e.g. access denied). Holding it keeps the PID from being reused."""
+    """A handle to process `pid` for the run, or None. Asks for
+    SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, then SYNCHRONIZE
+    alone (an anti-cheat may deny the query right but still allow the
+    wait). Either is enough for WaitForSingleObject, and holding it keeps
+    the PID from being reused."""
     if not pid or _k32 is None:
         return None
-    try:
-        return _k32.OpenProcess(
-            _SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION, False,
-            pid) or None
-    except Exception:
-        return None
+    for access in (_SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION,
+                   _SYNCHRONIZE):
+        try:
+            handle = _k32.OpenProcess(access, False, pid)
+        except Exception:
+            handle = None
+        if handle:
+            return handle
+    return None
 
 
 def _process_exited(handle):
@@ -287,14 +309,23 @@ def lost_message(state):
     return MSG_WINDOW_CLOSED if state == WINDOW_CLOSED else MSG_WINDOW_CHANGED
 
 
+class GameWindowUnavailable(RuntimeError):
+    """A run can't be bound to this window: its owning PID can't be read
+    (the window is invalid). `str()` is the user-facing reason."""
+
+
 class GameWindowRef:
     """The game window a run is bound to — fixed for the whole run: HWND,
-    the PID owning it (read with a few retries; 0 = unreadable) and a
-    process handle (None if OpenProcess failed). Never re-pointed, so any
-    thread may query it. `close()` it when the run ends."""
+    the PID owning it and a process handle (None if OpenProcess failed).
+    Never re-pointed, so any thread may query it. `close()` it when the
+    run ends.
+
+    Raises GameWindowUnavailable when the PID can't be read (after a few
+    retries): a run never starts without knowing whose window it is."""
 
     def __init__(self, hwnd, pid=None):
         self.hwnd = hwnd
+        self.handle = None
         if pid is None:
             pid = window_pid(hwnd)
             for _ in range(_PID_READ_ATTEMPTS - 1):
@@ -302,18 +333,24 @@ class GameWindowRef:
                     break
                 time.sleep(_PID_READ_RETRY_S)
                 pid = window_pid(hwnd)
-        self.pid = pid or 0
+        if not pid:
+            print("ERROR: can't read which process owns the game window.")
+            raise GameWindowUnavailable(MSG_WINDOW_NOT_FOUND)
+        self.pid = pid
         self.handle = _open_process(self.pid)
 
     def _window_is_ours(self):
-        """IsWindow(hwnd) and still owned by the game's PID. PID unknown
-        (ours or the window's): IsWindow alone decides."""
+        """IsWindow(hwnd) and owned by the game's PID (an unreadable owner
+        is not ours)."""
         if window_gone(self.hwnd):
             return False
-        if not self.pid:
-            return True
-        owner = window_pid(self.hwnd)
-        return not owner or owner == self.pid
+        return window_pid(self.hwnd) == self.pid
+
+    def owns_point(self, x, y):
+        """True if a click at screen (x, y) would land in a window of the
+        game process — checked right before mouse-down, so an app that
+        came to the front over the target never gets the click."""
+        return window_pid_at(x, y) == self.pid
 
     def alive(self):
         """Non-blocking, side-effect free: the process hasn't exited (when

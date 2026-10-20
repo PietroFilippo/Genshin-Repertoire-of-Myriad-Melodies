@@ -54,6 +54,10 @@ CLICK_HOVER_S = 0.15
 CLICK_HOLD_S = 0.10
 CLICK_SETTLE_S = 0.15
 
+# `last_refusal` reasons (why the last click on this thread wasn't issued),
+# for callers that report something more specific than "missed click".
+REFUSED_NOT_IN_FRONT = 'not_in_front'
+
 
 # Default match threshold when caller doesn't pass one at construction.
 # 0.85 picks up the typical UI-pill template against a clean
@@ -64,7 +68,8 @@ DEFAULT_MATCH_THRESHOLD = 0.85
 class ScreenWatcher:
     def __init__(self, region, scale_x, scale_y, controller, stop_evt,
                  templates, match_threshold=DEFAULT_MATCH_THRESHOLD,
-                 live_geometry_fn=None, window_gone_fn=None):
+                 live_geometry_fn=None, window_gone_fn=None,
+                 target_check_fn=None):
         """
         Args:
             region: dict with keys top/left/width/height — the mss
@@ -96,6 +101,12 @@ class ScreenWatcher:
                 instead of polling until the timeout. None = no check.
                 (The pre-click check is `live_geometry_fn`'s job: return
                 None once the window isn't the game's.)
+            target_check_fn: optional `callable(sx, sy) -> bool`, True if
+                a click at screen (sx, sy) would land in the game (e.g.
+                `GameWindowRef.owns_point`: the window under the point
+                belongs to the game's process). Checked LAST, right
+                before mouse-down — an app alt-tabbed over the target
+                during the hover never gets the click. None = no check.
         """
         if stop_evt is None:
             raise ValueError("ScreenWatcher requires a stop_evt — "
@@ -109,6 +120,9 @@ class ScreenWatcher:
         self._geom_lock = threading.Lock()
         self._live_geometry_fn = live_geometry_fn
         self._window_gone_fn = window_gone_fn
+        self._target_check_fn = target_check_fn
+        # Per-thread `last_refusal` (the end watcher clicks on its own).
+        self._click_state = threading.local()
         self.controller = controller
         self.stop_evt = stop_evt
         self.templates = templates
@@ -221,7 +235,10 @@ class ScreenWatcher:
         failed (see `_live_target_ok`; that one also publishes the new
         geometry, bumping `generation`). Callers treat False like a
         missed click; check `stop_evt.is_set()` / `generation` to tell
-        the cases apart (same escape hatch as `move_to`)."""
+        the cases apart (same escape hatch as `move_to`), or
+        `last_refusal` (REFUSED_NOT_IN_FRONT: another window was over
+        the target when the button would have gone down)."""
+        self._click_state.refusal = None
         if self._stale(generation):
             return False
         converged = self.controller.move_to(int(sx), int(sy),
@@ -247,6 +264,9 @@ class ScreenWatcher:
         if self._stale(generation):
             return False
         if not self._live_target_ok(sx, sy):
+            return False
+        if not self._target_in_game(sx, sy):
+            self._click_state.refusal = REFUSED_NOT_IN_FRONT
             return False
         self.controller.mouse_down('left')
         self.stop_wait(CLICK_HOLD_S)
@@ -287,6 +307,28 @@ class ScreenWatcher:
               f"({int(sx)},{int(sy)}) was for the old window")
         return False
 
+    def _target_in_game(self, sx, sy):
+        """`target_check_fn` at the click point; a failing check refuses
+        the click (never press into a window we can't vouch for)."""
+        fn = self._target_check_fn
+        if fn is None:
+            return True
+        try:
+            ok = bool(fn(int(sx), int(sy)))
+        except Exception as e:
+            print(f"    [watcher] click target check failed: {e}")
+            ok = False
+        if not ok:
+            print(f"    click SKIPPED — another window is in front of the "
+                  f"game at ({int(sx)},{int(sy)})")
+        return ok
+
+    @property
+    def last_refusal(self):
+        """Why the last click on THIS thread wasn't issued, when known
+        (REFUSED_NOT_IN_FRONT), else None."""
+        return getattr(self._click_state, 'refusal', None)
+
     def click_ref(self, ref_x, ref_y):
         """Click at a 1080p reference position. Returns `click_screen`'s
         result. If the window moved / resized under the click (the
@@ -308,6 +350,7 @@ class ScreenWatcher:
         the `grab()` that produced (lx, ly): if the geometry has changed
         since, the click is refused (returns False) and the caller
         should re-capture and re-match. Returns `click_screen`'s result."""
+        self._click_state.refusal = None
         region, _, _, current = self._geom
         if generation is not None and generation != current:
             self._stale(generation)
