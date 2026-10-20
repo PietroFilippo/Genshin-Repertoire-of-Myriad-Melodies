@@ -825,6 +825,8 @@ function renderElapsed() {
 
 setInterval(() => {
     if (MAIN.runStartedAt && !MAIN.runEndedAt) renderElapsed();
+    // Re-assert the events-editor mirror (no-op until it is due).
+    if (STATE.initialized) syncEditorDirty();
 }, 1000);
 
 // Start / Pause buttons from the live state machine (+ the Start/Stop
@@ -1301,7 +1303,7 @@ const MACRO = {
     lastActionAt: 0,
     noticeLead: '',
     noticeErr: '',
-    localErr: null,        // {lead, msg, until, state, seen} shown from a bridge refusal
+    localErr: null,        // {lead, msg, until, ident, seen} shown from a bridge refusal
     localErrTimer: null,
     hint: { text: '', until: 0, timer: null },
 };
@@ -1343,9 +1345,9 @@ function explainMacroRefusal(action, res) {
 
 function showMacroError(lead, msg) {
     const s = STATE.lastStatus || {};
-    // `state` / `seen` let the status retire it (see renderMacroNotice).
+    // `ident` / `seen` let the status retire it (see renderMacroNotice).
     MACRO.localErr = { lead, msg, until: Date.now() + LOCAL_ERR_MS,
-        state: s.macro_state || 'idle', seen: false };
+        ident: macroActivityIdent(s), seen: false };
     clearTimeout(MACRO.localErrTimer);
     MACRO.localErrTimer = setTimeout(() => {
         MACRO.localErr = null;
@@ -1353,6 +1355,16 @@ function showMacroError(lead, msg) {
         renderMacroNotice(STATE.lastStatus || {});
     }, LOCAL_ERR_MS + 50);
     renderMacroNotice(STATE.lastStatus || {});
+}
+
+// Which macro activity a status describes. A move to a NEW playback or
+// recording retires a cached refusal — including an interrupt the drain
+// coalesced into "still playing" (other slot / source, or the same slot
+// re-triggered: `macro_play_gen` bumps on every playback start).
+function macroActivityIdent(s) {
+    return [s.macro_state || 'idle', s.macro_playing_source || '',
+        parseInt(s.macro_playing_slot, 10) || 0,
+        parseInt(s.macro_play_gen, 10) || 0].join('|');
 }
 
 // The bridge refusal is only a stand-in until the status catches up, so
@@ -1438,9 +1450,10 @@ function activeUsersOfSlot(n) {
 // phrase ('' = nothing). Shared by the Load / Record / Close confirms.
 // Load / Record count a dirty buffer only when it has events (an empty
 // one has nothing to lose); `forClose` follows Python's close rule,
-// `macro_state === 'recording' || macro_dirty`, exactly.
-function macroUnsavedSummary(forClose) {
-    const s = STATE.lastStatus || {};
+// `macro_state === 'recording' || macro_dirty`, exactly. `status`
+// (optional) replaces the last pushed status, e.g. a fresh snapshot.
+function macroUnsavedSummary(forClose, status) {
+    const s = status || STATE.lastStatus || {};
     const parts = [];
     const n = s.macro_events || 0;
     const evs = plural(n, 'event');
@@ -1684,41 +1697,7 @@ async function slotAction(act, n) {
         return;
     }
     if (act === 'load') {
-        if (!occupied) {
-            showMacroHint(`Slot ${n} is empty — use "Save here" to store the current macro there.`);
-            return;
-        }
-        // The buffer revision is pinned when the confirm opens: a macro
-        // recorded meanwhile (in-game hotkey) makes Python refuse with
-        // 'stale' instead of discarding work the user never saw. Each
-        // refusal asks again about what is there now.
-        let note = '';
-        for (;;) {
-            if (macroIsBusy()) {
-                const st = (STATE.lastStatus || {}).macro_state;
-                showMacroHint(`Stop ${st === 'recording' ? 'recording' : 'playback'} before using the slots.`);
-                return;
-            }
-            const cur = STATE.lastStatus || {};
-            const loss = macroUnsavedSummary();
-            let expected = null;
-            if (loss) {
-                expected = typeof cur.macro_rev === 'number' ? cur.macro_rev : null;
-                const ok = await dlgConfirm(`Load slot ${n}${label}?`,
-                    `This replaces the current macro, and you have ${loss} that will be lost.`,
-                    { ok: 'Load and discard', danger: true, focusCancel: true, note });
-                if (!ok) return;
-            }
-            noteMacroAction('load');
-            const res = await callApi('macro_load_slot', n, expected);
-            if (res && res.ok === false && res.reason === 'stale' && expected !== null) {
-                note = 'The macro changed while the last question was open, so nothing was loaded.';
-                continue;
-            }
-            if (res && res.ok) discardEditorEdits();
-            explainMacroRefusal('load', res);
-            return;
-        }
+        await loadSlotFlow(n);
     } else if (act === 'save') {
         openSaveDialog(n);
     } else if (act === 'rename') {
@@ -1758,6 +1737,90 @@ async function slotAction(act, n) {
         const res = await callApi('macro_clear_slot', n);
         if (res && res.ok) noteUnassigned(n, res);
         explainMacroRefusal('clear', res);
+    }
+}
+
+// Status-shaped view of the macro buffer, for the Load decision: from
+// the last push, or (fetchBufferView) from macro_get_events, which Python
+// reads under its own lock — authoritative, unlike a push that may still
+// be on its way. macro_rev is null only for a Python without revisions.
+function bufferViewFromStatus() {
+    const s = STATE.lastStatus || {};
+    return {
+        macro_state: s.macro_state || 'idle',
+        macro_events: s.macro_events || 0,
+        macro_dirty: !!s.macro_dirty,
+        macro_loaded: parseInt(s.macro_loaded, 10) || 0,
+        macro_rev: typeof s.macro_rev === 'number' ? s.macro_rev : null,
+    };
+}
+
+async function fetchBufferView() {
+    let res = null;
+    try {
+        res = await callApi('macro_get_events');
+    } catch (e) {
+        res = null;
+    }
+    if (!res || Array.isArray(res) || !Array.isArray(res.events)
+            || typeof res.rev !== 'number') {
+        return null;
+    }
+    return {
+        macro_state: res.state || 'idle',
+        macro_events: res.events.length,
+        macro_dirty: !!res.dirty,
+        macro_loaded: parseInt(res.loaded, 10) || 0,
+        macro_rev: res.rev,
+    };
+}
+
+const LOAD_STALE_RETRIES = 5;
+
+// Load slot n. EVERY request — a clean-buffer one too — is pinned to the
+// buffer revision the decision was made on, so work recorded meanwhile
+// (in-game hotkey) makes Python refuse with 'stale' instead of being
+// discarded unseen. After a refusal the decision is re-made from a fresh
+// authoritative snapshot, and the target slot's occupancy / name is
+// re-read each round (it can change while a question is open).
+async function loadSlotFlow(n) {
+    let view = bufferViewFromStatus();
+    if (view.macro_rev === null) view = (await fetchBufferView()) || view;
+    let note = '';
+    for (let attempt = 0; ; attempt += 1) {
+        if (!slotIsOccupied(n)) {
+            showMacroHint(`Slot ${n} is empty — use "Save here" to store the current macro there.`);
+            return;
+        }
+        if (view.macro_state === 'recording' || view.macro_state === 'playing') {
+            showMacroHint(`Stop ${view.macro_state === 'recording'
+                ? 'recording' : 'playback'} before using the slots.`);
+            return;
+        }
+        const name = slotNameOf(n);
+        const label = name ? ` ("${name}")` : '';
+        const loss = macroUnsavedSummary(false, view);
+        const expected = view.macro_rev;
+        if (loss) {
+            const ok = await dlgConfirm(`Load slot ${n}${label}?`,
+                `This replaces the current macro, and you have ${loss} that will be lost.`,
+                { ok: 'Load and discard', danger: true, focusCancel: true, note });
+            if (!ok) return;
+        }
+        noteMacroAction('load');
+        const res = await callApi('macro_load_slot', n, expected);
+        if (res && res.ok === false && res.reason === 'stale' && expected !== null) {
+            if (attempt >= LOAD_STALE_RETRIES) {
+                showMacroHint('The macro kept changing — nothing was loaded. Try again.');
+                return;
+            }
+            view = (await fetchBufferView()) || bufferViewFromStatus();
+            note = 'The macro changed meanwhile, so nothing was loaded.';
+            continue;
+        }
+        if (res && res.ok) discardEditorEdits();
+        explainMacroRefusal('load', res);
+        return;
     }
 }
 
@@ -1984,13 +2047,14 @@ function renderMacroNotice(s) {
     const err = String(s.macro_error || '').trim();
     const le = MACRO.localErr;
     if (le) {
-        // The status contradicts the cached refusal: the macro went on
-        // to play / record after all (in-game hotkey, retry), or Python
-        // published the error and has cleared it since.
+        // The status contradicts the cached refusal: a macro went on to
+        // play / record after all (in-game hotkey, retry, interrupt), or
+        // Python published the error and has cleared it since.
         const st = s.macro_state || 'idle';
         if (err) le.seen = true;
         if ((!err && le.seen)
-                || (st !== le.state && (st === 'playing' || st === 'recording'))) {
+                || ((st === 'playing' || st === 'recording')
+                    && macroActivityIdent(s) !== le.ident)) {
             dropMacroLocalErr();
         }
     }
@@ -2264,15 +2328,28 @@ function renderEvtCount() {
 // Alt+F4 / taskbar Close are answered by Python's native close guard,
 // which can't see these local edits (its buffer is clean until Save).
 // Mirror the flag whenever it flips; every jsDirty change (edit, save,
-// discard, hide, re-fetch) ends in updateEvtButtons. Not cached until
-// the bridge exists, so a reload re-sends it.
+// discard, hide, re-fetch) ends in updateEvtButtons. Each bridge call
+// runs on its own Python thread, so updates carry an increasing `seq`
+// and Python drops any older than the last it applied; the value is
+// also re-asserted every few seconds (status pushes + the 1 s ticker)
+// so a lost update heals. Not sent until the bridge exists, so a reload
+// re-sends it.
+const EDITOR_DIRTY_REASSERT_MS = 3000;
 let _editorDirtySent = null;
+let _editorDirtySentAt = 0;
+let _editorDirtySeq = 0;
 
 function syncEditorDirty() {
     const dirty = !!(evtState.visible && evtState.jsDirty);
-    if (dirty === _editorDirtySent || !api()) return;
+    if (!api()) return;
+    const now = Date.now();
+    if (dirty === _editorDirtySent && now - _editorDirtySentAt < EDITOR_DIRTY_REASSERT_MS) return;
     _editorDirtySent = dirty;
-    callApi('macro_set_editor_dirty', dirty).catch(() => {});
+    _editorDirtySentAt = now;
+    // Clock-seeded, so a reloaded page still outranks calls the old one
+    // left in flight.
+    _editorDirtySeq = Math.max(_editorDirtySeq + 1, now);
+    callApi('macro_set_editor_dirty', dirty, _editorDirtySeq).catch(() => {});
 }
 
 function updateEvtButtons() {
@@ -2895,7 +2972,8 @@ window.updateStatus = function updateStatus(data) {
         || 'macro_loaded' in data || 'macro_slot_names' in data
         || 'macro_dirty' in data || 'macro_playing_slot' in data
         || 'macro_playing_source' in data || 'macro_error' in data
-        || 'macro_playing_events' in data || 'macro_playing_name' in data) {
+        || 'macro_playing_events' in data || 'macro_playing_name' in data
+        || 'macro_play_gen' in data) {
         renderMacroState(s);
     }
     if ('macro_events' in data || 'macro_rev' in data
@@ -3030,6 +3108,7 @@ function init() {
             macro_playing_name: macroSnap.macro_playing_name || '',
             macro_playing_source: macroSnap.macro_playing_source || '',
             macro_playing_events: macroSnap.macro_playing_events || 0,
+            macro_play_gen: macroSnap.macro_play_gen || 0,
             macro_rev: typeof macroSnap.macro_rev === 'number'
                 ? macroSnap.macro_rev : 0,
             macro_error: macroSnap.macro_error || '',

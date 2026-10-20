@@ -547,6 +547,9 @@ class BridgeApi:
         # doesn't have yet (mirrored by macro_set_editor_dirty) — the
         # native close guard must count them too.
         self._editor_dirty = False
+        # Highest update sequence applied to _editor_dirty; every bridge
+        # call runs on its own thread, so updates can arrive reordered.
+        self._editor_dirty_seq = 0
         # Set first thing in detach(): every start path, the backend
         # switch and _get_arduino refuse from then on.
         self._tearing_down = False
@@ -1212,13 +1215,30 @@ class BridgeApi:
             events, expected_rev=expected_rev, expected_slot=expected_slot,
             persist=bool(persist)))
 
-    def macro_set_editor_dirty(self, dirty):
+    def macro_set_editor_dirty(self, dirty, seq=None):
         """The events editor gained / lost local edits that are not in
-        the macro buffer yet (JS mirrors its flag on every flip; cleared
-        on save, discard and hide). Only the titlebar close can ask about
-        them in the page; Alt+F4 / taskbar Close reach allow_close
-        without JS, so it reads this mirror."""
-        self._editor_dirty = bool(dirty)
+        the macro buffer yet (JS mirrors its flag on every flip, cleared
+        on save, discard and hide, and re-asserts it every few seconds).
+        Only the titlebar close can ask about them in the page; Alt+F4 /
+        taskbar Close reach allow_close without JS, so it reads this
+        mirror.
+
+        `seq` (optional, increasing per update): pywebview runs every
+        bridge call on its own thread, so an older "false" can land after
+        a newer "true". An update whose seq is not above the last applied
+        one is dropped (returns False). Without `seq` (older page) the
+        update always applies."""
+        with self._lock:
+            if seq is not None:
+                try:
+                    seq = int(seq)
+                except (TypeError, ValueError):
+                    seq = None
+            if seq is not None:
+                if seq <= getattr(self, '_editor_dirty_seq', 0):
+                    return False
+                self._editor_dirty_seq = seq
+            self._editor_dirty = bool(dirty)
         return True
 
     def macro_get_active_config(self):

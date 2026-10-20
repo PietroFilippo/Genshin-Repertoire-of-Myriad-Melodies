@@ -412,6 +412,28 @@ class PlayingCountTests(_TempSlots):
             lambda: self.macro.state() == MacroController.STATE_IDLE))
         self.assertEqual(0, self.macro.snapshot()['macro_playing_events'])
 
+    def test_every_playback_start_bumps_play_gen(self):
+        """G7: an interrupt the drain coalesces into "still playing" must
+        still look like a new playback to the UI."""
+        _write_slot(self.dir, 1, [_ev(0, 'x', 'down'), _ev(5, 'x', 'up')])
+        _write_slot(self.dir, 2, [_ev(0, 'y', 'down'), _ev(5, 'y', 'up')])
+        controller = _Recorder()
+        self.macro._controller_provider = lambda: controller
+        gen0 = self.macro.snapshot()['macro_play_gen']
+        self.assertTrue(self.macro.play_slot(1))
+        gen1 = self.macro.snapshot()['macro_play_gen']
+        self.assertTrue(self.macro.play_slot(
+            2, conflict_policy=ui_core.MACRO_CONFLICT_INTERRUPT))
+        snap = self.macro.snapshot()
+        self.assertEqual(('playing', 2),
+                         (snap['macro_state'], snap['macro_playing_slot']))
+        self.assertTrue(gen0 < gen1 < snap['macro_play_gen'])
+        self.macro.stop_play()
+        self.assertTrue(_wait_for(
+            lambda: self.macro.state() == MacroController.STATE_IDLE))
+        self.assertEqual(snap['macro_play_gen'],
+                         self.macro.snapshot()['macro_play_gen'])
+
     def test_no_backend_is_a_visible_error(self):
         self.macro.apply_events([_ev(0, 'q', 'down')])
         res = self.macro.play()

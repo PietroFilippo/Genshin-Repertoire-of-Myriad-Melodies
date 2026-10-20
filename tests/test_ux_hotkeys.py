@@ -1014,6 +1014,76 @@ _NODE = shutil.which('node')
 
 
 @unittest.skipIf(_NODE is None, 'node not on PATH')
+class AppScopeFastPathChecksPid(unittest.TestCase):
+    """F4: is_allowed_foreground's cached-HWND fast path must also match
+    the PID the HWND was cached with — Windows can hand a closed game's
+    HWND to an unrelated window before the 1 s refresher runs."""
+
+    GAME, GAME_PID, OTHER_PID = 4242, 900, 901
+
+    def setUp(self):
+        # Keep a background refresher (started by other tests'
+        # KeybindManagers) from rewriting the cache mid-test.
+        for name, value in (('refresh_game_hwnd', None),
+                            ('_game_hwnd', self.GAME),
+                            ('_game_pid', self.GAME_PID),
+                            ('_foreground_hwnd', None)):
+            if value is None:
+                p = mock.patch.object(ui_core, name)
+            else:
+                p = mock.patch.object(ui_core, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        ui_core._foreground_hwnd.return_value = self.GAME
+        p = mock.patch.object(ui_core, '_window_title',
+                              return_value='Notepad')
+        self.title = p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(ui_core, '_foreground_process_name',
+                              return_value='notepad.exe')
+        self.proc = p.start()
+        self.addCleanup(p.stop)
+
+    def test_same_hwnd_and_pid_passes_without_lookups(self):
+        with mock.patch.object(ui_core, '_window_pid',
+                               return_value=self.GAME_PID):
+            self.assertTrue(ui_core.is_allowed_foreground(0))
+        self.title.assert_not_called()
+        self.proc.assert_not_called()
+
+    def test_recycled_hwnd_with_other_pid_is_refused(self):
+        with mock.patch.object(ui_core, '_window_pid',
+                               return_value=self.OTHER_PID):
+            self.assertFalse(ui_core.is_allowed_foreground(0))
+        # Fell through to the full title / process checks.
+        self.title.assert_called()
+        self.proc.assert_called()
+
+    def test_unknown_cached_pid_falls_through(self):
+        with mock.patch.object(ui_core, '_game_pid', 0), \
+                mock.patch.object(ui_core, '_window_pid',
+                                  return_value=self.GAME_PID):
+            self.assertFalse(ui_core.is_allowed_foreground(0))
+        self.title.assert_called()
+
+    def test_refresh_caches_pid_with_hwnd(self):
+        fake = mock.MagicMock()
+        fake.FindWindowW.return_value = 777
+        with mock.patch.object(ui_core.ctypes, 'windll') as windll, \
+                mock.patch.object(ui_core, '_window_pid',
+                                  return_value=31337) as pid_of:
+            windll.user32 = fake
+            # setUp patched refresh_game_hwnd out; call the real one
+            # (its writes land on the patched globals, restored after).
+            self.assertEqual(_REAL_REFRESH_GAME_HWND(), 777)
+        pid_of.assert_called_once_with(777)
+        self.assertEqual((ui_core._game_hwnd, ui_core._game_pid),
+                         (777, 31337))
+
+
+_REAL_REFRESH_GAME_HWND = ui_core.refresh_game_hwnd
+
+
 class CaptureGuardJs(unittest.TestCase):
     """HK1 / HK2: runs tests/capture_guard.test.js, which loads the real
     app.js in a vm with a fake DOM + bridge and drives the capture flow."""

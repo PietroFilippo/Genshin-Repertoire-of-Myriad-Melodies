@@ -656,10 +656,16 @@ def is_allowed_foreground(ui_hwnd):
     # handle with bit 31 set would never compare equal raw.
     if ui_hwnd and _same_hwnd(fg, ui_hwnd):
         return True
-    # Common case for F8/F9/F10 in-game: the cached Genshin HWND (see
-    # refresh_game_hwnd) answers with an integer compare, so the title /
-    # process lookups below only run for some other foreground window.
-    if _game_hwnd and _same_hwnd(fg, _game_hwnd):
+    # Common case for F8/F9/F10 in-game: the cached Genshin HWND + PID
+    # (see refresh_game_hwnd) answer cheaply on the hotkey hot path, so
+    # the title / process lookups below only run for some other
+    # foreground window. Both must match: if Genshin closed and Windows
+    # recycled its HWND for another window before the next refresh, the
+    # owning PID differs and we fall through to the full checks.
+    with _game_hwnd_lock:
+        cached, cached_pid = _game_hwnd, _game_pid
+    if (cached and cached_pid and _same_hwnd(fg, cached)
+            and _window_pid(fg) == cached_pid):
         return True
     title = _window_title(fg)
     if title == UI_WINDOW_TITLE:
@@ -686,12 +692,28 @@ def is_allowed_foreground(ui_hwnd):
 # and an integer compare, neither of which can block.
 _game_hwnd_lock = threading.Lock()
 _game_hwnd = 0
+# PID owning _game_hwnd (0 = unknown), refreshed with it.
+_game_pid = 0
+
+
+def _window_pid(hwnd):
+    """PID of the process owning `hwnd` (0 on failure).
+    GetWindowThreadProcessId reads the window object; it does not send
+    the window a message, so it cannot block on a busy game."""
+    if not hwnd:
+        return 0
+    try:
+        pid = ctypes.wintypes.DWORD(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value or 0)
+    except Exception:
+        return 0
 
 
 def refresh_game_hwnd():
-    """Re-resolve Genshin's HWND. Safe to call from a background thread;
-    must never be called from a hook callback."""
-    global _game_hwnd
+    """Re-resolve Genshin's HWND (and the PID owning it). Safe to call
+    from a background thread; must never be called from a hook callback."""
+    global _game_hwnd, _game_pid
     hwnd = 0
     try:
         user32 = ctypes.windll.user32
@@ -704,8 +726,10 @@ def refresh_game_hwnd():
                 break
     except Exception:
         hwnd = 0
+    pid = _window_pid(hwnd) if hwnd else 0
     with _game_hwnd_lock:
         _game_hwnd = hwnd or 0
+        _game_pid = pid
     return _game_hwnd
 
 
@@ -732,18 +756,23 @@ def is_allowed_game_only():
     record while the user is in another app.
 
     HOT PATH — runs inside a low-level hook callback. Only
-    GetForegroundWindow plus an integer compare; nothing here may send a
-    window message or open a process handle (see the note above)."""
+    GetForegroundWindow, GetWindowThreadProcessId and integer compares;
+    nothing here may send a window message or open a process handle (see
+    the note above)."""
     fg = _foreground_hwnd()
     if not fg:
         return False
     with _game_hwnd_lock:
-        cached = _game_hwnd
+        cached, cached_pid = _game_hwnd, _game_pid
     # _same_hwnd (pure int masking, hook-safe), not ==: FindWindowW may be
     # bound to return HWND (unsigned) while GetForegroundWindow returns a
     # signed c_int, so a handle with bit 31 set never matched raw and the
     # game counted as "not in front".
-    return _same_hwnd(fg, cached)
+    if not _same_hwnd(fg, cached):
+        return False
+    # Recycled-HWND guard (see is_allowed_foreground): GetWindowThreadProcessId
+    # doesn't message the window. Unknown PID keeps the HWND-only answer.
+    return not cached_pid or _window_pid(fg) == cached_pid
 
 
 FOCUS_GAME_NOT_FOUND = 'game_not_found'
@@ -2304,6 +2333,10 @@ class MacroController:
         self._playing_slot = None
         self._playing_name = ''
         self._playing_source = ''
+        # Bumped by every playback start (status `macro_play_gen`), so the
+        # UI sees a new playback even when the drain coalesces an
+        # interrupt into "still playing" — same slot included.
+        self._play_gen = 0
         # Bindings reserved as macro hotkeys — filtered out of capture so
         # the user pressing the record-stop key doesn't end up inside the
         # macro itself.
@@ -2465,6 +2498,8 @@ class MacroController:
             # Events in the macro that is playing — an active slot's
             # count differs from the working buffer's. 0 when idle.
             'macro_playing_events': self._playing_events,
+            # Playback generation (see __init__).
+            'macro_play_gen': self._play_gen,
             # Buffer revision for the events editor (see __init__).
             'macro_rev': self._buffer_rev,
             # Last user-actionable failure ('' = none).
@@ -3129,6 +3164,7 @@ class MacroController:
     def _start_playback_locked(self, controller, events, slot, name, source):
         self._stop_play_evt = threading.Event()
         self._state = self.STATE_PLAYING
+        self._play_gen += 1
         self._playing_slot = slot
         self._playing_name = name or ''
         self._playing_source = source

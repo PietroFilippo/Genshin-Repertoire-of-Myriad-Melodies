@@ -1058,6 +1058,27 @@ class DirectionABridgeTests(unittest.TestCase):
         self.assertTrue(api.allow_close())
         api._ask_discard_unsaved_macro.assert_not_called()
 
+    def test_editor_dirty_updates_apply_in_sequence_order(self):
+        """G5: bridge calls run on their own threads, so an older 'false'
+        (hide) can land after a newer 'true' (reopen + edit). The older
+        one must be dropped or Alt+F4 closes without asking."""
+        api = self.make_api()
+        api._macro = self._macro_with()
+        api._ask_discard_unsaved_macro = mock.Mock(return_value=False)
+        self.assertIs(api.macro_set_editor_dirty(True, 11), True)
+        self.assertIs(api.macro_set_editor_dirty(False, 10), False)  # late
+        self.assertFalse(api.allow_close())                 # still asks
+        self.assertIs(api.macro_set_editor_dirty(True, 11), False)   # dup
+        self.assertIs(api.macro_set_editor_dirty(False, 12), True)
+        self.assertTrue(api.allow_close())
+        # Without seq (older page) an update always applies.
+        self.assertIs(api.macro_set_editor_dirty(True), True)
+        self.assertTrue(api._editor_dirty)
+        # Clock-seeded seqs from a reloaded page (JS Date.now()) work.
+        self.assertIs(api.macro_set_editor_dirty(False, 1_760_000_000_000),
+                      True)
+        self.assertFalse(api._editor_dirty)
+
     def test_close_confirmed_skips_prompt_for_editor_edits(self):
         api = self.make_api()
         api._macro = self._macro_with()
