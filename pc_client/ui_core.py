@@ -367,19 +367,93 @@ def bot_options_for_settings(opts):
         {k: opts.get(k) for k in _PERSISTED_BOT_OPTION_KEYS})
 
 
+# Window chrome persisted across launches: the page theme (`theme`) and
+# the frameless window's restored geometry (`window_rect`, in logical
+# 96-DPI pixels — the units webview.create_window takes) plus whether it
+# was maximized (`window_maximized`). ui.py owns the Win32 side (the
+# on-screen check at launch, the resize loop, the work-area maximize);
+# these helpers only sanitize what a hand-edited file may contain.
+UI_THEMES = ('score', 'light', 'dark', 'system')
+UI_THEME_DEFAULT = 'score'
+# Logical px. UI_WINDOW_MIN_SIZE is create_window's min_size (WinForms
+# MinimumSize) and the floor of the manual resize loop in ui.py.
+UI_WINDOW_MIN_SIZE = (640, 600)
+UI_WINDOW_DEFAULT_SIZE = (720, 720)
+# Anything bigger is a corrupt value, not a window.
+UI_WINDOW_MAX_DIM = 10000
+# |x| / |y| bound for a saved position (virtual desktops span negative
+# coordinates when a monitor sits left of / above the primary one).
+UI_WINDOW_MAX_COORD = 100000
+
+
+def normalize_theme(value):
+    """One of UI_THEMES; anything else (unknown name, wrong type) is the
+    default 'score' theme."""
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in UI_THEMES:
+            return value
+    return UI_THEME_DEFAULT
+
+
+def _rect_number(value):
+    """int for a finite JSON number (bool refused — int(True) is 1),
+    else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float):
+        if value != value or value in (float('inf'), float('-inf')):
+            return None
+        value = round(value)
+    return int(value)
+
+
+def normalize_window_rect(value):
+    """Sanitize a persisted `window_rect` ({x, y, width, height}, logical
+    px). Returns a fresh dict of ints or None (no usable rect → the
+    default size, centered). Width / height below UI_WINDOW_MIN_SIZE are
+    raised to it (DPI rounding can land a pixel under); above
+    UI_WINDOW_MAX_DIM, or a coordinate beyond UI_WINDOW_MAX_COORD, the
+    whole rect is garbage. Whether the rect is actually on a monitor is
+    decided at launch by ui.py, not here."""
+    if not isinstance(value, dict):
+        return None
+    nums = {k: _rect_number(value.get(k))
+            for k in ('x', 'y', 'width', 'height')}
+    if any(v is None for v in nums.values()):
+        return None
+    if (nums['width'] > UI_WINDOW_MAX_DIM
+            or nums['height'] > UI_WINDOW_MAX_DIM
+            or abs(nums['x']) > UI_WINDOW_MAX_COORD
+            or abs(nums['y']) > UI_WINDOW_MAX_COORD):
+        return None
+    nums['width'] = max(nums['width'], UI_WINDOW_MIN_SIZE[0])
+    nums['height'] = max(nums['height'], UI_WINDOW_MIN_SIZE[1])
+    return nums
+
+
+def default_settings():
+    """A fresh settings dict with every field at its default."""
+    return {
+        'keybinds': dict(UI_KEYBINDS_DEFAULT),
+        'input_backend': INPUT_BACKEND_DEFAULT,
+        'macro_active_macros': _default_active_macros(),
+        'macro_conflict_policy': MACRO_CONFLICT_IGNORE,
+        'bot_options': default_bot_options(),
+        'prereq_tip_dismissed': False,
+        'theme': UI_THEME_DEFAULT,
+        'window_rect': None,
+        'window_maximized': False,
+    }
+
+
 def load_settings():
-    """Load UI settings (keybinds + input_backend). Falls back to config
-    defaults on missing file or parse errors."""
+    """Load UI settings (keybinds, input_backend, macro / Main-tab
+    options, theme, window geometry). Every field is sanitized; falls
+    back to defaults on a missing file or parse errors. Never raises."""
     p = settings_path()
     if not p.exists():
-        return {
-            'keybinds': dict(UI_KEYBINDS_DEFAULT),
-            'input_backend': INPUT_BACKEND_DEFAULT,
-            'macro_active_macros': _default_active_macros(),
-            'macro_conflict_policy': MACRO_CONFLICT_IGNORE,
-            'bot_options': default_bot_options(),
-            'prereq_tip_dismissed': False,
-        }
+        return default_settings()
     try:
         with p.open('r', encoding='utf-8') as fh:
             data = json.load(fh)
@@ -399,17 +473,14 @@ def load_settings():
             # hidden for good once dismissed. Strict bool only.
             'prereq_tip_dismissed':
                 data.get('prereq_tip_dismissed') is True,
+            'theme': normalize_theme(data.get('theme')),
+            'window_rect': normalize_window_rect(data.get('window_rect')),
+            # Strict bool, like prereq_tip_dismissed.
+            'window_maximized': data.get('window_maximized') is True,
         }
     except Exception as e:
         print(f"[ui] failed to load settings: {e} — using defaults")
-        return {
-            'keybinds': dict(UI_KEYBINDS_DEFAULT),
-            'input_backend': INPUT_BACKEND_DEFAULT,
-            'macro_active_macros': _default_active_macros(),
-            'macro_conflict_policy': MACRO_CONFLICT_IGNORE,
-            'bot_options': default_bot_options(),
-            'prereq_tip_dismissed': False,
-        }
+        return default_settings()
 
 
 def _accepts_kwarg(fn, name):

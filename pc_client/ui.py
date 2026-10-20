@@ -139,6 +139,9 @@ from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
                      warn_if_not_admin)
 from ui_core import bot_options_for_settings, clamp_song_count, normalize_bot_options, normalize_difficulty
 from ui_core import normalize_hotkey, validate_hotkey
+from ui_core import (UI_THEMES, UI_WINDOW_DEFAULT_SIZE, UI_WINDOW_MIN_SIZE,
+                     normalize_theme, normalize_window_rect)
+from system_setup import set_dpi_aware
 from ui_core import FOCUS_GAME_NOT_FOUND, FOCUS_GAME_STOPPED, focus_game_window_ex
 # Imported defensively: a missing pyserial must only break the Arduino
 # path (make_input_backend imports controller lazily for the same reason).
@@ -502,6 +505,389 @@ def _set_window_icon(hwnd, icon_path):
         print(f"[ui] icon set failed: {e}")
 
 
+# --- frameless window geometry: resize, maximize, remembered rect ----------
+# pywebview's frameless WinForms window has FormBorderStyle.None, so it has
+# no native resize edges even with resizable=True. The page puts grab zones
+# on its edges / corners and calls start_window_resize(edge) on a left
+# mousedown; a short-lived thread then follows the cursor until the button
+# is released (see BridgeApi._resize_loop for why not a native sizing loop).
+
+# Page background per theme — `--bg` in pc_client/web/style.css (keep in
+# sync), used as the WinForms BackColor / WebView2 DefaultBackgroundColor
+# so the window doesn't flash white (or the wrong theme) before the page
+# paints, or along the growing edge while it is resized. 'system' is
+# resolved like the page does (Windows app mode: dark → Dark, light →
+# Light); its entry here is the fallback when the mode can't be read.
+THEME_BACKGROUNDS = {
+    'score': '#171a21',     # :root
+    'light': '#eeece6',     # [data-theme="light"]
+    'dark': '#0a0a0a',      # [data-theme="dark"]
+    'system': '#171a21',
+}
+
+RESIZE_EDGES = frozenset(('n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'))
+# Cursor poll cadence of the resize loop (~one WebView2 relayout per tick).
+RESIZE_POLL_S = 0.010
+# Hard cap on one resize — a lost button-up (secure desktop, ...) can't
+# leave the loop running forever.
+RESIZE_MAX_S = 60.0
+# How often the drain refreshes the remembered restored rect (one
+# GetWindowRect + IsIconic + IsZoomed — kernel reads, no messages).
+WINDOW_RECT_POLL_S = 1.0
+# A remembered rect counts as on-screen at launch only if this much of
+# its titlebar strip (logical px) lies inside some monitor's work area —
+# the titlebar is the only way to move a frameless window back.
+_TITLEBAR_STRIP_H = 40
+_TITLEBAR_MIN_VISIBLE_W = 120
+_TITLEBAR_MIN_VISIBLE_H = 20
+
+_VK_LBUTTON = 0x01
+_VK_RBUTTON = 0x02
+_SM_SWAPBUTTON = 23
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
+_MONITOR_DEFAULTTONEAREST = 2
+_WS_OVERLAPPEDWINDOW = 0x00CF0000
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [('cbSize', ctypes.wintypes.DWORD),
+                ('rcMonitor', ctypes.wintypes.RECT),
+                ('rcWork', ctypes.wintypes.RECT),
+                ('dwFlags', ctypes.wintypes.DWORD)]
+
+
+_MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    ctypes.wintypes.BOOL, ctypes.wintypes.HMONITOR, ctypes.wintypes.HDC,
+    ctypes.POINTER(ctypes.wintypes.RECT), ctypes.wintypes.LPARAM)
+
+
+class _UiWin32:
+    """The Win32 calls behind the window resize / maximize / remembered
+    geometry code. Rects are (left, top, right, bottom) in the process's
+    coordinate space (physical px: pywebview makes the process
+    system-DPI-aware before it creates the window, and main() does the same
+    before reading monitors). Every method swallows errors (None / False).
+
+    Private WinDLL instance: the argtypes below must not leak onto the
+    shared ctypes.windll.user32 function objects that other modules (and
+    pywebview) call with their own args. Explicit restypes keep x64 handles
+    from being truncated to 32 bits."""
+
+    def __init__(self):
+        W = ctypes.wintypes
+        u = ctypes.WinDLL('user32')
+        u.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
+        u.GetWindowRect.restype = W.BOOL
+        u.GetCursorPos.argtypes = [ctypes.POINTER(W.POINT)]
+        u.GetCursorPos.restype = W.BOOL
+        u.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        u.GetAsyncKeyState.restype = ctypes.c_short
+        u.GetSystemMetrics.argtypes = [ctypes.c_int]
+        u.GetSystemMetrics.restype = ctypes.c_int
+        u.SetWindowPos.argtypes = [
+            W.HWND, W.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        u.SetWindowPos.restype = W.BOOL
+        for name in ('IsZoomed', 'IsIconic', 'IsWindow'):
+            fn = getattr(u, name)
+            fn.argtypes = [W.HWND]
+            fn.restype = W.BOOL
+        u.MonitorFromWindow.argtypes = [W.HWND, W.DWORD]
+        u.MonitorFromWindow.restype = W.HMONITOR
+        u.GetMonitorInfoW.argtypes = [W.HMONITOR, ctypes.POINTER(_MONITORINFO)]
+        u.GetMonitorInfoW.restype = W.BOOL
+        u.EnumDisplayMonitors.argtypes = [
+            W.HDC, ctypes.POINTER(W.RECT), _MONITORENUMPROC, W.LPARAM]
+        u.EnumDisplayMonitors.restype = W.BOOL
+        u.AdjustWindowRectEx.argtypes = [
+            ctypes.POINTER(W.RECT), W.DWORD, W.BOOL, W.DWORD]
+        u.AdjustWindowRectEx.restype = W.BOOL
+        # Windows 10 1607+; absent → scale 1.0.
+        self._dpi_for_window = None
+        self._dpi_for_system = None
+        try:
+            u.GetDpiForWindow.argtypes = [W.HWND]
+            u.GetDpiForWindow.restype = ctypes.c_uint
+            self._dpi_for_window = u.GetDpiForWindow
+        except AttributeError:
+            pass
+        try:
+            u.GetDpiForSystem.argtypes = []
+            u.GetDpiForSystem.restype = ctypes.c_uint
+            self._dpi_for_system = u.GetDpiForSystem
+        except AttributeError:
+            pass
+        self._u = u
+
+    def window_rect(self, hwnd):
+        try:
+            r = ctypes.wintypes.RECT()
+            if self._u.GetWindowRect(hwnd, ctypes.byref(r)):
+                return (r.left, r.top, r.right, r.bottom)
+        except Exception:
+            pass
+        return None
+
+    def set_window_rect(self, hwnd, rect):
+        """Move + size without activating or changing the Z order. Called
+        off the UI thread, so the sizing messages are sent across threads
+        (pywebview's own move() does the same) — never call it while
+        holding a lock the UI thread may wait for."""
+        l, t, r, b = rect
+        try:
+            return bool(self._u.SetWindowPos(
+                hwnd, None, int(l), int(t), int(r - l), int(b - t),
+                _SWP_NOZORDER | _SWP_NOACTIVATE))
+        except Exception:
+            return False
+
+    def cursor_pos(self):
+        try:
+            p = ctypes.wintypes.POINT()
+            if self._u.GetCursorPos(ctypes.byref(p)):
+                return (p.x, p.y)
+        except Exception:
+            pass
+        return None
+
+    def primary_button_vk(self):
+        """VK of the PHYSICAL button that is the logical primary one.
+        GetAsyncKeyState reads physical buttons, and the page's left
+        mousedown is the logical primary — the physical right button
+        when the user swapped buttons."""
+        try:
+            if self._u.GetSystemMetrics(_SM_SWAPBUTTON):
+                return _VK_RBUTTON
+        except Exception:
+            pass
+        return _VK_LBUTTON
+
+    def button_down(self, vk):
+        try:
+            return bool(self._u.GetAsyncKeyState(vk) & 0x8000)
+        except Exception:
+            return False
+
+    def is_zoomed(self, hwnd):
+        try:
+            return bool(self._u.IsZoomed(hwnd))
+        except Exception:
+            return False
+
+    def is_iconic(self, hwnd):
+        try:
+            return bool(self._u.IsIconic(hwnd))
+        except Exception:
+            return False
+
+    def dpi_scale(self, hwnd):
+        """Logical→physical factor for `hwnd` — the same GetDpiForWindow
+        / 96 pywebview uses for its Size / MinimumSize / Location."""
+        try:
+            if self._dpi_for_window is not None:
+                dpi = int(self._dpi_for_window(hwnd))
+                if dpi > 0:
+                    return dpi / 96.0
+        except Exception:
+            pass
+        return self.system_scale()
+
+    def system_scale(self):
+        try:
+            if self._dpi_for_system is not None:
+                dpi = int(self._dpi_for_system())
+                if dpi > 0:
+                    return dpi / 96.0
+        except Exception:
+            pass
+        return 1.0
+
+    def frame_delta(self):
+        """(width, height) a sizable frame adds around a client area —
+        what WinForms loses when pywebview switches the form to
+        FormBorderStyle.None after sizing it (see
+        initial_window_geometry). (0, 0) on failure."""
+        try:
+            r = ctypes.wintypes.RECT(0, 0, 0, 0)
+            if self._u.AdjustWindowRectEx(
+                    ctypes.byref(r), _WS_OVERLAPPEDWINDOW, False, 0):
+                return (max(0, r.right - r.left), max(0, r.bottom - r.top))
+        except Exception:
+            pass
+        return (0, 0)
+
+    def monitor_work_area(self, hwnd):
+        """Work area (taskbar excluded) of the monitor nearest `hwnd`."""
+        try:
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            mon = self._u.MonitorFromWindow(hwnd, _MONITOR_DEFAULTTONEAREST)
+            if mon and self._u.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                w = mi.rcWork
+                return (w.left, w.top, w.right, w.bottom)
+        except Exception:
+            pass
+        return None
+
+    def work_areas(self):
+        """Work area of every monitor ([] on failure)."""
+        out = []
+
+        def _cb(hmon, _hdc, _rect, _lparam):
+            try:
+                mi = _MONITORINFO()
+                mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                if self._u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                    w = mi.rcWork
+                    out.append((w.left, w.top, w.right, w.bottom))
+            except Exception:
+                pass
+            return True
+        try:
+            self._u.EnumDisplayMonitors(None, None, _MONITORENUMPROC(_cb), 0)
+        except Exception:
+            return []
+        return out
+
+
+_ui_win32_instance = None
+_ui_win32_lock = threading.Lock()
+
+
+def _ui_win32():
+    """Process-wide _UiWin32 (built lazily — prototypes bound once)."""
+    global _ui_win32_instance
+    with _ui_win32_lock:
+        if _ui_win32_instance is None:
+            _ui_win32_instance = _UiWin32()
+        return _ui_win32_instance
+
+
+def _apps_use_light_theme():
+    """Windows' app mode (Settings → Personalization → Colors), which
+    WebView2's prefers-color-scheme follows: True = light, False = dark,
+    None = unreadable."""
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r'Software\Microsoft\Windows\CurrentVersion\Themes'
+                r'\Personalize') as k:
+            value, _kind = winreg.QueryValueEx(k, 'AppsUseLightTheme')
+        return bool(value)
+    except Exception:
+        return None
+
+
+def theme_background(theme):
+    """create_window / native background color for a theme name."""
+    theme = normalize_theme(theme)
+    if theme == 'system':
+        light = _apps_use_light_theme()
+        if light is not None:
+            return THEME_BACKGROUNDS['light' if light else 'dark']
+    return THEME_BACKGROUNDS[theme]
+
+
+def resize_rect(edge, start, dx, dy, min_w, min_h):
+    """New (left, top, right, bottom) after dragging `edge` of `start` by
+    (dx, dy) cursor pixels. Only the dragged edge(s) move; each stops
+    where the window would get smaller than min_w x min_h, so the opposite
+    edge never moves (WinForms' own MinimumSize enforcement would keep the
+    left/top and shove the right/bottom instead)."""
+    l, t, r, b = start
+    if 'w' in edge:
+        l = min(l + dx, r - min_w)
+    elif 'e' in edge:
+        r = max(r + dx, l + min_w)
+    if 'n' in edge:
+        t = min(t + dy, b - min_h)
+    elif 's' in edge:
+        b = max(b + dy, t + min_h)
+    return (l, t, r, b)
+
+
+def _visible_work_area(rect, work_areas, scale):
+    """The work area in which enough of `rect`'s titlebar strip is visible
+    to grab it (most visible wins), or None. rect = (l, t, r, b)."""
+    l, t, r, _b = rect
+    strip_b = t + int(_TITLEBAR_STRIP_H * scale)
+    need_w = min(r - l, int(_TITLEBAR_MIN_VISIBLE_W * scale))
+    need_h = int(_TITLEBAR_MIN_VISIBLE_H * scale)
+    best, best_area = None, 0
+    for wa in work_areas:
+        wl, wt, wr, wb = wa
+        iw = min(r, wr) - max(l, wl)
+        ih = min(strip_b, wb) - max(t, wt)
+        if iw >= need_w and ih >= need_h and iw * ih > best_area:
+            best, best_area = wa, iw * ih
+    return best
+
+
+def initial_window_geometry(settings, win=None):
+    """(create_window kwargs {width, height, x, y} in logical px, target)
+    from the remembered `window_rect`. `target` is the exact physical
+    (left, top, right, bottom) the window should end up at — applied once
+    it is shown (BridgeApi._apply_startup_geometry) — or None.
+
+    Falls back to the default size centered (x = y = None → WinForms
+    CenterScreen, target None) when there is no rect, Win32 fails, or its
+    titlebar isn't on any monitor's work area (monitor unplugged,
+    resolution lowered). A rect bigger than the work area it lands on is
+    shrunk to fit and pinned to it.
+
+    Frame compensation: pywebview sets the form's Size while it still has
+    a sizable frame and only then switches to FormBorderStyle.None, which
+    keeps the CLIENT size — create_window(720, 720) gives a 704 x 681
+    window at 96 DPI (measured). The saved rect is the real window, so the
+    width / height passed in are grown by that frame (AdjustWindowRectEx of
+    WS_OVERLAPPEDWINDOW); without it the window shrank on every launch.
+    The default size is passed as-is (unchanged first-launch window).
+
+    The process must already be DPI-aware like pywebview makes it (main()
+    calls set_dpi_aware), so monitor rects and pywebview's logical →
+    physical scale agree."""
+    default = ({'width': UI_WINDOW_DEFAULT_SIZE[0],
+                'height': UI_WINDOW_DEFAULT_SIZE[1], 'x': None, 'y': None},
+               None)
+    saved = normalize_window_rect((settings or {}).get('window_rect'))
+    if saved is None:
+        return default
+    try:
+        win = win or _ui_win32()
+        scale = win.system_scale() or 1.0
+        areas = win.work_areas()
+        frame_w, frame_h = win.frame_delta()
+    except Exception:
+        return default
+    if not areas:
+        return default
+    x = int(round(saved['x'] * scale))
+    y = int(round(saved['y'] * scale))
+    w = int(round(saved['width'] * scale))
+    h = int(round(saved['height'] * scale))
+    wa = _visible_work_area((x, y, x + w, y + h), areas, scale)
+    if wa is None:
+        print('[ui] saved window position is off-screen — using the '
+              'default size, centered')
+        return default
+    wl, wt, wr, wb = wa
+    if w > wr - wl:
+        w, x = wr - wl, wl
+    if h > wb - wt:
+        h, y = wb - wt, wt
+    w = max(w, int(UI_WINDOW_MIN_SIZE[0] * scale))
+    h = max(h, int(UI_WINDOW_MIN_SIZE[1] * scale))
+    kwargs = {
+        'width': int(round((w + frame_w) / scale)),
+        'height': int(round((h + frame_h) / scale)),
+        'x': int(round(x / scale)),
+        'y': int(round(y / scale)),
+    }
+    return kwargs, (x, y, x + w, y + h)
+
+
 class BridgeApi:
     """Public methods exposed to JS as `pywebview.api.*`. JS calls these
     directly; return values come back as a Promise on the JS side. Methods
@@ -538,7 +924,26 @@ class BridgeApi:
         # the bot's last_error when the bot was the caller.
         self._backend_error = ''
         # Window rect saved by toggle_maximize (None = not maximized).
+        # (x, y, width, height), physical px — like _normal_rect below.
         self._restore_rect = None
+        # Last known restored (not maximized / minimized) window rect,
+        # refreshed ~1 Hz by the drain, after a resize and before a
+        # maximize; what detach persists when the window is minimized or
+        # maximized at close. None until first seen.
+        self._normal_rect = None
+        # Exact physical rect to put the window at once it is shown (the
+        # remembered one; set by main() from initial_window_geometry).
+        # One shot — consumed by _apply_startup_geometry.
+        self._startup_rect = None
+        # Re-maximize once the window is shown (it was maximized at the
+        # last close). One shot — consumed by _apply_startup_maximize.
+        self._startup_maximize = self._settings.get('window_maximized') is True
+        self._startup_maximize_claimed = False
+        # One edge / corner resize at a time (start_window_resize).
+        self._resize_lock = threading.Lock()
+        self._resize_thread = None
+        # _UiWin32 override for tests; None = the process-wide instance.
+        self._win32 = None
         # Set once the user agreed to discard unsaved macro work (in-app
         # dialog → close(confirmed=True), or the native prompt) so the
         # close isn't asked about twice. See allow_close.
@@ -696,6 +1101,14 @@ class BridgeApi:
         self._stopping = True
         self._drain_stop.set()
 
+        # Remember the window's size / position / maximized state for the
+        # next launch, while it is still shown (a pywebview drag-move has
+        # no end event — this catches it). Kernel-side reads + one atomic
+        # settings write; uses only the cached HWND. Never joins the
+        # resize thread: it may be parked in a SetWindowPos sent to THIS
+        # (UI) thread — it sees _tearing_down and exits on its own.
+        self._persist_window_geometry_on_close()
+
         # Hide the window before any blocking teardown. `closing` runs
         # synchronously on the WinForms UI thread, and the bot / macro
         # joins below can take seconds mid-album — hidden, that wait is
@@ -806,7 +1219,62 @@ class BridgeApi:
                     'macro_conflict_policy', MACRO_CONFLICT_IGNORE),
                 'input_backend': self._settings.get(
                     'input_backend', INPUT_BACKEND_DEFAULT),
+                'theme': normalize_theme(self._settings.get('theme')),
+                'maximized': self._is_maximized(),
             }
+
+    def _is_maximized(self):
+        """Work-area maximized right now — or about to be: the startup
+        re-maximize runs once the window is shown and may land after the
+        page asked. Plain attribute reads (get_initial_state + drain)."""
+        return (getattr(self, '_restore_rect', None) is not None
+                or bool(getattr(self, '_startup_maximize', False)))
+
+    def set_theme(self, name):
+        """Persist the page theme ('score' | 'light' | 'dark' | 'system';
+        atomic settings write) and repaint the native background behind
+        the page to match. {'ok': True, 'theme': name}, or {'ok': False,
+        'reason': 'bad_theme'} for anything else (nothing changes)."""
+        if not isinstance(name, str) or name not in UI_THEMES:
+            return {'ok': False, 'reason': 'bad_theme'}
+        with self._lock:
+            if self._settings.get('theme') != name:
+                self._settings['theme'] = name
+                save_settings(self._settings)
+        self._apply_native_background(theme_background(name))
+        return {'ok': True, 'theme': name}
+
+    def _apply_native_background(self, color):
+        """Best effort: set the WinForms BackColor + WebView2
+        DefaultBackgroundColor (what shows before the page paints and
+        along the growing edge during a resize) to `color`. Queued with
+        BeginInvoke — never blocks the bridge thread on the UI thread.
+        False when there is no native form (tests, not shown yet)."""
+        w = self._window
+        form = getattr(w, 'native', None) if w is not None else None
+        if form is None or not hasattr(form, 'BeginInvoke'):
+            return False
+        try:
+            from System import Action                 # pythonnet
+            from System.Drawing import ColorTranslator
+        except Exception:
+            return False
+
+        def _apply():
+            try:
+                c = ColorTranslator.FromHtml(color)
+                form.BackColor = c
+                wv = getattr(getattr(form, 'browser', None), 'webview', None)
+                if wv is not None:
+                    wv.DefaultBackgroundColor = c
+            except Exception as e:
+                print(f"[ui] background update failed: {e}")
+        try:
+            form.BeginInvoke(Action(_apply))
+            return True
+        except Exception as e:
+            print(f"[ui] background update failed: {e}")
+            return False
 
     def dismiss_prereq_tip(self):
         """Hide the Main-tab prerequisites tip for good: persists
@@ -1532,60 +2000,251 @@ class BridgeApi:
         bug) and not window.maximize() either: for a frameless WinForms
         form (FormBorderStyle.None) DefWindowProc sizes the maximized
         window to the full monitor, i.e. it covers the taskbar too. So
-        snap the rect ourselves with plain Win32 calls."""
+        snap the rect ourselves with plain Win32 calls (_UiWin32: a
+        private WinDLL('user32') with explicit prototypes).
+
+        Also persists `window_maximized` + the restored rect, so the next
+        launch reopens the same way (see _apply_startup_maximize)."""
         hwnd = self._ui_hwnd()
         if not hwnd:
             return {'maximized': self._restore_rect is not None}
+        changed = False
         try:
-            W = ctypes.wintypes
-            # Private WinDLL instance: the argtypes below must not leak
-            # onto the shared ctypes.windll.user32 function objects that
-            # other modules (and pywebview) call with their own args.
-            user32 = ctypes.WinDLL('user32')
-
-            class _MONITORINFO(ctypes.Structure):
-                _fields_ = [('cbSize', W.DWORD), ('rcMonitor', W.RECT),
-                            ('rcWork', W.RECT), ('dwFlags', W.DWORD)]
-
-            user32.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
-            user32.GetWindowRect.restype = W.BOOL
-            user32.MonitorFromWindow.argtypes = [W.HWND, W.DWORD]
-            user32.MonitorFromWindow.restype = W.HMONITOR
-            user32.GetMonitorInfoW.argtypes = [
-                W.HMONITOR, ctypes.POINTER(_MONITORINFO)]
-            user32.GetMonitorInfoW.restype = W.BOOL
-            user32.SetWindowPos.argtypes = [
-                W.HWND, W.HWND, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-            user32.SetWindowPos.restype = W.BOOL
-            SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
-            MONITOR_DEFAULTTONEAREST = 2
-
+            win = self._win()
             if self._restore_rect is None:
-                cur = W.RECT()
-                if not user32.GetWindowRect(hwnd, ctypes.byref(cur)):
+                cur = win.window_rect(hwnd)
+                if cur is None:
                     return {'maximized': False}
-                mi = _MONITORINFO()
-                mi.cbSize = ctypes.sizeof(_MONITORINFO)
-                mon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
-                if not mon or not user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                work = win.monitor_work_area(hwnd)
+                if work is None:
                     return {'maximized': False}
-                work = mi.rcWork
-                if user32.SetWindowPos(
-                        hwnd, None, work.left, work.top,
-                        work.right - work.left, work.bottom - work.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE):
-                    self._restore_rect = (cur.left, cur.top,
-                                          cur.right - cur.left,
-                                          cur.bottom - cur.top)
+                if win.set_window_rect(hwnd, work):
+                    self._restore_rect = (cur[0], cur[1],
+                                          cur[2] - cur[0], cur[3] - cur[1])
+                    if not (win.is_zoomed(hwnd) or win.is_iconic(hwnd)):
+                        self._normal_rect = self._restore_rect
+                    changed = True
             else:
                 x, y, w, h = self._restore_rect
                 self._restore_rect = None
-                user32.SetWindowPos(hwnd, None, x, y, w, h,
-                                    SWP_NOZORDER | SWP_NOACTIVATE)
+                win.set_window_rect(hwnd, (x, y, x + w, y + h))
+                self._normal_rect = (x, y, w, h)
+                changed = True
         except Exception as e:
             print(f"[ui] maximize failed: {e}")
-        return {'maximized': self._restore_rect is not None}
+        maximized = self._restore_rect is not None
+        if changed:
+            self._save_window_geometry(
+                self._restore_rect or self._normal_rect, maximized, hwnd)
+        return {'maximized': maximized}
+
+    def _apply_startup_geometry(self):
+        """Put the just-shown window exactly at the remembered rect
+        (_startup_rect) when it isn't there already — create_window's
+        logical size is frame-compensated but can be a pixel off after
+        DPI rounding. One shot, consumed once the HWND is known."""
+        target = getattr(self, '_startup_rect', None)
+        if target is None or self._tearing_down:
+            return False
+        hwnd = self._ui_hwnd()
+        if not hwnd:
+            return False
+        self._startup_rect = None
+        win = self._win()
+        cur = win.window_rect(hwnd)
+        moved = False
+        if cur != tuple(target):
+            moved = win.set_window_rect(hwnd, target)
+            print(f"[ui] window restored to {target} (was {cur})")
+        l, t, r, b = target
+        if moved or cur == tuple(target):
+            self._normal_rect = (l, t, r - l, b - t)
+        return moved
+
+    def _apply_startup_maximize(self):
+        """Re-maximize (work area, via toggle_maximize) a window that was
+        maximized at the last close. Called once the window is shown —
+        not create_window(maximized=True), which for a frameless form
+        covers the taskbar. The window was created at the remembered
+        restored rect, so Restore returns there. One shot, consumed only
+        once the HWND is known (`shown` and `loaded` both call this)."""
+        if not getattr(self, '_startup_maximize', False):
+            return False
+        if self._tearing_down or not self._ui_hwnd():
+            return False
+        with self._lock:
+            # `shown` and `loaded` run this on two threads: one claims it.
+            if (not self._startup_maximize
+                    or getattr(self, '_startup_maximize_claimed', False)):
+                return False
+            self._startup_maximize_claimed = True
+        try:
+            if self._restore_rect is not None:
+                return False
+            return bool(self.toggle_maximize().get('maximized'))
+        finally:
+            # Cleared only now, so _is_maximized() never reads False in
+            # between (the drain would push a one-tick "restored").
+            self._startup_maximize = False
+
+    # ---- frameless resize (start_window_resize) ----
+
+    def _win(self):
+        return getattr(self, '_win32', None) or _ui_win32()
+
+    def start_window_resize(self, edge):
+        """Resize the frameless window by `edge` ('n', 's', 'e', 'w', 'ne',
+        'nw', 'se', 'sw') until the primary mouse button is released. The
+        page calls it on a left mousedown in an edge / corner grab zone.
+        Returns at once ({'ok': True}); a daemon thread does the drag.
+
+        {'ok': False, 'reason': ...}: 'bad_edge' (anything not listed),
+        'maximized' (maximized or minimized — like a native window, a
+        maximized one has no resize edges; Restore first), 'busy' (a resize
+        is already running), 'closing', 'no_window', 'win32_failed'.
+
+        Why a polling thread and not ReleaseCapture + WM_NCLBUTTONDOWN
+        (HTLEFT...) → DefWindowProc's native sizing loop: the press lands
+        in WebView2's renderer window, whose mouse capture belongs to
+        another thread (msedgewebview2 process), and the bridge call
+        arrives on a pywebview worker thread — ReleaseCapture there
+        releases nothing, and the modal loop would run on the UI thread
+        that also serves `closing` / evaluate_js. Following the cursor
+        with GetCursorPos + GetAsyncKeyState + SetWindowPos (the same
+        cross-thread SetWindowPos pywebview's own drag-move uses) works
+        whoever holds the capture, honors the minimum size without
+        WM_GETMINMAXINFO, and can't wedge the UI thread."""
+        if not isinstance(edge, str) or edge not in RESIZE_EDGES:
+            return {'ok': False, 'reason': 'bad_edge'}
+        if self._tearing_down:
+            return {'ok': False, 'reason': 'closing'}
+        hwnd = self._ui_hwnd()
+        if not hwnd:
+            return {'ok': False, 'reason': 'no_window'}
+        win = self._win()
+        with self._resize_lock:
+            t = self._resize_thread
+            if t is not None and t.is_alive():
+                return {'ok': False, 'reason': 'busy'}
+            if (self._restore_rect is not None or win.is_zoomed(hwnd)
+                    or win.is_iconic(hwnd)):
+                return {'ok': False, 'reason': 'maximized'}
+            start = win.window_rect(hwnd)
+            cursor = win.cursor_pos()
+            if start is None or cursor is None:
+                return {'ok': False, 'reason': 'win32_failed'}
+            scale = win.dpi_scale(hwnd)
+            # Same int(min * scale) pywebview used for MinimumSize.
+            min_w = int(UI_WINDOW_MIN_SIZE[0] * scale)
+            min_h = int(UI_WINDOW_MIN_SIZE[1] * scale)
+            t = threading.Thread(
+                target=self._resize_loop,
+                args=(hwnd, edge, start, cursor, min_w, min_h,
+                      win.primary_button_vk(), win),
+                daemon=True, name='ui-resize')
+            self._resize_thread = t
+            t.start()
+        return {'ok': True}
+
+    def _resize_loop(self, hwnd, edge, start, cursor, min_w, min_h, vk,
+                     win):
+        """Follow the cursor every RESIZE_POLL_S until the button `vk` is
+        up, teardown starts, the window gets maximized, or RESIZE_MAX_S
+        passes. The cursor is read before the button so the last applied
+        size is where the button was released. Holds no lock while
+        SetWindowPos waits on the UI thread. Persists the final rect
+        (unless tearing down — detach persists then — or maximized —
+        toggle_maximize did)."""
+        sx, sy = cursor
+        last = start
+        deadline = time.monotonic() + RESIZE_MAX_S
+        try:
+            while (not self._tearing_down and self._restore_rect is None
+                   and time.monotonic() < deadline):
+                pos = win.cursor_pos()
+                if pos is not None:
+                    rect = resize_rect(edge, start, pos[0] - sx, pos[1] - sy,
+                                       min_w, min_h)
+                    if rect != last and win.set_window_rect(hwnd, rect):
+                        last = rect
+                if not win.button_down(vk):
+                    break
+                time.sleep(RESIZE_POLL_S)
+        except Exception as e:
+            print(f"[ui] window resize failed: {e}")
+        if self._tearing_down or self._restore_rect is not None:
+            return
+        try:
+            final = win.window_rect(hwnd) or last
+            self._normal_rect = (final[0], final[1],
+                                 final[2] - final[0], final[3] - final[1])
+            self._save_window_geometry(self._normal_rect, False, hwnd, win)
+        except Exception as e:
+            print(f"[ui] window size not saved: {e}")
+
+    # ---- remembered geometry ----
+
+    def _save_window_geometry(self, rect, maximized, hwnd=None, win=None):
+        """Persist `window_rect` (from `rect` = physical (x, y, w, h),
+        converted to logical px with the window's DPI; None keeps the saved
+        one) and `window_maximized`. Writes only when something changed.
+        Bounded wait on self._lock — this also runs on the UI thread at
+        close."""
+        upd = {'window_maximized': bool(maximized)}
+        if rect is not None:
+            win = win or self._win()
+            scale = (win.dpi_scale(hwnd) if hwnd
+                     else win.system_scale()) or 1.0
+            logical = normalize_window_rect({
+                'x': rect[0] / scale, 'y': rect[1] / scale,
+                'width': rect[2] / scale, 'height': rect[3] / scale})
+            if logical is not None:
+                upd['window_rect'] = logical
+        if not self._lock.acquire(timeout=1.0):
+            print('[ui] window size not saved (settings busy)')
+            return False
+        try:
+            if all(self._settings.get(k) == v for k, v in upd.items()):
+                return False
+            self._settings.update(upd)
+            save_settings(self._settings)
+            return True
+        finally:
+            self._lock.release()
+
+    def _track_window_rect(self):
+        """Drain-side (~1 Hz): remember the restored rect while the window
+        is neither work-area maximized, minimized nor natively zoomed.
+        Cached HWND only; never raises."""
+        try:
+            hwnd = getattr(self, '_hwnd_cache', 0)
+            if not hwnd or getattr(self, '_restore_rect', None) is not None:
+                return
+            win = self._win()
+            if win.is_iconic(hwnd) or win.is_zoomed(hwnd):
+                return
+            r = win.window_rect(hwnd)
+            if r is not None:
+                self._normal_rect = (r[0], r[1], r[2] - r[0], r[3] - r[1])
+        except Exception:
+            pass
+
+    def _persist_window_geometry_on_close(self):
+        """detach(): save the restored rect + maximized flag. A window
+        closed while minimized / natively maximized keeps the last rect
+        the drain saw. Cached HWND only; never raises."""
+        try:
+            hwnd = getattr(self, '_hwnd_cache', 0)
+            if not hwnd:
+                return
+            win = self._win()
+            self._track_window_rect()
+            restore = getattr(self, '_restore_rect', None)
+            maximized = restore is not None or win.is_zoomed(hwnd)
+            rect = restore or getattr(self, '_normal_rect', None)
+            self._save_window_geometry(rect, maximized, hwnd, win)
+        except Exception as e:
+            print(f"[ui] window size not saved: {e}")
 
     def _hide_window_for_teardown(self):
         """SW_HIDE the UI window (see detach). Uses only the cached HWND
@@ -2257,6 +2916,7 @@ class BridgeApi:
         last_push = 0.0
         last_health_check = 0.0
         last_window_poll = 0.0
+        last_rect_poll = 0.0
         game_window_found = False
         while not self._drain_stop.is_set():
             try:
@@ -2273,6 +2933,9 @@ class BridgeApi:
                 if time.monotonic() - last_window_poll >= GAME_WINDOW_POLL_S:
                     last_window_poll = time.monotonic()
                     game_window_found = self._poll_game_window()
+                if time.monotonic() - last_rect_poll >= WINDOW_RECT_POLL_S:
+                    last_rect_poll = time.monotonic()
+                    self._track_window_rect()     # never raises
                 debug = self._sync_debug_opts()
                 lanes = self._read_lanes()
                 with self._status_lock:
@@ -2281,6 +2944,9 @@ class BridgeApi:
                     status = dict(self._status)
                 status['admin'] = is_admin()
                 status['debug'] = debug
+                # Keeps the titlebar glyph / resize zones right when the
+                # startup re-maximize lands after get_initial_state.
+                status['maximized'] = self._is_maximized()
                 log_text = ''.join(chunks) if chunks else ''
                 now = time.monotonic()
                 if (log_text or status != last_status
@@ -2354,6 +3020,7 @@ def _on_shown(api, icon_path):
     the first hotkey press doesn't pay the title-search latency.
     Idempotent — safe to call from both `shown` and `loaded` events."""
     if getattr(api, '_icon_applied', False):
+        _apply_startup_window(api)    # no-op once done
         return
     hwnd = api.resolve_hwnd_now()
     # Bypass the QueueWriter so this trace is visible on the launching
@@ -2415,6 +3082,20 @@ def _on_shown(api, icon_path):
         except Exception:
             pass
     api._icon_applied = True
+    _apply_startup_window(api)
+
+
+def _apply_startup_window(api):
+    """Now that the HWND is real (after _on_shown's taskbar-button
+    refresh): snap to the exact remembered rect, then work-area maximize
+    if the window was maximized at the last close (Restore then returns
+    to that rect). Each step is one shot and stays pending until the
+    HWND resolves."""
+    for step in (api._apply_startup_geometry, api._apply_startup_maximize):
+        try:
+            step()
+        except Exception as e:
+            print(f"[ui] startup window restore failed: {e}")
 
 
 def _warm_input_stack():
@@ -2458,17 +3139,28 @@ def main():
     # is redirected — printed here it only reached the console, which a
     # --windowed .exe doesn't have, so it never showed up in Logs.)
 
+    # Reopen at the remembered size / position (logical px, checked
+    # against the monitors' work areas). pywebview makes the process
+    # system-DPI-aware inside webview.start(); doing it first (same call,
+    # idempotent) puts the monitor rects read here in the physical pixels
+    # its logical→physical Size / Location math produces.
+    set_dpi_aware()
+    geom, api._startup_rect = initial_window_geometry(api._settings)
     window = webview.create_window(
         title=UI_WINDOW_TITLE,
         url=INDEX_PATH.as_uri(),
         js_api=api,
-        width=720,
-        height=720,
-        min_size=(640, 600),
+        width=geom['width'],
+        height=geom['height'],
+        x=geom['x'],
+        y=geom['y'],
+        min_size=UI_WINDOW_MIN_SIZE,
         frameless=True,
         easy_drag=False,
         resizable=True,
-        background_color='#1a1a1a',
+        # The saved theme's page background: no white / wrong-theme
+        # flash before the page paints.
+        background_color=theme_background(api._settings.get('theme')),
     )
 
     api.attach_window(window)
