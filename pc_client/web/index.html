@@ -3,10 +3,32 @@
 <head>
     <meta charset="UTF-8">
     <title>Genshin Rhythm Bot</title>
+    <script>
+    // Theme bootstrap: localStorage mirrors the persisted `theme` so the
+    // first paint is already in it (no navy flash). get_initial_state()
+    // is authoritative and corrects it in app.js init().
+    (function () {
+        try {
+            var t = localStorage.getItem('theme');
+            if (t === 'system') t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+        } catch (e) { /* no-op: the default theme applies */ }
+    })();
+    </script>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div class="app">
+    <!-- Resize grab zones (frameless window): 6 px edges, 12 px corners,
+         invisible, hidden while maximized. mousedown -> start_window_resize. -->
+    <div class="rz rz-n" data-edge="n"></div>
+    <div class="rz rz-s" data-edge="s"></div>
+    <div class="rz rz-e" data-edge="e"></div>
+    <div class="rz rz-w" data-edge="w"></div>
+    <div class="rz rz-ne" data-edge="ne"></div>
+    <div class="rz rz-nw" data-edge="nw"></div>
+    <div class="rz rz-se" data-edge="se"></div>
+    <div class="rz rz-sw" data-edge="sw"></div>
     <!-- Titlebar. The two pywebview-drag-region islands are the only drag
          surfaces; the tabs and window buttons sit between them as plain
          (no-drag) elements so a drag can never swallow their clicks. -->
@@ -33,6 +55,15 @@
         <span class="hs" id="hs-admin"><i class="dot neutral"></i><span>Checking admin rights…</span></span>
         <span class="hs" id="hs-game"><i class="dot neutral"></i><span>Looking for the game…</span></span>
         <span class="hs-fill"></span>
+        <span class="hs hs-theme">
+            <label for="theme-select">Theme</label>
+            <span class="sel"><select id="theme-select" aria-label="Theme">
+                <option value="score">Score sheet</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+                <option value="system">Match Windows</option>
+            </select></span>
+        </span>
         <span class="hs hs-input">
             <label for="input-backend">Input</label>
             <span class="sel"><select id="input-backend" aria-label="Input backend">
@@ -111,7 +142,7 @@
                 <button type="button" class="link" data-goto="logs">View logs</button>
             </div>
             <div class="tip" id="prereq-tip" hidden>
-                <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="#d6bf8f" d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg>
+                <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg>
                 <span>Before the first run: <b>equip the Hu Tao theme</b> in the minigame; Album mode also needs English game text.</span>
                 <button type="button" class="x" id="prereq-tip-close" aria-label="Dismiss tip">&times;</button>
             </div>
@@ -288,7 +319,7 @@
                             <th class="th-time">Time (s)</th>
                             <th class="th-device">Device <span class="help help-th" tabindex="0" aria-label="Device &amp; key info"
                                   data-help="Device sets what the Key column means. keyboard: the key name — letters (a, s, d), modifiers (shift, ctrl, alt) or special keys (space, enter, esc, tab, backspace, delete, up, down, left, right, f1–f12, home, end, page up, page down, insert). mouse: the button name — left, right, middle, x (Mouse 4) or x2 (Mouse 5).">?</span></th>
-                            <th>Key</th>
+                            <th class="th-key">Key</th>
                             <th class="th-event">Event <span class="help help-th" tabindex="0" aria-label="Event type info"
                                   data-help="down: press. up: release. double: mouse double-click, replayed as a single down (the controller has no double-click primitive). Recordings only produce down/up; double is accepted on hand-edit so you can paste in raw events from elsewhere.">?</span></th>
                             <th class="th-del"></th>
@@ -305,7 +336,7 @@
         <div class="logbar">
             <div class="fchips" id="log-filters" role="group" aria-label="Filter by source">
                 <button type="button" class="fchip on" data-f="" aria-pressed="true">All</button>
-                <button type="button" class="fchip" data-f="album" style="--c:var(--gold)" aria-pressed="false"><i></i>album</button>
+                <button type="button" class="fchip" data-f="album" style="--c:var(--gold-text)" aria-pressed="false"><i></i>album</button>
                 <button type="button" class="fchip" data-f="bot" style="--c:var(--anemo)" aria-pressed="false"><i></i>bot</button>
                 <button type="button" class="fchip" data-f="macro" style="--c:var(--hydro)" aria-pressed="false"><i></i>macro</button>
                 <button type="button" class="fchip" data-f="serial" style="--c:var(--pyro)" aria-pressed="false"><i></i>serial</button>

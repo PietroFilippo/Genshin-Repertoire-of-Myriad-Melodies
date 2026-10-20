@@ -214,14 +214,65 @@ function dlgPrompt(title, body, opts = {}) {
 // --- titlebar buttons ------------------------------------------------------
 
 $('#btn-min').addEventListener('click', () => callApi('minimize'));
-$('#btn-max').addEventListener('click', () => {
+
+// Maximized state: the glyph / tooltip of the maximize button, and
+// `html[data-maximized]`, which hides the resize zones and the 1 px edge
+// hairline (a maximized window has no edge to find).
+function setMaximized(maximized) {
+    const on = !!maximized;
+    const btn = $('#btn-max');
+    setText(btn, on ? '\uE923' : '\uE922');
+    setTitle(btn, on ? 'Restore' : 'Maximize');
+    const root = document.documentElement;
+    if (on) root.setAttribute('data-maximized', '1');
+    else root.removeAttribute('data-maximized');
+}
+
+function toggleMaximize() {
     // Python snaps to the monitor work area (taskbar stays visible) and
     // reports the new state; swap glyph + tooltip to match.
-    callApi('toggle_maximize').then((res) => {
+    return callApi('toggle_maximize').then((res) => {
         if (!res || typeof res.maximized !== 'boolean') return;
-        const btn = $('#btn-max');
-        btn.textContent = res.maximized ? '\uE923' : '\uE922';
-        btn.title = res.maximized ? 'Restore' : 'Maximize';
+        setMaximized(res.maximized);
+    });
+}
+
+$('#btn-max').addEventListener('click', toggleMaximize);
+
+// Double-click on a titlebar drag area = maximize / restore, as on a
+// native titlebar. Detected from the mousedown pair rather than
+// `dblclick`: the drag region hands the first press to the OS move loop
+// (WM_NCLBUTTONDOWN), which may swallow the mouseup the DOM `dblclick`
+// needs, while mousedowns keep arriving.
+const TB_DBLCLICK_MS = 450;
+let _tbLastDown = { at: 0, x: 0, y: 0 };
+$$('.pywebview-drag-region').forEach((el) => {
+    el.addEventListener('mousedown', (ev) => {
+        if (ev.button !== 0) return;
+        const now = Date.now();
+        const prev = _tbLastDown;
+        _tbLastDown = { at: now, x: ev.clientX, y: ev.clientY };
+        if (now - prev.at <= TB_DBLCLICK_MS
+            && Math.abs(ev.clientX - prev.x) <= 4 && Math.abs(ev.clientY - prev.y) <= 4) {
+            _tbLastDown = { at: 0, x: 0, y: 0 };   // a third press starts over
+            ev.preventDefault();
+            toggleMaximize();
+        }
+    });
+});
+
+// Resize grab zones (eight invisible edge / corner strips in index.html).
+// Left button only; Python owns the resize loop until the button is
+// released. preventDefault keeps the press from starting a text
+// selection or a drag of whatever sits under the zone.
+$$('.rz').forEach((el) => {
+    el.addEventListener('mousedown', (ev) => {
+        if (ev.button !== 0) return;
+        const edge = el.dataset.edge;
+        if (!edge) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        callApi('start_window_resize', edge).catch(() => {});
     });
 });
 $('#btn-close').addEventListener('click', async () => {
@@ -351,6 +402,58 @@ $('#input-backend').addEventListener('change', async () => {
     } else if (res && res.ok === false) {
         sel.value = current;
     }
+});
+
+// --- theme -----------------------------------------------------------------
+
+// `score` (default navy sheet), `light`, `dark`, or `system`, which follows
+// Windows' app mode live (prefers-color-scheme: dark -> Dark, else Light).
+// The runtime switch is one attribute: `html[data-theme]`; everything else
+// is CSS. Python persists the preference (`theme`, set_theme); localStorage
+// mirrors it so the inline bootstrap in index.html can paint the right
+// theme before get_initial_state answers.
+const THEMES = ['score', 'light', 'dark', 'system'];
+const THEME = { pref: 'score', mql: null };
+
+function themeMedia() {
+    if (THEME.mql) return THEME.mql;
+    try {
+        if (typeof window.matchMedia === 'function') {
+            THEME.mql = window.matchMedia('(prefers-color-scheme: dark)') || null;
+        }
+    } catch (e) { THEME.mql = null; }
+    if (THEME.mql && typeof THEME.mql.addEventListener === 'function') {
+        THEME.mql.addEventListener('change', () => { if (THEME.pref === 'system') renderTheme(); });
+    }
+    return THEME.mql;
+}
+
+function resolveTheme(pref) {
+    if (pref !== 'system') return pref;
+    const mql = themeMedia();
+    return (mql && mql.matches) ? 'dark' : 'light';
+}
+
+function renderTheme() {
+    const root = document.documentElement;
+    const resolved = resolveTheme(THEME.pref);
+    if (resolved === 'score') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', resolved);
+    const sel = $('#theme-select');
+    if (sel && sel.value !== THEME.pref && sel !== activeEl()) sel.value = THEME.pref;
+}
+
+function applyTheme(name, persist) {
+    const pref = THEMES.includes(name) ? name : 'score';
+    THEME.pref = pref;
+    if (pref === 'system') themeMedia();
+    renderTheme();
+    try { localStorage.setItem('theme', pref); } catch (e) { /* mirror only */ }
+    if (persist) callApi('set_theme', pref).catch(() => {});
+}
+
+$('#theme-select').addEventListener('change', () => {
+    applyTheme($('#theme-select').value, true);
 });
 
 // --- mode + album options --------------------------------------------------
@@ -2980,6 +3083,12 @@ window.updateStatus = function updateStatus(data) {
             sel.value = data.input_backend;
         }
     }
+    if ('theme' in data && typeof data.theme === 'string' && data.theme !== THEME.pref) {
+        applyTheme(data.theme, false);
+    }
+    if ('maximized' in data && typeof data.maximized === 'boolean') {
+        setMaximized(data.maximized);
+    }
 
     if ('macro_state' in data || 'macro_events' in data
         || 'macro_loaded' in data || 'macro_slot_names' in data
@@ -3092,6 +3201,10 @@ function init() {
         if (typeof s.replay_canorus === 'boolean') setSwitch($('#replay-canorus'), s.replay_canorus);
         if (typeof s.debug === 'boolean') MAIN.debug = s.debug;
         if (s.input_backend) $('#input-backend').value = s.input_backend;
+        // Python is authoritative; the localStorage mirror only painted
+        // the first frame. Older Python without `theme` keeps that frame.
+        if (typeof s.theme === 'string') applyTheme(s.theme, false);
+        if (typeof s.maximized === 'boolean') setMaximized(s.maximized);
         if (s.keybinds) renderKeybinds(s.keybinds);
         if (typeof s.prereq_tip_dismissed === 'boolean') MAIN.tipDismissed = s.prereq_tip_dismissed;
         setModeUi(s.mode === 'album' ? 'album' : 'standalone');

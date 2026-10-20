@@ -3,32 +3,138 @@
    §2; keep them in sync if you retune anything here. System fonts only. */
 
 :root {
+    color-scheme: dark;               /* native widgets + <option> list follow the theme */
     --bg: #171a21;
     --bg-2: #1d2129;
     --bg-3: #252a34;
     --bg-4: #2c3240;
     --line: #2c313c;
     --line-2: #3b4150;
+    --line-3: #626c82;                /* scrollbar thumb hover */
+    --track: #6b7590;                 /* unplayed progress segment (shipped: #3b4150, 1.5:1) */
+    --switch-off: #3b4150;            /* switch off-track (as shipped) */
+    --switch-knob: #aea995;           /* switch off-knob (as shipped) */
     --ink: #ece6d8;
     --ink-2: #aea995;
     --ink-3: #918e81;
-    --gold: #d6bf8f;
-    --gold-2: #f0d9a4;
-    --gold-ink: #1b1710;
+    --gold: #d6bf8f;                  /* fills, borders, rings */
+    --gold-2: #f0d9a4;                /* hover fill, held note, "now" segment */
+    --gold-text: #d6bf8f;             /* gold used AS TEXT (= --gold on dark bases) */
+    --gold-ink: #1b1710;              /* text on a gold fill */
     --gold-dim: rgba(214, 191, 143, .16);
     --ok: #86c99b;
+    --ok-text: #86c99b;               /* success used as text */
     --warn: #e6b45c;
     --bad: #e2756a;
     --bad-text: #f0a79e;
     --rec: #e35d5d;
+    --rec-text: #f2a4a4;
     --anemo: #6fc5a9;
     --hydro: #5aa7dc;
     --pyro: #ee8352;
     --electro: #b08fe9;
+    --stage-top: #20252f;             /* status stage gradient + idle flower fill */
+    --stage-bottom: #1b1f28;
+    --pop-bg: #2c3240;                /* tooltip */
+    --pop-ink: #ece6d8;
+    --scrim: rgba(10, 11, 14, .6);
+    --shadow-pop: rgba(0, 0, 0, .45);
+    --shadow-dlg: rgba(0, 0, 0, .6);
+    --close-hover: #c42b1c;           /* Windows close-button red, every theme */
+    --close-hover-ink: #fff;
     --mono: 'Cascadia Mono', 'Cascadia Code', Consolas, monospace;
     --display: 'Segoe UI Variable Display', 'Segoe UI Variable', 'Segoe UI', sans-serif;
     --titlebar-h: 40px;
     --health-h: 34px;
+}
+
+/* --- Light: paper, ink navy, brass ------------------------------------ */
+[data-theme="light"] {
+    color-scheme: light;
+    --bg: #eeece6;
+    --bg-2: #faf9f5;
+    --bg-3: #e6e3da;
+    --bg-4: #dbd7cb;
+    --line: #d9d5c9;
+    --line-2: #b9b3a3;
+    --line-3: #857f71;
+    --track: #8a8577;
+    --switch-off: #8a8577;
+    --switch-knob: #faf9f5;
+    --ink: #1f2430;
+    --ink-2: #555b68;
+    --ink-3: #6f7480;
+    --gold: #a8842e;
+    --gold-2: #ad8832;               /* hover fill / held note / "now" segment, 3:1 on the stage */
+    --gold-text: #7a5d1e;
+    --gold-ink: #1b1710;
+    --gold-dim: rgba(168, 132, 46, .14);
+    --ok: #246e3b;
+    --ok-text: #246e3b;
+    --warn: #9a5f06;
+    --bad: #c0392b;
+    --bad-text: #a0281c;
+    --rec: #d13b3b;
+    --rec-text: #a42626;
+    --anemo: #1f7a5e;
+    --hydro: #1f6aa6;
+    --pyro: #b4441a;
+    --electro: #6a44b8;
+    --stage-top: #faf9f5;
+    --stage-bottom: #f3f1eb;
+    --pop-bg: #262b36;
+    --pop-ink: #ece6d8;
+    --scrim: rgba(31, 36, 48, .45);
+    --shadow-pop: rgba(31, 36, 48, .18);
+    --shadow-dlg: rgba(31, 36, 48, .28);
+}
+
+/* --- Dark: T3 Code's dark palette (near-black neutrals, blue accent) ---
+   Neutral surfaces / borders / inputs are T3's tokens verbatim:
+   background #0a0a0a, card #111111, accent-surface #141414, border
+   #191919, input #1e1e1e, foreground #f5f5f5, muted-foreground #818181.
+   The accent is T3's primary #346bf1 (white on it), with a lighter tint
+   where blue is used as text so it clears 4.5:1 on the near-black
+   surfaces. Semantic colours are T3's destructive / warning / success /
+   info; the element tints come from its categorical set. */
+[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0a0a0a;                    /* T3 background */
+    --bg-2: #111111;                  /* T3 card / popover / secondary */
+    --bg-3: #141414;                  /* T3 accent-surface: buttons, key caps, slot tiles */
+    --bg-4: #1e1e1e;                  /* T3 input: hover, segmented "on", active chip */
+    --line: #191919;                  /* T3 border: hairlines, card borders */
+    --line-2: #323232;                /* control borders (one step above T3 border, 1.5:1 on page) */
+    --line-3: #666666;                /* scrollbar thumb hover, 3.3:1 on card */
+    --track: #666666;                 /* unplayed progress segment, 3.3:1 on stage */
+    --switch-off: #1e1e1e;            /* T3 input */
+    --switch-knob: #818181;           /* T3 muted-foreground */
+    --ink: #f5f5f5;                   /* T3 foreground */
+    --ink-2: #818181;                 /* T3 muted-foreground */
+    --ink-3: #6e6e6e;                 /* disabled / timestamps, 3.7:1 on card */
+    --gold: #346bf1;                  /* T3 primary: fills, borders, rings */
+    --gold-2: #2b5fe3;                /* hover fill (primary/90), held note, "now" */
+    --gold-text: #6f9bff;             /* primary as text, 7:1 on card */
+    --gold-ink: #ffffff;              /* T3 primary-foreground */
+    --gold-dim: rgba(52, 107, 241, .16);
+    --ok: #10b981;                    /* T3 success */
+    --ok-text: #34d399;               /* T3 success text */
+    --warn: #fe9a00;                  /* T3 warning */
+    --bad: #fb414a;                   /* T3 destructive */
+    --bad-text: #ff6467;              /* T3 destructive text */
+    --rec: #fb414a;
+    --rec-text: #ff6467;
+    --anemo: #2dd4bf;                 /* T3 categorical teal: Normal chip, bot tag */
+    --hydro: #60a5fa;                 /* T3 info text: Hard chip, macro tag */
+    --pyro: #fb7185;                  /* T3 categorical rose: Pro chip, serial tag */
+    --electro: #c084fc;               /* T3 categorical purple: Legendary chip, other tag */
+    --stage-top: #141414;             /* T3 accent-surface */
+    --stage-bottom: #0e0e0e;
+    --pop-bg: #1e1e1e;
+    --pop-ink: #f5f5f5;
+    --scrim: rgba(0, 0, 0, .66);
+    --shadow-pop: rgba(0, 0, 0, .6);
+    --shadow-dlg: rgba(0, 0, 0, .75);
 }
 
 * { box-sizing: border-box; }
@@ -60,7 +166,7 @@ button {
 button:disabled { cursor: not-allowed; }
 
 :focus-visible {
-    outline: 2px solid var(--gold);
+    outline: 2px solid var(--gold-text);
     outline-offset: 2px;
 }
 
@@ -155,7 +261,7 @@ button:disabled { cursor: not-allowed; }
 }
 
 .titlebar-btn:hover { background: var(--bg-3); color: var(--ink); }
-.titlebar-btn-close:hover { background: #c42b1c; color: #fff; }
+.titlebar-btn-close:hover { background: var(--close-hover); color: var(--close-hover-ink); }
 
 /* --- health strip --------------------------------------------------------- */
 
@@ -188,13 +294,13 @@ button:disabled { cursor: not-allowed; }
     height: 7px;
     border-radius: 50%;
     background: var(--ok);
-    box-shadow: 0 0 0 3px rgba(134, 201, 155, .14);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 14%, transparent);
     flex-shrink: 0;
 }
 
-.dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(230, 180, 92, .16); }
-.dot.bad { background: var(--bad); box-shadow: 0 0 0 3px rgba(226, 117, 106, .16); }
-.dot.neutral { background: var(--ink-3); box-shadow: 0 0 0 3px rgba(145, 142, 129, .14); }
+.dot.warn { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 16%, transparent); }
+.dot.bad { background: var(--bad); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 16%, transparent); }
+.dot.neutral { background: var(--ink-3); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink-3) 14%, transparent); }
 
 .hs.bad { color: var(--bad-text); }
 
@@ -274,8 +380,8 @@ button:disabled { cursor: not-allowed; }
     white-space: nowrap;
 }
 
-.card-sub.cap-msg { color: var(--gold); }
-.card-sub.hint-msg { color: var(--gold); }
+.card-sub.cap-msg { color: var(--gold-text); }
+.card-sub.hint-msg { color: var(--gold-text); }
 
 /* Transient messages (capture prompt, slot hints) carry instructions, so
    they wrap to a second line instead of being cut; the static subtitles
@@ -342,16 +448,16 @@ button:disabled { cursor: not-allowed; }
     width: max-content;
     max-width: 260px;
     padding: 8px 10px;
-    background: var(--bg-4);
+    background: var(--pop-bg);
     border: 1px solid var(--line-2);
     border-radius: 6px;
-    color: var(--ink);
+    color: var(--pop-ink);
     font-size: 12px;
     font-weight: 400;
     line-height: 1.4;
     text-align: left;
     white-space: normal;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+    box-shadow: 0 8px 24px var(--shadow-pop);
     opacity: 0;
     visibility: hidden;
     transition: opacity .12s;
@@ -379,16 +485,16 @@ button:disabled { cursor: not-allowed; }
     position: fixed;
     max-width: 300px;
     padding: 8px 10px;
-    background: var(--bg-4);
+    background: var(--pop-bg);
     border: 1px solid var(--line-2);
     border-radius: 6px;
-    color: var(--ink);
+    color: var(--pop-ink);
     font-size: 12px;
     font-weight: normal;
     line-height: 1.4;
     white-space: normal;
     text-align: left;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+    box-shadow: 0 8px 24px var(--shadow-pop);
     pointer-events: none;
     z-index: 10000;
 }
@@ -542,7 +648,7 @@ button:disabled { cursor: not-allowed; }
     width: 36px;
     height: 20px;
     border-radius: 999px;
-    background: var(--line-2);
+    background: var(--switch-off);
     border: 0;
     flex-shrink: 0;
     padding: 0;
@@ -557,7 +663,7 @@ button:disabled { cursor: not-allowed; }
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: var(--ink-2);
+    background: var(--switch-knob);
     transition: transform .15s, background .15s;
 }
 
@@ -599,16 +705,16 @@ button:disabled { cursor: not-allowed; }
 .btn.go:hover:not(:disabled) { background: var(--gold-2); border-color: var(--gold-2); }
 .btn.go:disabled { background: transparent; border-color: var(--line-2); color: var(--ink-3); }
 
-.btn.stop { border-color: rgba(226, 117, 106, .5); color: var(--bad-text); background: transparent; }
-.btn.stop:hover:not(:disabled) { background: rgba(226, 117, 106, .12); border-color: var(--bad); }
+.btn.stop { border-color: color-mix(in srgb, var(--bad) 50%, transparent); color: var(--bad-text); background: transparent; }
+.btn.stop:hover:not(:disabled) { background: color-mix(in srgb, var(--bad) 12%, transparent); border-color: var(--bad); }
 
-.btn.rec-on { background: rgba(227, 93, 93, .14); border-color: rgba(227, 93, 93, .6); color: #f2a4a4; }
-.btn.rec-on:hover:not(:disabled) { background: rgba(227, 93, 93, .22); border-color: var(--rec); }
+.btn.rec-on { background: color-mix(in srgb, var(--rec) 14%, transparent); border-color: color-mix(in srgb, var(--rec) 60%, transparent); color: var(--rec-text); }
+.btn.rec-on:hover:not(:disabled) { background: color-mix(in srgb, var(--rec) 22%, transparent); border-color: var(--rec); }
 
 .btn.sm { height: 28px; padding: 0 11px; font-size: 12px; }
 .btn.sm.go { padding: 0 12px; font-size: 12px; }
 
-.btn.outline-gold { background: transparent; border-color: rgba(214, 191, 143, .55); color: var(--gold); }
+.btn.outline-gold { background: transparent; border-color: color-mix(in srgb, var(--gold) 55%, transparent); color: var(--gold-text); }
 .btn.outline-gold:hover:not(:disabled) { background: var(--gold-dim); border-color: var(--gold); }
 
 /* --- status stage ----------------------------------------------------------- */
@@ -616,7 +722,7 @@ button:disabled { cursor: not-allowed; }
 .stage {
     position: relative;
     overflow: hidden;
-    background: linear-gradient(180deg, #20252f, #1b1f28);
+    background: linear-gradient(180deg, var(--stage-top), var(--stage-bottom));
     border: 1px solid var(--line);
     border-radius: 10px;
     padding: 16px 18px 14px;
@@ -651,16 +757,16 @@ button:disabled { cursor: not-allowed; }
 
 .pulse.live {
     background: var(--ok);
-    box-shadow: 0 0 0 4px rgba(134, 201, 155, .18);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 18%, transparent);
     animation: pulse 1.6s ease-in-out infinite;
 }
 
-.pulse.paused { background: var(--warn); box-shadow: 0 0 0 4px rgba(230, 180, 92, .18); }
+.pulse.paused { background: var(--warn); box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 18%, transparent); }
 .pulse.stopping { background: var(--warn); }
 
 @keyframes pulse {
-    0%, 100% { box-shadow: 0 0 0 3px rgba(134, 201, 155, .18); }
-    50% { box-shadow: 0 0 0 7px rgba(134, 201, 155, .06); }
+    0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
+    50% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--ok) 6%, transparent); }
 }
 
 .state h1 {
@@ -717,11 +823,11 @@ button:disabled { cursor: not-allowed; }
     margin-top: 12px;
 }
 
-.prog i { flex: 1; height: 6px; border-radius: 2px; background: var(--line-2); }
+.prog i { flex: 1; height: 6px; border-radius: 2px; background: var(--track); }
 .prog i.done { background: var(--gold); }
-.prog i.now { background: var(--gold-2); box-shadow: 0 0 8px rgba(240, 217, 164, .45); }
-.prog i.skip { background: repeating-linear-gradient(135deg, var(--line-2) 0 3px, rgba(214, 191, 143, .45) 3px 5px); }
-.prog i.fail { background: rgba(226, 117, 106, .6); }
+.prog i.now { background: var(--gold-2); box-shadow: 0 0 8px color-mix(in srgb, var(--gold-2) 45%, transparent); }
+.prog i.skip { background: repeating-linear-gradient(135deg, var(--track) 0 3px, color-mix(in srgb, var(--gold) 45%, transparent) 3px 5px); }
+.prog i.fail { background: color-mix(in srgb, var(--bad) 60%, transparent); }
 .prog.stale { opacity: .45; }
 
 .legend {
@@ -742,9 +848,9 @@ button:disabled { cursor: not-allowed; }
 }
 
 .legend .lg-done { background: var(--gold); }
-.legend .lg-skip { background: repeating-linear-gradient(135deg, var(--line-2) 0 3px, rgba(214, 191, 143, .45) 3px 5px); }
-.legend .lg-fail { background: rgba(226, 117, 106, .6); }
-.legend .lg-next { background: var(--line-2); }
+.legend .lg-skip { background: repeating-linear-gradient(135deg, var(--track) 0 3px, color-mix(in srgb, var(--gold) 45%, transparent) 3px 5px); }
+.legend .lg-fail { background: color-mix(in srgb, var(--bad) 60%, transparent); }
+.legend .lg-next { background: var(--track); }
 
 /* first-run tip */
 .tip {
@@ -754,13 +860,14 @@ button:disabled { cursor: not-allowed; }
     margin-top: 10px;
     padding: 5px 6px 5px 10px;
     border-radius: 6px;
-    background: rgba(214, 191, 143, .09);
+    background: color-mix(in srgb, var(--gold) 9%, transparent);
     font-size: 12px;
     color: var(--ink-2);
 }
 
 .tip b { color: var(--ink); font-weight: 600; }
 .tip svg { flex-shrink: 0; }
+.tip svg path { fill: var(--gold); }
 /* The sentence wraps (two lines at 640 px) rather than losing its second
    half to an ellipsis — it's the one prerequisite a first run depends on. */
 .tip > span { min-width: 0; line-height: 1.35; }
@@ -788,7 +895,7 @@ button:disabled { cursor: not-allowed; }
     margin-top: 10px;
     padding: 7px 8px 7px 12px;
     border-radius: 6px;
-    background: rgba(226, 117, 106, .09);
+    background: color-mix(in srgb, var(--bad) 9%, transparent);
     box-shadow: inset 3px 0 0 var(--bad);
     font-size: 12.5px;
     color: var(--ink);
@@ -803,7 +910,7 @@ button:disabled { cursor: not-allowed; }
     margin-left: auto;
     border: 0;
     background: none;
-    color: var(--gold);
+    color: var(--gold-text);
     font-weight: 600;
     font-size: 12px;
     white-space: nowrap;
@@ -852,7 +959,7 @@ button:disabled { cursor: not-allowed; }
     right: 0;
     bottom: 34px;
     height: 1px;
-    background: linear-gradient(90deg, rgba(214, 191, 143, 0), rgba(214, 191, 143, .5) 8%, rgba(214, 191, 143, .5) 92%, rgba(214, 191, 143, 0));
+    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 50%, transparent) 8%, color-mix(in srgb, var(--gold) 50%, transparent) 92%, transparent);
 }
 
 .lane { position: relative; }
@@ -863,7 +970,7 @@ button:disabled { cursor: not-allowed; }
     top: 0;
     bottom: 34px;
     width: 1px;
-    background: linear-gradient(180deg, rgba(59, 65, 80, 0), var(--line-2));
+    background: linear-gradient(180deg, transparent, var(--line-2));
 }
 
 .lane .note {
@@ -873,7 +980,7 @@ button:disabled { cursor: not-allowed; }
     width: 8px;
     height: 0;
     border-radius: 4px;
-    background: linear-gradient(180deg, rgba(240, 217, 164, 0), var(--gold-2));
+    background: linear-gradient(180deg, transparent, var(--gold-2));
     opacity: 0;
     transition: height .08s, opacity .08s;
 }
@@ -888,7 +995,7 @@ button:disabled { cursor: not-allowed; }
 }
 
 .lane .flower path {
-    fill: #20252f;
+    fill: var(--stage-top);
     stroke: var(--line-2);
     stroke-width: 1.4;
     transition: fill .08s, stroke .08s;
@@ -915,7 +1022,7 @@ button:disabled { cursor: not-allowed; }
    the class flips already shows the full flower, note bar and gold cap
    instead of a half-faded in-between state. */
 .lane.on .note { height: 58px; opacity: 1; transition-duration: 0s; }
-.lane.on .flower path { fill: var(--gold-2); stroke: var(--gold-2); filter: drop-shadow(0 0 5px rgba(240, 217, 164, .8)); transition-duration: 0s; }
+.lane.on .flower path { fill: var(--gold-2); stroke: var(--gold-text); filter: drop-shadow(0 0 5px color-mix(in srgb, var(--gold-2) 80%, transparent)); transition-duration: 0s; }
 .lane.on b { color: var(--gold-ink); background: var(--gold); border-color: var(--gold); transition-duration: 0s; }
 
 /* --- hotkey rows + key caps ------------------------------------------------- */
@@ -969,12 +1076,12 @@ button:disabled { cursor: not-allowed; }
     flex-shrink: 0;
 }
 
-button.key:hover:not(:disabled) { border-color: var(--gold); color: var(--gold-2); }
+button.key:hover:not(:disabled) { border-color: var(--gold); color: var(--gold-text); }
 button.key:disabled { color: var(--ink-3); }
 
 .key.cap {
     border-color: var(--gold);
-    color: var(--gold);
+    color: var(--gold-text);
     background: var(--gold-dim);
     font-family: inherit;
     font-size: 11.5px;
@@ -996,7 +1103,7 @@ button.key:disabled { color: var(--ink-3); }
     border-style: dashed;
 }
 
-.key.warnkey { border-color: rgba(226, 117, 106, .6); color: var(--bad-text); }
+.key.warnkey { border-color: color-mix(in srgb, var(--bad) 60%, transparent); color: var(--bad-text); }
 
 @keyframes blink { 50% { border-color: var(--line-2); } }
 
@@ -1064,27 +1171,27 @@ button.key:disabled { color: var(--ink-3); }
 }
 
 .pill b { color: var(--ink); font-weight: 600; }
-.pill.rec { border-color: rgba(227, 93, 93, .6); color: #f2a4a4; }
-.pill.rec b { color: #f2a4a4; }
+.pill.rec { border-color: color-mix(in srgb, var(--rec) 60%, transparent); color: var(--rec-text); }
+.pill.rec b { color: var(--rec-text); }
 .pill .rec-i { width: 8px; height: 8px; border-radius: 50%; background: var(--rec); }
-.pill.play { border-color: rgba(134, 201, 155, .6); color: var(--ok); }
-.pill.play b { color: var(--ok); }
+.pill.play { border-color: color-mix(in srgb, var(--ok) 60%, transparent); color: var(--ok-text); }
+.pill.play b { color: var(--ok-text); }
 .pill.slotpill { min-width: 0; flex-shrink: 1; max-width: 240px; }
 .pill.slotpill > span:first-child { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .pill .tag { flex-shrink: 0; }
-.pill.unsaved { border-color: rgba(214, 191, 143, .45); color: var(--gold); }
+.pill.unsaved { border-color: color-mix(in srgb, var(--gold) 45%, transparent); color: var(--gold-text); }
 
 .tag {
     font-size: 11px;
     font-weight: 700;
-    color: var(--gold);
+    color: var(--gold-text);
     background: var(--gold-dim);
     border-radius: 4px;
     padding: 1px 6px;
     white-space: nowrap;
 }
 
-.tag.stale { color: var(--bad-text); background: rgba(226, 117, 106, .12); }
+.tag.stale { color: var(--bad-text); background: color-mix(in srgb, var(--bad) 12%, transparent); }
 
 /* --- macros: slot grid ---------------------------------------------------------- */
 
@@ -1122,8 +1229,8 @@ button.key:disabled { color: var(--ink-3); }
 .slot.empty { border: 1px dashed var(--line); background: transparent; }
 .slot.empty .n { color: var(--ink-3); }
 .slot.empty .name { color: var(--ink-3); font-weight: 500; }
-.slot.loaded { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold), 0 0 14px rgba(214, 191, 143, .18); }
-.slot.loaded .n { color: var(--gold); }
+.slot.loaded { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold), 0 0 14px color-mix(in srgb, var(--gold) 18%, transparent); }
+.slot.loaded .n { color: var(--gold-text); }
 .slot:hover { border-color: var(--ink-3); }
 .slot.loaded:hover { border-color: var(--gold); }
 
@@ -1140,7 +1247,7 @@ button.key:disabled { color: var(--ink-3); }
     height: 15px;
     border-radius: 4px;
     background: var(--gold-dim);
-    color: var(--gold);
+    color: var(--gold-text);
     font: 700 10px/15px var(--mono);
     text-align: center;
     font-style: normal;
@@ -1165,7 +1272,7 @@ button.key:disabled { color: var(--ink-3); }
 
 .acts button {
     border: 0;
-    background: rgba(23, 26, 33, .97);
+    background: color-mix(in srgb, var(--bg) 97%, transparent);
     color: var(--ink-2);
     font-size: 11.5px;
     font-weight: 600;
@@ -1202,7 +1309,7 @@ button.key:disabled { color: var(--ink-3); }
     background: var(--bg);
 }
 
-.active-macro-row.assigned .am-letter { color: var(--gold); border-color: rgba(214, 191, 143, .5); background: var(--gold-dim); }
+.active-macro-row.assigned .am-letter { color: var(--gold-text); border-color: color-mix(in srgb, var(--gold) 50%, transparent); background: var(--gold-dim); }
 .active-macro-row.active-playing .am-letter { color: var(--gold-ink); background: var(--ok); border-color: var(--ok); }
 .active-macro-row .sel, .active-macro-row .sel select { width: 100%; min-width: 0; }
 .active-macro-row .sel select { height: 28px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
@@ -1211,9 +1318,9 @@ button.key:disabled { color: var(--ink-3); }
 .active-macro-row .key { display: block; height: 28px; line-height: 22px; max-width: none; }
 
 .hint { font-size: 12px; color: var(--ink-2); margin-top: 8px; line-height: 1.35; }
-.hint.live { color: var(--gold); }
+.hint.live { color: var(--gold-text); }
 /* Second-press guard armed in game: the sentence is a deadline. */
-.hint.confirm { color: var(--gold); font-weight: 600; }
+.hint.confirm { color: var(--gold-text); font-weight: 600; }
 
 /* --- macros: events editor ------------------------------------------------------- */
 
@@ -1260,7 +1367,7 @@ button.key:disabled { color: var(--ink-3); }
 .evt td { padding: 3px 4px; border-bottom: 1px solid var(--line); }
 .evt tr:last-child td { border-bottom: 0; }
 .evt td.i { color: var(--ink-3); text-align: right; width: 34px; padding-right: 8px; }
-.evt tr.edited td.i { box-shadow: inset 3px 0 0 var(--gold); color: var(--gold); }
+.evt tr.edited td.i { box-shadow: inset 3px 0 0 var(--gold); color: var(--gold-text); }
 
 .evt input, .evt select {
     font: inherit;
@@ -1293,7 +1400,7 @@ button.key:disabled { color: var(--ink-3); }
     padding: 0;
 }
 
-.evt .del:hover { color: var(--bad-text); border-color: rgba(226, 117, 106, .5); }
+.evt .del:hover { color: var(--bad-text); border-color: color-mix(in srgb, var(--bad) 50%, transparent); }
 
 .evt-empty {
     border: 1px dashed var(--line);
@@ -1371,7 +1478,7 @@ button.key:disabled { color: var(--ink-3); }
 
 .log .t { color: var(--ink-3); }
 .log .g { font-weight: 600; color: var(--ink-2); }
-.log .g.album { color: var(--gold); }
+.log .g.album { color: var(--gold-text); }
 .log .g.macro { color: var(--hydro); }
 .log .g.serial { color: var(--pyro); }
 .log .g.ui { color: var(--ink-2); }
@@ -1394,7 +1501,7 @@ button.key:disabled { color: var(--ink-3); }
 .scrim {
     position: fixed;
     inset: 0;
-    background: rgba(10, 11, 14, .6);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1411,7 +1518,7 @@ button.key:disabled { color: var(--ink-3); }
     border: 1px solid var(--line-2);
     border-radius: 10px;
     padding: 18px 18px 14px;
-    box-shadow: 0 20px 50px rgba(0, 0, 0, .6);
+    box-shadow: 0 20px 50px var(--shadow-dlg);
 }
 
 .dlg.wide { width: 540px; }
@@ -1485,14 +1592,14 @@ button.key:disabled { color: var(--ink-3); }
 .mslot.empty { border-style: dashed; background: transparent; border-color: var(--line); }
 .mslot.empty .name { color: var(--ink-3); font-weight: 500; }
 .mslot.pick { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold); }
-.mslot.pick .n { color: var(--gold); }
+.mslot.pick .n { color: var(--gold-text); }
 
 /* --- scrollbar ------------------------------------------------------------------ */
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 5px; border: 2px solid var(--bg); }
-::-webkit-scrollbar-thumb:hover { background: #4a5162; }
+::-webkit-scrollbar-thumb:hover { background: var(--line-3); }
 
 /* --- motion ----------------------------------------------------------------------- */
 
@@ -1500,4 +1607,173 @@ button.key:disabled { color: var(--ink-3); }
     .pulse.live, .rec-dot.blink, .key.cap { animation: none; }
     .lane .note, .lane .flower path, .lane b, .switch, .switch::after,
     .slot .acts, .help::after { transition: none; }
+}
+
+
+/* =====================================================================
+   v2 additions: themes (tokens above), native widget colouring, theme
+   switcher, resize edge, wide / tall layouts.
+   ===================================================================== */
+
+/* The <select> popup list is drawn by Chromium with these rules plus the
+   root `color-scheme`, so the option list matches the theme. */
+select option { background: var(--bg-2); color: var(--ink); }
+
+/* Theme switcher: a second select in the health strip, identical to Input
+   (score / light / dark / system — `system` follows prefers-color-scheme).
+   The strip is outside the pywebview-drag-region islands. */
+.hs-theme .sel select { min-width: 108px; }
+
+/* At the 640 px minimum the strip has no room for both labels; the theme
+   select's own value ("Score sheet" / "Light" / "Dark") names itself. */
+@media (max-width: 760px) {
+    .hs-theme label { display: none; }
+}
+
+/* 640 px: the slot pill was ellipsized to nothing ("… unsaved"). The
+   event count already shows in the Events card, so it yields its space
+   to the slot name. */
+@media (max-width: 680px) {
+    #macro-pill-events { display: none; }
+    .mstatus { gap: 6px; }
+    .pill.slotpill > span:first-child { min-width: 56px; }
+}
+
+/* Text selection (dialog name field, log pane) in the accent, not the
+   browser's blue. */
+::selection { background: color-mix(in srgb, var(--gold) 38%, transparent); }
+
+/* Resize edge: a frameless window has no border, so a 1px hairline marks
+   where the invisible 6 px grab zones are. Dropped when maximized. */
+.app { box-shadow: inset 0 0 0 1px var(--line); }
+html[data-maximized="1"] .app { box-shadow: none; }
+
+/* --- tall windows: the lane strip is the one thing that should grow ---- */
+
+@media (min-height: 760px) {
+    .lanes { min-height: 170px; }
+    .lane-row { max-height: 240px; }
+    .lane.on .note { height: 40%; }
+    .lane .flower { width: 28px; height: 28px; left: calc(50% - 14px); bottom: 21px; }
+    .lane b { font-size: 13px; padding: 5px 9px 4px; min-width: 30px; }
+    .state h1 { font-size: 30px; }
+}
+
+@media (min-height: 860px) {
+    .lanes { min-height: 240px; }
+    .lane-row { max-height: 340px; }
+    .lane.on .note { height: 42%; }
+}
+
+/* --- wide windows (>= 960 px): use the width, cap what shouldn't stretch - */
+
+@media (min-width: 960px) {
+    /* Main: the album options become one horizontal strip (three fields
+       side by side) so the stage gets the height. */
+    #album-card {
+        display: grid;
+        grid-template-columns: 300px minmax(0, 1fr) max-content;
+        column-gap: 20px;
+        align-items: start;
+    }
+    #album-card .field { grid-template-columns: 76px 1fr auto; min-height: 30px; align-items: start; }
+    #album-card .field > label, #album-card .field > .help { margin-top: 7px; }
+    #album-card .field .val { flex-wrap: wrap; }
+    #album-card .field .val .sub { flex-basis: 100%; white-space: normal; line-height: 1.3; }
+    #album-card .field .val.switch-row { flex-wrap: nowrap; min-height: 30px; }
+
+    /* The six lanes stay a strip, never a 1600 px smear: centred, capped. */
+    .lane-row { max-width: 960px; width: 100%; margin: 0 auto; }
+    .stage { padding: 18px 22px 16px; }
+
+    /* Macros: two columns — editing on the right, full height. */
+    .panel-active[data-panel="macros"] {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(360px, 460px);
+        grid-template-rows: auto auto auto auto 1fr;
+        grid-template-areas:
+            "transport transport"
+            "notice    notice"
+            "slots     events"
+            "active    events"
+            "hotkeys   events";
+        column-gap: 14px;
+        row-gap: 12px;
+        align-items: start;
+    }
+    .transport { grid-area: transport; }
+    #macro-notice { grid-area: notice; }
+    #slots-card { grid-area: slots; }
+    #active-macros-card { grid-area: active; }
+    #macro-hotkeys-card { grid-area: hotkeys; }
+    #events-card {
+        grid-area: events;
+        align-self: stretch;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+    }
+    #events-card .evt-wrap { max-height: none; flex: 1; min-height: 0; }
+    #events-card .card-h { flex-wrap: wrap; row-gap: 6px; }
+    #events-card .card-h .right { flex-wrap: wrap; justify-content: flex-end; }
+    #events-card .evt-empty { flex: 1; display: grid; place-items: center; }
+    #macro-hotkeys-card .hk { grid-template-columns: repeat(3, 1fr); }
+}
+
+@media (min-width: 1240px) {
+    #macro-hotkeys-card .hk { grid-template-columns: repeat(5, 1fr); }
+    #hotkeys-card .hk { max-width: 900px; }
+}
+
+@media (min-width: 1400px) {
+    /* Album strip: everything on one line. */
+    #album-card { grid-template-columns: max-content minmax(0, 1fr) max-content; }
+    #album-card .field .val { flex-wrap: nowrap; }
+    #album-card .field .val .sub { flex-basis: auto; white-space: nowrap; }
+    #album-card .field > label, #album-card .field > .help { margin-top: 0; }
+    #album-card .field { align-items: center; }
+    /* 18 slots as 9 x 2 instead of 6 x 3: shorter column, tiles still wide. */
+    .slots { grid-template-columns: repeat(9, 1fr); }
+    .panel-active[data-panel="macros"] { grid-template-columns: minmax(0, 1fr) minmax(400px, 520px); }
+}
+
+/* Logs: full width is the right call for log lines; nothing to cap.
+   The tag column just gets a little air on wide windows. */
+@media (min-width: 960px) {
+    .log .ln { grid-template-columns: 64px 80px 1fr; }
+}
+
+
+/* --- resizable window: grab zones ------------------------------------- */
+/* Eight invisible zones on the app's edges (6 px) and corners (12 px).
+   mousedown (left button) on one calls start_window_resize(edge) and
+   Python runs the resize loop until the button is released. They sit
+   outside both pywebview-drag-region islands, above every panel and the
+   dialog scrim (a 6 px band at the very edge blocks nothing that
+   matters), and disappear while maximized, with the hairline. */
+.rz { position: absolute; z-index: 120; -webkit-app-region: no-drag; background: transparent; }
+.rz-n  { top: 0; left: 12px; right: 12px; height: 6px; cursor: ns-resize; }
+.rz-s  { bottom: 0; left: 12px; right: 12px; height: 6px; cursor: ns-resize; }
+.rz-e  { right: 0; top: 12px; bottom: 12px; width: 6px; cursor: ew-resize; }
+.rz-w  { left: 0; top: 12px; bottom: 12px; width: 6px; cursor: ew-resize; }
+.rz-ne { top: 0; right: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+.rz-nw { top: 0; left: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+.rz-se { bottom: 0; right: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+.rz-sw { bottom: 0; left: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+html[data-maximized="1"] .rz { display: none; }
+
+/* --- events editor: the Key column ------------------------------------- */
+/* The Key column had no width of its own, so in the wide two-column
+   Macros layout the fixed Time / Device / Event columns squeezed it to a
+   few characters ("shif", "righ"). It now has a floor that fits the
+   longest common names ("page down", "backspace", "x2") at 12 px mono,
+   and the fixed columns give back what their contents never used. */
+.evt th.th-key { width: 112px; min-width: 112px; }
+.evt input[data-field="key"] { min-width: 100px; }
+@media (min-width: 960px) and (max-width: 1399px) {
+    .evt th.th-time { width: 80px; }
+    .evt th.th-device { width: 100px; }
+    .evt th.th-event { width: 86px; }
+    .evt td.i { width: 30px; }
+    .panel-active[data-panel="macros"] { grid-template-columns: minmax(0, 1fr) minmax(420px, 460px); }
 }
