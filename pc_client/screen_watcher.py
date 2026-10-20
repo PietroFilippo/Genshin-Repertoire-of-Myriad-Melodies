@@ -89,14 +89,15 @@ class ScreenWatcher:
                 mouse-down so a window change the caller's periodic poll
                 hasn't published yet still stops the click. None = no
                 live check (caller-published geometry only).
-            window_gone_fn: optional `callable() -> bool`, True once no
-                game window exists any more (AlbumRunner passes its
-                `_window_gone`, which also reports it and adopts a window
-                the game recreated — `live_geometry_fn` then reads the
-                new one). `wait_for` gives up as soon as it says so
-                instead of polling a closed game until the timeout; the
-                pre-click live check re-reads once when it says "not
-                gone". None = no check.
+            window_gone_fn: optional `callable() -> bool`, True once the
+                game is gone (AlbumRunner passes its `_window_gone`, which
+                also reports it and — on the runner's own thread only —
+                adopts a window the game recreated, so `live_geometry_fn`
+                then reads the new one; on any other thread it's a pure
+                no-op returning False). `wait_for` gives up as soon as it
+                says so instead of polling a closed game until the
+                timeout; the pre-click live check re-reads once when it
+                says "not gone". None = no check.
         """
         if stop_evt is None:
             raise ValueError("ScreenWatcher requires a stop_evt — "
@@ -269,8 +270,9 @@ class ScreenWatcher:
             live = self._live_geometry_fn()
             if (live is None and self._window_gone_fn is not None
                     and not self._window_gone()):
-                # Not closed: minimized — or the game recreated its window
-                # and window_gone_fn just adopted the new one; read again.
+                # Not closed: minimized / re-create gap — or the game
+                # recreated its window and window_gone_fn just adopted the
+                # new one (caller's own thread only); read again.
                 live = self._live_geometry_fn()
         except Exception as e:
             print(f"    [watcher] live window check failed: {e}")

@@ -182,53 +182,226 @@ def read_game_geometry(hwnd):
     return _geometry(left, top, width, height)
 
 
-def resolve_game_window(hwnd):
-    """The live game window for a run bound to `hwnd`: `hwnd` itself
-    while it exists (minimized / hidden included); otherwise a re-found
-    game window — Genshin can RECREATE its window (fullscreen toggle,
-    resolution or display-mode change) while the game keeps running, so
-    a dead `hwnd` alone doesn't mean the game was closed; None only when
-    no game window exists at all (closed). Callers adopt a returned
-    handle that differs from `hwnd` (rebuild the detector for it).
+# --- following the game across a recreated window ---------------------------
+#
+# Genshin can RECREATE its window (fullscreen / Alt+Enter toggle, resolution
+# or display-mode change) while the game keeps running: the old HWND dies,
+# possibly with a gap before the new one exists. A run is therefore anchored
+# to the game PROCESS (the PID owning the window it started on), not to an
+# HWND or a title — an unrelated window captioned "Genshin Impact" must
+# never be adopted (the rebuilt detector would type into it).
+#
+# `resolve_game_window(hwnd, pid)` outcomes:
+WINDOW_ALIVE = 'alive'        # `hwnd` exists (minimized / hidden included)
+WINDOW_REPLACED = 'replaced'  # dead; the SAME process has a new game window
+WINDOW_PENDING = 'pending'    # dead; no game window yet, process still alive
+WINDOW_CLOSED = 'closed'      # dead; the game process is gone
 
-    Non-blocking: IsWindow + FindWindowW, neither messages the game —
-    fine on the ~0.5 s poll paths, never on the detector's 5 ms loops."""
-    if not window_gone(hwnd):
-        return hwnd
+# A PENDING game (process alive, no game window) is waited for like a
+# minimized one — no input, polled every ~0.5 s, never reported as closed —
+# for at most this long. Real recreate gaps last milliseconds to seconds; a
+# process lingering a minute without any game window (hung on exit, crash
+# dialog) is gone as far as the run is concerned: MSG_WINDOW_CLOSED.
+PENDING_MAX_S = 60.0
+# Poll cadence while blocked on a PENDING game (follow_game_geometry).
+PENDING_POLL_S = 0.5
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_ERROR_INVALID_PARAMETER = 87
+
+_WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND,
+                                  ctypes.wintypes.LPARAM)
+
+try:
+    # Private handle (own prototypes + last-error) so nothing leaks onto
+    # the process-global `ctypes.windll.kernel32`.
+    _k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    _k32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL,
+                                 ctypes.wintypes.DWORD]
+    _k32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    _k32.GetExitCodeProcess.argtypes = [ctypes.wintypes.HANDLE,
+                                        ctypes.POINTER(ctypes.wintypes.DWORD)]
+    _k32.GetExitCodeProcess.restype = ctypes.wintypes.BOOL
+    _k32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    _k32.CloseHandle.restype = ctypes.wintypes.BOOL
+except (AttributeError, OSError):
+    _k32 = None
+
+
+def window_pid(hwnd):
+    """PID owning `hwnd`, 0 if unknown. GetWindowThreadProcessId reads the
+    window object; it never messages the window."""
+    if not hwnd:
+        return 0
+    pid = ctypes.wintypes.DWORD(0)
+    try:
+        _user32().GetWindowThreadProcessId(ctypes.wintypes.HWND(hwnd),
+                                           ctypes.byref(pid))
+    except Exception:
+        return 0
+    return int(pid.value or 0)
+
+
+def _top_level_windows():
+    """Every top-level window (visible or not), via EnumWindows."""
+    found = []
+
+    def collect(hwnd, _lparam):
+        found.append(hwnd or 0)
+        return True
+
+    try:
+        _user32().EnumWindows(_WNDENUMPROC(collect),
+                              ctypes.wintypes.LPARAM(0))
+    except Exception:
+        pass
+    return [h for h in found if h]
+
+
+def _window_title(hwnd):
+    """Caption of a top-level window. For another process's window
+    GetWindowTextW reads the stored caption — no WM_GETTEXT, can't block
+    on a busy game. Only called for windows the game process owns."""
+    buf = ctypes.create_unicode_buffer(256)
+    try:
+        _user32().GetWindowTextW(ctypes.wintypes.HWND(hwnd), buf, len(buf))
+    except Exception:
+        return ''
+    return buf.value
+
+
+def _process_alive(pid):
+    """True / False if the process is known running / exited; None if it
+    can't be told (e.g. access denied) — callers treat None as alive."""
+    if not pid or _k32 is None:
+        return None
+    try:
+        handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False,
+                                  pid)
+        if not handle:
+            # ERROR_INVALID_PARAMETER: no such process (it exited and
+            # nothing holds it open). Anything else: unknown.
+            if ctypes.get_last_error() == _ERROR_INVALID_PARAMETER:
+                return False
+            return None
+        try:
+            code = ctypes.wintypes.DWORD(0)
+            if not _k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return None
+            return code.value == _STILL_ACTIVE
+        finally:
+            _k32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def resolve_game_window(hwnd, pid=0):
+    """Where the run's game window is now -> (state, hwnd, pid):
+
+    - WINDOW_ALIVE: `hwnd` exists (and, PID known, still belongs to it).
+    - WINDOW_REPLACED: `hwnd` is dead, but the game process (`pid`) owns a
+      top-level window titled GAME_WINDOW_TITLE — the returned handle.
+      Never a window of another process, whatever its title.
+    - WINDOW_PENDING: no such window, but the process is alive (it still
+      owns some top-level window — Unity / IME keep hidden ones — or
+      OpenProcess says STILL_ACTIVE / can't tell): a destroy -> create gap.
+    - WINDOW_CLOSED: the process is gone.
+
+    Unknown `pid` (0): the old title lookup, adopting only a window whose
+    PID can be read (returned as the new anchor); otherwise CLOSED.
+
+    Non-blocking (IsWindow, GetWindowThreadProcessId, EnumWindows,
+    GetWindowTextW on the game's own windows, OpenProcess) — never messages
+    the game. For the ~0.5 s owner-thread polls only; never on the
+    detector's 5 ms loops. Use `GameWindowRef` rather than calling this
+    directly: it also caps PENDING."""
+    titles = set(GAME_WINDOW_TITLE)
+    if hwnd and not window_gone(hwnd):
+        owner = window_pid(hwnd) if pid else 0
+        if not owner or owner == pid:      # only a KNOWN mismatch rejects
+            return WINDOW_ALIVE, hwnd, pid
+    if pid:
+        owned = [h for h in _top_level_windows() if window_pid(h) == pid]
+        for h in owned:
+            if _window_title(h) in titles:
+                return WINDOW_REPLACED, h, pid
+        if owned or _process_alive(pid) is not False:
+            return WINDOW_PENDING, hwnd, pid
+        return WINDOW_CLOSED, hwnd, pid
     new = find_game_window()
     if new and not window_gone(new):
-        return new
-    return None
+        new_pid = window_pid(new)
+        if new_pid:                        # never adopt an unreadable PID
+            return WINDOW_REPLACED, new, new_pid
+    return WINDOW_CLOSED, hwnd, pid
 
 
-# A window recreated again and again while we wait can't loop forever.
-_FOLLOW_ATTEMPTS = 5
+class GameWindowRef:
+    """The game window a run is bound to: HWND + the game's PID (captured
+    from the starting HWND unless given). `check()` re-resolves it and
+    adopts a recreated window of the same process.
 
+    OWNER-THREAD ONLY: the thread running the run (album runner thread,
+    standalone loop, CLI main loop) is the only one that may call
+    `check()` / read-modify `hwnd` — other threads (the album end watcher)
+    never adopt or swap handles, so handles can't split between holders."""
 
-def follow_game_geometry(hwnd, stop_evt=None, status_cb=None):
-    """`get_game_geometry` that follows a recreated game window (see
-    `resolve_game_window`): blocking and stop-aware, waits for a restored
-    window like it. Returns (hwnd, (capture_region, scale_x, scale_y)) —
-    `hwnd` may be a new handle the caller must adopt — or None when
-    stopped (check `stop_evt.is_set()`) or when no game window exists
-    any more (MSG_WINDOW_CLOSED reported)."""
-    for _ in range(_FOLLOW_ATTEMPTS):
-        if stop_evt is not None and stop_evt.is_set():
-            return None
-        live = resolve_game_window(hwnd)
-        if live is None:
-            break
-        if not same_hwnd(live, hwnd):
+    def __init__(self, hwnd, pid=None):
+        self.hwnd = hwnd
+        self.pid = window_pid(hwnd) if pid is None else (pid or 0)
+        self._pending_since = None
+
+    def check(self):
+        """WINDOW_ALIVE / WINDOW_REPLACED (adopted: `hwnd` / `pid` now the
+        new window's) / WINDOW_PENDING (wait like a minimized game) /
+        WINDOW_CLOSED (process gone, or PENDING for PENDING_MAX_S)."""
+        state, hwnd, pid = resolve_game_window(self.hwnd, self.pid)
+        if state != WINDOW_PENDING:
+            self._pending_since = None
+        if state == WINDOW_REPLACED:
+            self.hwnd, self.pid = hwnd, pid
             print("Genshin Impact window was recreated — following the "
                   "new window.")
-        hwnd = live
-        geom = get_game_geometry(hwnd, stop_evt=stop_evt,
+        elif state == WINDOW_PENDING:
+            now = time.monotonic()
+            if self._pending_since is None:
+                self._pending_since = now
+                print("Genshin Impact window disappeared — waiting for the "
+                      "game to recreate it.")
+            elif now - self._pending_since >= PENDING_MAX_S:
+                print(f"Genshin Impact window didn't come back within "
+                      f"{PENDING_MAX_S:.0f} s.")
+                return WINDOW_CLOSED
+        return state
+
+
+def follow_game_geometry(window, stop_evt=None, status_cb=None):
+    """`get_game_geometry` for a `GameWindowRef` that follows a recreated
+    game window: blocking and stop-aware like it (waits for a restored
+    window; waits through a PENDING gap, polling every PENDING_POLL_S).
+    Returns (capture_region, scale_x, scale_y) — `window.hwnd` may now be
+    a new handle the caller must adopt — or None when stopped (check
+    `stop_evt.is_set()`) or when the game is gone (MSG_WINDOW_CLOSED
+    reported)."""
+    while True:
+        if stop_evt is not None and stop_evt.is_set():
+            return None
+        state = window.check()
+        if state == WINDOW_CLOSED:
+            break
+        if state == WINDOW_PENDING:
+            if stop_evt is not None:
+                if stop_evt.wait(PENDING_POLL_S):
+                    return None
+            else:
+                time.sleep(PENDING_POLL_S)
+            continue
+        geom = get_game_geometry(window.hwnd, stop_evt=stop_evt,
                                  status_cb=status_cb, report_closed=False)
         if geom is not None:
-            return hwnd, geom
-        # Stopped, or the window vanished during the wait: loop re-finds.
-    if stop_evt is not None and stop_evt.is_set():
-        return None
+            return geom
+        # Stopped, or the window vanished during the wait: re-resolve.
     print("ERROR: Genshin Impact window closed.")
     _report(status_cb, MSG_WINDOW_CLOSED)
     return None
@@ -255,7 +428,7 @@ def get_game_geometry(hwnd, stop_evt=None, status_cb=None,
 
     `report_closed=False` leaves "the window is gone" to the caller (no
     log line, no MSG_WINDOW_CLOSED; a reported wait is cleared) — used by
-    `follow_game_geometry`, which first re-finds a recreated window.
+    `follow_game_geometry`, which then follows a recreated window.
 
     Returns:
         (capture_region, scale_x, scale_y) on success, or None if stopped
@@ -338,13 +511,13 @@ def auto_detect(stop_evt=None, status_cb=None):
         _report(status_cb, MSG_WINDOW_NOT_FOUND)
         return None
 
-    # Follows a window recreated during the wait; callers re-fetch the
-    # HWND with find_game_window() afterwards, which then returns it.
-    followed = follow_game_geometry(hwnd, stop_evt=stop_evt,
-                                    status_cb=status_cb)
-    if followed is None:
+    # Follows a window the game recreates during the wait; callers
+    # re-fetch the HWND with find_game_window() afterwards.
+    geom = follow_game_geometry(GameWindowRef(hwnd), stop_evt=stop_evt,
+                                status_cb=status_cb)
+    if geom is None:
         return None
-    capture_region, scale_x, scale_y = followed[1]
+    capture_region, scale_x, scale_y = geom
 
     # Scale reference 1080p positions to actual resolution.
     # Positions are relative to the client area (capture region), so no

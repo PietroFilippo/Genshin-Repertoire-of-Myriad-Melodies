@@ -78,25 +78,29 @@ def main():
         print("ERROR: no input backend available.")
         _fail_exit()
     print("Note: keys are only sent while Genshin is the focused window.")
-    detector = NoteDetector(hwnd, column_centers, hit_line_y, controller)
-
-    print(f"Starting per-key detection threads "
-          f"(poll {KEY_POLL_DELAY_S*1000:.0f}ms, strip {Y_SAMPLE_OFFSETS})")
-    detector.start()
 
     # Windowed Genshin can be moved / resized while we run. A move needs
     # nothing (the detector reads client-relative pixels; the viz retargets
     # its capture itself); a resize changes the lane layout, and a window
     # the game recreated (fullscreen toggle, ...) has a new HWND, so
-    # rebuild the detector for either (the tracker holds the new HWND).
+    # rebuild the detector for either (the tracker holds the new HWND). The
+    # tracker anchors the run to the game's PID (captured here), polled
+    # from this main thread only.
     tracker = GeometryTracker(hwnd, capture_region, column_centers,
                               hit_line_y, tag='[cli]')
+    detector = NoteDetector(hwnd, column_centers, hit_line_y, controller,
+                            pid=tracker.pid)
+
+    print(f"Starting per-key detection threads "
+          f"(poll {KEY_POLL_DELAY_S*1000:.0f}ms, strip {Y_SAMPLE_OFFSETS})")
+    detector.start()
 
     def _rebuild_detector():
         nonlocal detector
         detector.stop()
         _, cols, hit = tracker.current
-        detector = NoteDetector(tracker.hwnd, cols, hit, controller)
+        detector = NoteDetector(tracker.hwnd, cols, hit, controller,
+                                pid=tracker.pid)
         detector.start()
 
     # Set when Genshin is closed mid-run: shut down cleanly, then exit 1.

@@ -28,6 +28,7 @@ Run:  python -m unittest discover -s tests -p "test_*.py"
 """
 import contextlib
 import io
+import os
 import sys
 import threading
 import time
@@ -199,6 +200,19 @@ class DetectorForegroundGate(unittest.TestCase):
         self.det.start()
         self.assertTrue(_wait_until(
             lambda: all(self.det.pressed[k] for k in KEYS)))
+
+    def test_runs_pid_anchor_beats_the_hwnds_current_owner(self):
+        """RG1 — a detector built with the run's game PID never adopts the
+        PID of whatever its HWND belongs to now: a handle already owned
+        by another app at start() gets no input."""
+        self.pids[GAME_HWND] = 200          # handle now owned by another app
+        det = detector.NoteDetector(GAME_HWND, [10] * len(KEYS), 50,
+                                    self.ctrl, pid=100)
+        self.addCleanup(det.stop)
+        det.start()
+        self.assertEqual(det._game_pid, 100)
+        time.sleep(0.15)
+        self.assertEqual(self._downs(), [])
 
     def test_recycled_game_hwnd_of_another_process_is_not_focused(self):
         """RC2 — Genshin closed and Windows recycled its HWND for another
@@ -502,7 +516,19 @@ class ScreenWatcherClicks(unittest.TestCase):
 
 # --- game_window: geometry + last_error ---------------------------------------
 
+GAME_PID = 7100      # the game process every run is anchored to
+FOREIGN_PID = 9900   # some other app
+FOREIGN_HWND = 6464  # ... with a top-level window captioned like the game
+HIDDEN_HWND = 6565   # a hidden helper window the game process keeps (Unity)
+GAME_TITLE = 'Genshin Impact'
+
+
 class FakeUser32:
+    """Win32 window surface as game_window sees it, incl. the process
+    model behind GameWindowRef: every game window is owned by GAME_PID;
+    `others` adds {hwnd: (pid, title)} top-level windows; the process is
+    alive while it owns any window (or per `process_alive`)."""
+
     def __init__(self, exists=True, iconic=(), size=(1920, 1080),
                  origin=(0, 0), find=GAME_HWND, windows=None):
         self.exists = exists
@@ -511,27 +537,72 @@ class FakeUser32:
         self.origin = origin
         self.find = find
         self.shown = []
-        # Optional {hwnd: (w, h)} of the live windows — models a game that
-        # recreates its window (old handle dies, FindWindowW returns the
-        # new one). None = a single window per `exists` / `size`.
+        # Optional {hwnd: (w, h)} of the live GAME windows — models a game
+        # that recreates its window (old handle dies, a new one appears).
+        # None = a single window per `exists` / `size` (handle `find`).
         self.windows = windows
+        self.others = {}
+        # None: alive iff GAME_PID owns a window; True / False / None-like
+        # overrides model OpenProcess (e.g. a gap with no window at all).
+        self.process_alive = None
 
     @staticmethod
     def _h(hwnd):
         return int(getattr(hwnd, 'value', hwnd) or 0)  # HWND() or int
+
+    def _game_hwnds(self):
+        if self.windows is not None:
+            return list(self.windows)
+        return [self.find] if self.exists and self.find else []
+
+    def owner(self, hwnd):
+        h = self._h(hwnd)
+        return self.others[h][0] if h in self.others else GAME_PID
 
     def recreate(self, new_hwnd, size):
         """The game replaced its window (fullscreen toggle, ...)."""
         self.windows = {new_hwnd: size}
         self.find = new_hwnd
 
+    def destroy(self, process_alive=True):
+        """The game destroyed its window and hasn't created the new one
+        yet (`process_alive`), or exited (False)."""
+        self.windows = {}
+        self.exists = False
+        self.process_alive = process_alive
+
+    def process_state(self, pid):
+        if self.process_alive is not None:
+            return self.process_alive
+        return any(self.owner(h) == pid
+                   for h in self._game_hwnds() + list(self.others))
+
     def FindWindowW(self, cls, title):
         return self.find
 
     def IsWindow(self, hwnd):
+        h = self._h(hwnd)
+        if h in self.others:
+            return True
         if self.windows is not None:
-            return self._h(hwnd) in self.windows
+            return h in self.windows
         return self.exists
+
+    def EnumWindows(self, proc, lparam):
+        for h in self._game_hwnds() + list(self.others):
+            if not proc(h, 0):
+                break
+        return 1
+
+    def GetWindowThreadProcessId(self, hwnd, ref):
+        ref._obj.value = self.owner(hwnd) if self.IsWindow(hwnd) else 0
+        return 1
+
+    def GetWindowTextW(self, hwnd, buf, size):
+        h = self._h(hwnd)
+        buf.value = (self.others[h][1] if h in self.others
+                     else GAME_TITLE if self.IsWindow(h) else '')
+        return len(buf.value)
 
     def IsIconic(self, hwnd):
         return self.iconic.pop(0) if self.iconic else False
@@ -553,12 +624,24 @@ class FakeUser32:
         ref._obj.x, ref._obj.y = self.origin
 
 
+def win32(fake):
+    """Patch game_window's Win32 surface (user32 + the OpenProcess probe)
+    with `fake` — a context manager."""
+    stack = contextlib.ExitStack()
+    stack.enter_context(mock.patch.object(game_window, '_user32',
+                                          return_value=fake))
+    stack.enter_context(mock.patch.object(
+        game_window, '_process_alive',
+        side_effect=getattr(fake, 'process_state', lambda pid: None)))
+    return stack
+
+
 class GameWindowGeometry(unittest.TestCase):
 
     def _patch(self, fake):
-        p = mock.patch.object(game_window, '_user32', return_value=fake)
-        p.start()
-        self.addCleanup(p.stop)
+        stack = win32(fake)
+        stack.__enter__()
+        self.addCleanup(stack.__exit__, None, None, None)
 
     def test_read_geometry_is_non_blocking(self):
         self._patch(FakeUser32(iconic=[True]))
@@ -618,41 +701,121 @@ class GameWindowGeometry(unittest.TestCase):
         self._patch(broken)
         self.assertFalse(game_window.window_gone(GAME_HWND))
 
-    def test_resolve_follows_recreated_window(self):
-        """W2 — a dead HWND isn't "closed" while a game window exists."""
+    def resolve(self, hwnd=GAME_HWND, pid=GAME_PID):
+        return game_window.resolve_game_window(hwnd, pid)
+
+    def test_resolve_alive_replaced_pending_closed(self):
+        """W2 — a dead HWND is only "closed" once the PROCESS is gone."""
         fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
         self._patch(fake)
-        self.assertEqual(game_window.resolve_game_window(GAME_HWND),
-                         GAME_HWND)
+        A, R, P, C = (game_window.WINDOW_ALIVE, game_window.WINDOW_REPLACED,
+                      game_window.WINDOW_PENDING, game_window.WINDOW_CLOSED)
+        self.assertEqual(self.resolve(), (A, GAME_HWND, GAME_PID))
         fake.iconic = [True]                      # minimized: still ours
-        self.assertEqual(game_window.resolve_game_window(GAME_HWND),
-                         GAME_HWND)
+        self.assertEqual(self.resolve()[0], A)
         fake.recreate(NEW_HWND, (1280, 720))
-        self.assertEqual(game_window.resolve_game_window(GAME_HWND),
-                         NEW_HWND)
-        fake.windows = {}                          # closed
-        self.assertIsNone(game_window.resolve_game_window(GAME_HWND))
-        fake.find = 0
-        self.assertIsNone(game_window.resolve_game_window(GAME_HWND))
+        self.assertEqual(self.resolve(), (R, NEW_HWND, GAME_PID))
+        fake.destroy(process_alive=True)          # RG2: re-create gap
+        self.assertEqual(self.resolve()[0], P)
+        fake.process_alive = None                 # ... hidden window only
+        fake.others[HIDDEN_HWND] = (GAME_PID, 'UnityWndClass helper')
+        self.assertEqual(self.resolve()[0], P)
+        del fake.others[HIDDEN_HWND]              # process exited
+        self.assertEqual(self.resolve()[0], C)
+        fake.process_alive = None                 # OpenProcess can't tell
+        with mock.patch.object(game_window, '_process_alive',
+                               return_value=None):
+            self.assertEqual(self.resolve()[0], P)
+
+    def test_foreign_window_with_game_title_never_adopted(self):
+        """RG1 — another process's window captioned "Genshin Impact" (and
+        found by FindWindowW) is never adopted, alive game or not."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        self._patch(fake)
+        fake.destroy(process_alive=True)
+        fake.others[FOREIGN_HWND] = (FOREIGN_PID, GAME_TITLE)
+        fake.find = FOREIGN_HWND
+        self.assertEqual(self.resolve()[0], game_window.WINDOW_PENDING)
+        fake.process_alive = False
+        self.assertEqual(self.resolve()[0], game_window.WINDOW_CLOSED)
+        # The recycled-HWND case: our handle now belongs to that app.
+        fake.others[GAME_HWND] = (FOREIGN_PID, GAME_TITLE)
+        self.assertEqual(self.resolve()[0], game_window.WINDOW_CLOSED)
+
+    def test_unknown_pid_falls_back_to_title_but_needs_a_readable_pid(self):
+        fake = FakeUser32(windows={NEW_HWND: (1280, 720)}, find=NEW_HWND)
+        self._patch(fake)
+        self.assertEqual(self.resolve(pid=0),
+                         (game_window.WINDOW_REPLACED, NEW_HWND, GAME_PID))
+        fake.windows = {}
+        fake.others[FOREIGN_HWND] = (0, GAME_TITLE)     # PID unreadable
+        fake.find = FOREIGN_HWND
+        self.assertEqual(self.resolve(pid=0)[0], game_window.WINDOW_CLOSED)
+
+    def test_window_ref_caps_pending(self):
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        self._patch(fake)
+        ref = game_window.GameWindowRef(GAME_HWND)
+        self.assertEqual(ref.pid, GAME_PID)
+        fake.destroy(process_alive=True)
+        with mock.patch.object(game_window, 'PENDING_MAX_S', 0.1), _quiet():
+            self.assertEqual(ref.check(), game_window.WINDOW_PENDING)
+            time.sleep(0.15)
+            self.assertEqual(ref.check(), game_window.WINDOW_CLOSED)
+            fake.recreate(NEW_HWND, (1280, 720))   # came back: timer resets
+            self.assertEqual(ref.check(), game_window.WINDOW_REPLACED)
+            self.assertEqual((ref.hwnd, ref.pid), (NEW_HWND, GAME_PID))
+            fake.destroy(process_alive=True)
+            self.assertEqual(ref.check(), game_window.WINDOW_PENDING)
 
     def test_follow_geometry_adopts_new_window_or_reports_closed(self):
         fake = FakeUser32(windows={NEW_HWND: (1280, 720)}, find=NEW_HWND)
         self._patch(fake)
         rec = Recorder()
+        ref = game_window.GameWindowRef(GAME_HWND, GAME_PID)
         with _quiet():
-            hwnd, (region, sx, sy) = game_window.follow_game_geometry(
-                GAME_HWND, stop_evt=threading.Event(), status_cb=rec)
-        self.assertEqual((hwnd, region['width'], round(sx, 3)),
+            region, sx, sy = game_window.follow_game_geometry(
+                ref, stop_evt=threading.Event(), status_cb=rec)
+        self.assertEqual((ref.hwnd, region['width'], round(sx, 3)),
                          (NEW_HWND, 1280, round(2 / 3, 3)))
         self.assertEqual(rec.values('last_error'), [])
         fake.windows = {}
         stop = threading.Event()
         with _quiet():
             self.assertIsNone(game_window.follow_game_geometry(
-                GAME_HWND, stop_evt=stop, status_cb=rec))
+                ref, stop_evt=stop, status_cb=rec))
         self.assertFalse(stop.is_set())
         self.assertEqual(rec.values('last_error'),
                          [game_window.MSG_WINDOW_CLOSED])
+
+    def test_follow_geometry_waits_through_recreate_gap(self):
+        """RG2 — destroy -> 0.15 s gap -> create: blocking re-read waits
+        (no "closed") and returns the new window."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        self._patch(fake)
+        fake.destroy(process_alive=True)
+        create = threading.Timer(0.15, fake.recreate, (NEW_HWND, (1280, 720)))
+        create.start()
+        self.addCleanup(create.cancel)
+        rec, ref = Recorder(), game_window.GameWindowRef(GAME_HWND, GAME_PID)
+        with mock.patch.object(game_window, 'PENDING_POLL_S', 0.02), _quiet():
+            region, _, _ = game_window.follow_game_geometry(
+                ref, stop_evt=threading.Event(), status_cb=rec)
+        self.assertEqual((ref.hwnd, region['width']), (NEW_HWND, 1280))
+        self.assertEqual(rec.values('last_error'), [])
+
+    def test_follow_geometry_gap_is_stop_aware(self):
+        fake = FakeUser32(windows={})
+        fake.process_alive = True
+        self._patch(fake)
+        stop = threading.Event()
+        threading.Timer(0.1, stop.set).start()
+        started = time.time()
+        with _quiet():
+            self.assertIsNone(game_window.follow_game_geometry(
+                game_window.GameWindowRef(GAME_HWND, GAME_PID),
+                stop_evt=stop))
+        self.assertLess(time.time() - started, 0.6)
 
     def test_follow_geometry_window_recreated_during_minimized_wait(self):
         """W2 — the old window vanishes while we wait for it to be
@@ -664,12 +827,20 @@ class GameWindowGeometry(unittest.TestCase):
         swap = threading.Timer(0.1, fake.recreate, (NEW_HWND, (1280, 720)))
         swap.start()
         self.addCleanup(swap.cancel)
+        ref = game_window.GameWindowRef(GAME_HWND, GAME_PID)
         with _quiet():
-            hwnd, (region, _, _) = game_window.follow_game_geometry(
-                GAME_HWND, stop_evt=threading.Event(), status_cb=rec)
-        self.assertEqual((hwnd, region['width']), (NEW_HWND, 1280))
+            region, _, _ = game_window.follow_game_geometry(
+                ref, stop_evt=threading.Event(), status_cb=rec)
+        self.assertEqual((ref.hwnd, region['width']), (NEW_HWND, 1280))
         self.assertEqual(rec.values('last_error'),
                          [game_window.MSG_WINDOW_MINIMIZED, ''])
+
+    def test_process_probe_on_real_win32(self):
+        """`_process_alive` against the real kernel32: this process is
+        alive; a PID that can't exist is gone."""
+        self.assertIs(game_window._process_alive(os.getpid()), True)
+        self.assertIs(game_window._process_alive(0x7FFFFFFC), False)
+        self.assertIsNone(game_window._process_alive(0))
 
 
 # --- standalone runner --------------------------------------------------------
@@ -677,8 +848,10 @@ class GameWindowGeometry(unittest.TestCase):
 class FakeDetector:
     instances = []
 
-    def __init__(self, hwnd, column_centers, hit_line_y, controller):
+    def __init__(self, hwnd, column_centers, hit_line_y, controller,
+                 pid=0):
         self.hwnd = hwnd
+        self.pid = pid
         self.column_centers = column_centers
         self.hit_line_y = hit_line_y
         self.started = False
@@ -710,8 +883,7 @@ class StandaloneRunner(unittest.TestCase):
             mock.patch.object(standalone_runner, 'find_game_window',
                               return_value=GAME_HWND),
             mock.patch.object(standalone_runner, 'follow_game_geometry',
-                              return_value=(GAME_HWND,
-                                            (moved, 2 / 3, 2 / 3))),
+                              return_value=(moved, 2 / 3, 2 / 3)),
             mock.patch.object(standalone_runner, 'NoteDetector', FakeDetector),
         ]
         for p in patches:
@@ -829,16 +1001,17 @@ class StandaloneRunner(unittest.TestCase):
         self.assertEqual(calls[1][0]['width'], 1280)
         self.assertNotIn('paused', self.rec.values('state'))
 
-    def _run_real_viz(self, fake_user32, timeout=3.0):
+    def _run_real_viz(self, fake_user32, timeout=3.0, controller=None):
         """run_standalone with the REAL viz loop + GeometryTracker +
-        read_game_geometry / window_gone over `fake_user32` (debug off,
+        read_game_geometry / GameWindowRef over `fake_user32` (debug off,
         so no cv2 window). A Timer sets Stop after `timeout`, so a
         regression fails instead of hanging. Returns the elapsed time."""
+        if controller is None:
+            controller = FakeInput()
         sct = mock.MagicMock()
         sct.__enter__.return_value = sct
         safety = threading.Timer(timeout, self.stop.set)
-        with mock.patch.object(game_window, '_user32',
-                               return_value=fake_user32), \
+        with win32(fake_user32), \
                 mock.patch.object(standalone_runner, 'GEOMETRY_POLL_S',
                                   0.01), \
                 mock.patch.object(standalone_runner.mss, 'mss',
@@ -848,7 +1021,7 @@ class StandaloneRunner(unittest.TestCase):
                 started = time.time()
                 standalone_runner.run_standalone(
                     self.stop, self.debug, status_cb=self.rec,
-                    pause_evt=self.pause, controller=FakeInput())
+                    pause_evt=self.pause, controller=controller)
                 return time.time() - started
             finally:
                 safety.cancel()
@@ -889,6 +1062,75 @@ class StandaloneRunner(unittest.TestCase):
         self.assertEqual(second.hwnd, NEW_HWND)
         self.assertEqual(second.column_centers[0], int(417 * 2 / 3))
         self.assertTrue(second.stopped)
+
+    def test_recreate_gap_mid_play_continues_on_new_hwnd(self):
+        """RG2 — destroy -> 0.2 s with no game window (process alive) ->
+        create: waited out, then adopted; never reported as closed."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        for delay, fn in ((0.1, lambda: fake.destroy(True)),
+                          (0.3, lambda: fake.recreate(NEW_HWND, (1280, 720))),
+                          (0.6, self.stop.set)):
+            timer = threading.Timer(delay, fn)
+            timer.start()
+            self.addCleanup(timer.cancel)
+        elapsed = self._run_real_viz(fake)
+        self.assertGreaterEqual(elapsed, 0.55)         # ended by Stop
+        self.assertEqual(self.rec.values('last_error'), [])
+        first, second = FakeDetector.instances
+        self.assertEqual((first.hwnd, second.hwnd), (GAME_HWND, NEW_HWND))
+        self.assertEqual((first.pid, second.pid), (GAME_PID, GAME_PID))
+
+    def test_foreign_titled_window_gets_no_keys(self):
+        """RG1 — the game destroys its window; an unrelated app's window
+        captioned "Genshin Impact" becomes foreground and is what
+        FindWindowW returns. With the REAL detector (every pixel "note"):
+        no detector is built on it and not one key reaches it."""
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        fg = [GAME_HWND]
+        ctrl = FakeInput()
+        built = []
+        marks = {}
+
+        def make_detector(*args, **kwargs):
+            built.append(args[0])
+            return detector.NoteDetector(*args, **kwargs)
+
+        def downs():
+            return [c for c in ctrl.snapshot() if c[0] == 'key_down']
+
+        def foreign_takes_over():
+            marks['before'] = len(downs())
+            fake.destroy(process_alive=True)
+            fake.others[FOREIGN_HWND] = (FOREIGN_PID, GAME_TITLE)
+            fake.find = FOREIGN_HWND
+            fg[0] = FOREIGN_HWND
+
+        user32 = mock.MagicMock()
+        user32.GetDC.return_value = 1
+        gdi32 = mock.MagicMock()
+        gdi32.GetPixel.return_value = 0                # blue 0: note
+        for delay, fn in ((0.15, foreign_takes_over),
+                          (0.3, lambda: marks.setdefault(
+                              'settled', len(downs()))),
+                          (0.7, self.stop.set)):
+            timer = threading.Timer(delay, fn)
+            timer.start()
+            self.addCleanup(timer.cancel)
+        with mock.patch.object(standalone_runner, 'NoteDetector',
+                               make_detector), \
+                mock.patch.object(detector, '_user32', user32), \
+                mock.patch.object(detector, '_gdi32', gdi32), \
+                mock.patch.object(detector, '_foreground_hwnd',
+                                  side_effect=lambda: fg[0]), \
+                mock.patch.object(detector, '_window_pid',
+                                  side_effect=lambda h: fake.owner(h)
+                                  if fake.IsWindow(h) else 0), \
+                mock.patch.object(detector, 'FOCUS_POLL_S', 0.01):
+            self._run_real_viz(fake, controller=ctrl)
+        self.assertGreater(marks['before'], 0)        # it did play the game
+        self.assertEqual(built, [GAME_HWND])          # never rebuilt on it
+        self.assertEqual(len(downs()), marks['settled'])
+        self.assertEqual(self.rec.values('last_error'), [])
 
     def test_minimized_mid_play_keeps_running(self):
         """RC1 — minimized is not closed: play waits (until Stop here)
@@ -1158,42 +1400,63 @@ class GeometryTrackerTests(unittest.TestCase):
     def _tracker(self):
         return standalone_runner.GeometryTracker(
             GAME_HWND, dict(REGION_1080),
-            *game_window.scaled_layout(1.0, 1.0))
+            *game_window.scaled_layout(1.0, 1.0), pid=GAME_PID)
 
     def test_unchanged_or_unusable_returns_none(self):
         t = self._tracker()
         for geom in ((dict(REGION_1080), 1.0, 1.0), None):
             with mock.patch.object(standalone_runner, 'read_game_geometry',
                                    return_value=geom), \
-                    mock.patch.object(standalone_runner,
-                                      'resolve_game_window',
-                                      side_effect=lambda hwnd: hwnd):
+                    win32(FakeUser32(iconic=[True])):
                 self.assertIsNone(t.poll())
 
     def test_closed_game_reported_minimized_is_not(self):
         """RC1 — the tracker behind Standalone / CLI play tells a closed
         game (end the run) from a minimized one (keep waiting)."""
         t = self._tracker()
-        with mock.patch.object(game_window, '_user32',
-                               return_value=FakeUser32(iconic=[True])):
+        with win32(FakeUser32(iconic=[True])):
             self.assertIsNone(t.poll())
-        with mock.patch.object(game_window, '_user32',
-                               return_value=FakeUser32(exists=False)):
+        with win32(FakeUser32(exists=False)):
             self.assertEqual(t.poll(), standalone_runner.WINDOW_GONE)
         self.assertEqual(t.current[0], REGION_1080)   # last-known kept
 
     def test_recreated_window_adopted_not_gone(self):
-        """W2 — old HWND dead, a new game window exists: adopt it (with its
-        new size) and ask for a detector rebuild."""
+        """W2 — old HWND dead, the game process has a new window: adopt it
+        (with its new size) and ask for a detector rebuild."""
         t = self._tracker()
         fake = FakeUser32(windows={NEW_HWND: (1280, 720)}, find=NEW_HWND)
-        with mock.patch.object(game_window, '_user32', return_value=fake), \
-                _quiet():
+        with win32(fake), _quiet():
             self.assertEqual(t.poll(), standalone_runner.WINDOW_REPLACED)
-            self.assertEqual(t.hwnd, NEW_HWND)
+            self.assertEqual((t.hwnd, t.pid), (NEW_HWND, GAME_PID))
             self.assertEqual(t.current[0]['width'], 1280)
             self.assertEqual(t.current[2], int(REF_HIT_LINE_Y * 2 / 3))
             self.assertIsNone(t.poll())                # settled on it
+
+    def test_recreate_gap_waits_then_adopts(self):
+        """RG2 — destroy -> gap -> create: the gap is NOT "gone"."""
+        t = self._tracker()
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        with win32(fake), _quiet():
+            fake.destroy(process_alive=True)
+            self.assertIsNone(t.poll())
+            self.assertIsNone(t.poll())
+            fake.recreate(NEW_HWND, (1920, 1080))
+            self.assertEqual(t.poll(), standalone_runner.WINDOW_REPLACED)
+            self.assertEqual(t.hwnd, NEW_HWND)
+
+    def test_foreign_titled_window_not_adopted(self):
+        """RG1 — game window destroyed, another app's "Genshin Impact"
+        window is what FindWindowW returns: never adopted."""
+        t = self._tracker()
+        fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        with win32(fake), _quiet():
+            fake.destroy(process_alive=True)
+            fake.others[FOREIGN_HWND] = (FOREIGN_PID, GAME_TITLE)
+            fake.find = FOREIGN_HWND
+            self.assertIsNone(t.poll())                 # pending, not it
+            fake.process_alive = False
+            self.assertEqual(t.poll(), standalone_runner.WINDOW_GONE)
+        self.assertEqual(t.hwnd, GAME_HWND)
 
     def test_move_vs_resize(self):
         t = self._tracker()
@@ -1228,8 +1491,10 @@ class AlbumRunnerBase(unittest.TestCase):
         # Tests close the game (`fake.windows = {}`) or have it recreate
         # its window (`fake.recreate(...)`).
         self.fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        stack = win32(self.fake)
+        stack.__enter__()
+        self.addCleanup(stack.__exit__, None, None, None)
         patches = [
-            mock.patch.object(game_window, '_user32', return_value=self.fake),
             mock.patch.object(album, 'find_game_window',
                               return_value=GAME_HWND),
             mock.patch.object(album.AlbumRunner, '_load_tpl',
@@ -1803,6 +2068,130 @@ class AlbumWindowRecreated(AlbumWindowFixture):
         self.assertEqual(r.hwnd, NEW_HWND)
         self.assertEqual(self.rec.values('last_error'), [])
 
+    def test_mid_song_recreate_gap_keeps_run_alive(self):
+        """RG2 — destroy -> 0.25 s with NO game window (process alive) ->
+        create, mid-song: waited out like a minimized game, then the new
+        window is adopted; never reported as closed."""
+        r = self.runner()
+        sp = r.song_player
+
+        def end_watcher(local_stop):
+            if _wait_until(lambda: len(FakeDetector.instances) >= 2):
+                time.sleep(0.05)
+                local_stop.set()
+
+        sp._end_watcher = end_watcher
+        sp.watcher.stop_wait = lambda secs: r.stop_evt.wait(0.01)
+        for delay, fn in ((0.1, lambda: self.fake.destroy(True)),
+                          (0.35, self.recreate)):
+            timer = threading.Timer(delay, fn)
+            timer.start()
+            self.addCleanup(timer.cancel)
+        with _quiet():
+            self.assertTrue(sp._rhythm_phase())
+        self.assertFalse(r.stop_evt.is_set())
+        first, second = FakeDetector.instances
+        self.assertEqual((first.hwnd, second.hwnd), (GAME_HWND, NEW_HWND))
+        self.assertEqual(second.pid, GAME_PID)
+        self.assert_adopted(r, 1280)
+
+    def test_pending_too_long_ends_as_closed(self):
+        r = self.runner()
+        self.fake.destroy(process_alive=True)
+        with mock.patch.object(game_window, 'PENDING_MAX_S', 0.15), \
+                _quiet():
+            self.assertTrue(r._refresh_geometry(block=False))   # waiting
+            self.assertEqual(self.rec.values('last_error'), [])
+            time.sleep(0.2)
+            self.assertFalse(r._refresh_geometry(block=False))
+        self.closed_error_only()
+
+    def test_foreign_titled_window_never_adopted(self):
+        """RG1 — the game destroyed its window and another app's window
+        captioned "Genshin Impact" is what FindWindowW returns: the run
+        waits (process alive), then ends as closed when the game exits —
+        never moving onto the foreign window."""
+        r = self.runner()
+        self.fake.destroy(process_alive=True)
+        self.fake.others[FOREIGN_HWND] = (FOREIGN_PID, GAME_TITLE)
+        self.fake.find = FOREIGN_HWND
+        with _quiet():
+            self.assertFalse(r._window_gone())
+            self.assertEqual((r.hwnd, r.song_player.hwnd),
+                             (GAME_HWND, GAME_HWND))
+            self.fake.process_alive = False
+            self.assertTrue(r._window_gone())
+        self.assertEqual((r.hwnd, r.song_player.hwnd), (GAME_HWND, GAME_HWND))
+        self.closed_error_only()
+
+    def test_next_song_waits_out_a_recreate_gap(self):
+        """RG2 — the wheel click missed because the window was being
+        recreated: wait for the new window, then retry on it."""
+        r = self.runner()
+        calls = []
+
+        def click(*a):
+            calls.append(a)
+            if len(calls) == 1:
+                self.fake.destroy(process_alive=True)
+                timer = threading.Timer(0.15, self.recreate)
+                timer.start()
+                self.addCleanup(timer.cancel)
+                return False
+            return True
+
+        r.watcher.click_ref = click
+        r.watcher.stop_wait = lambda secs: False
+        with mock.patch.object(game_window, 'PENDING_POLL_S', 0.02), \
+                _quiet():
+            self.assertTrue(r._next_song())
+        self.assertEqual(len(calls), 2)
+        self.assert_adopted(r, 1280)
+
+    def test_end_watcher_thread_cannot_adopt_or_split_handles(self):
+        """RG3 — only the runner's thread adopts. Every window entry point
+        reachable from another thread (the end watcher's click check:
+        `_window_gone`, the refresh, a click) is a no-op there, so the
+        runner and SongPlayer can never end up on different handles —
+        whatever the interleaving with the runner's own polls."""
+        for name in ('CLICK_HOVER_S', 'CLICK_HOLD_S', 'CLICK_SETTLE_S'):
+            p = mock.patch.object(screen_watcher, name, 0)
+            p.start()
+            self.addCleanup(p.stop)
+        r = self.runner()
+        sp = r.song_player
+        seen = []
+
+        def from_end_watcher():
+            seen.append((r._window_gone(), r._refresh_geometry(block=False),
+                         r.watcher.click_local(
+                             10, 10, generation=r.watcher.generation),
+                         r.hwnd, sp.hwnd))
+
+        def other_thread():
+            t = threading.Thread(target=from_end_watcher)
+            t.start()
+            t.join(2.0)
+            return seen[-1]
+
+        newer = NEW_HWND + 1
+        with _quiet():
+            self.recreate(size=(1920, 1080))           # A -> B
+            self.assertEqual(other_thread(),
+                             (False, True, False, GAME_HWND, GAME_HWND))
+            self.assertTrue(r._refresh_geometry(block=False))   # runner
+            self.assertEqual((r.hwnd, sp.hwnd), (NEW_HWND, NEW_HWND))
+            self.fake.recreate(newer, (1920, 1080))    # B -> C
+            self.assertEqual(other_thread()[3:], (NEW_HWND, NEW_HWND))
+            self.assertTrue(r._refresh_geometry(block=False))
+            self.assertEqual((r.hwnd, sp.hwnd), (newer, newer))
+            self.fake.destroy(process_alive=False)     # game exits
+            self.assertEqual(other_thread()[0], False)   # never latches
+            self.assertFalse(r._window_closed)
+        self.assertNotIn('mouse_down',
+                         [c[0] for c in r.controller.snapshot()])
+        self.assertEqual(self.rec.values('last_error'), [])
+
 
 # --- SongPlayer ----------------------------------------------------------------
 
@@ -2321,9 +2710,7 @@ class MainCliGameClosed(unittest.TestCase):
                 side_effect=lambda *a, **k: k['geometry_poll']() and (
                     standalone_runner.VIZ_EXIT_WINDOW_GONE)))
         code = None
-        with mock.patch.multiple(cli, **patches), \
-                mock.patch.object(game_window, '_user32',
-                                  return_value=fake), \
+        with mock.patch.multiple(cli, **patches), win32(fake), \
                 _quiet() as out:
             try:
                 cli.main()

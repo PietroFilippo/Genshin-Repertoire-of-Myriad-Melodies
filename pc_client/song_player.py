@@ -98,7 +98,7 @@ class SongPlayer:
     def __init__(self, watcher, controller, hwnd, region, scale_x, scale_y,
                  stop_evt, pause_evt, debug_evt,
                  status_cb=None, dump_frame_fn=None,
-                 refresh_geometry_fn=None):
+                 refresh_geometry_fn=None, game_pid=0):
         """
         Args:
             watcher: `ScreenWatcher` — clicks, match, waits. Shared
@@ -132,6 +132,9 @@ class SongPlayer:
                 geometry). Returns False iff the run should end (stop,
                 or the game window is gone — already reported), for
                 either mode. AlbumRunner passes its `_refresh_geometry`.
+            game_pid: the game process the run is anchored to — handed
+                to every detector so its focus gate only accepts that
+                process's windows. 0 = the detector reads it from `hwnd`.
         """
         self.watcher = watcher
         self.controller = controller
@@ -145,6 +148,7 @@ class SongPlayer:
         self.status_cb = status_cb
         self.dump_frame_fn = dump_frame_fn
         self.refresh_geometry_fn = refresh_geometry_fn
+        self.game_pid = game_pid or 0
 
     def update_geometry(self, region, scale_x, scale_y):
         """New capture geometry (game window moved / resized). Picked
@@ -154,11 +158,16 @@ class SongPlayer:
         self.scale_x = scale_x
         self.scale_y = scale_y
 
-    def update_hwnd(self, hwnd):
+    def update_hwnd(self, hwnd, pid=0):
         """The game recreated its window (fullscreen toggle, display-mode
-        change): new HWND for the detector's GDI reads and focus gate.
-        `_rhythm_phase` rebuilds the detector (+ viz) on its next tick."""
+        change): new HWND for the detector's GDI reads and focus gate
+        (`pid`: the game process, unchanged unless it was unknown).
+        `_rhythm_phase` rebuilds the detector (+ viz) on its next tick.
+        Called from the album runner's thread only (the thread running
+        `_rhythm_phase`) — never from the end watcher."""
         self.hwnd = hwnd
+        if pid:
+            self.game_pid = pid
 
     def play(self, difficulty, skip_intro=False):
         """Play one song at `difficulty`. Returns True on normal
@@ -440,7 +449,8 @@ class SongPlayer:
             st['layout'] = layout
             st['hwnd'] = self.hwnd
             st['detector'] = NoteDetector(self.hwnd, column_centers,
-                                          hit_line_y, self.controller)
+                                          hit_line_y, self.controller,
+                                          pid=self.game_pid)
             st['detector'].start()
             start_viz()
 

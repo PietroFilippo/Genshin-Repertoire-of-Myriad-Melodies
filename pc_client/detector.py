@@ -119,7 +119,7 @@ def _window_pid(hwnd):
 
 
 class NoteDetector:
-    def __init__(self, hwnd, column_centers, hit_line_y, controller):
+    def __init__(self, hwnd, column_centers, hit_line_y, controller, pid=0):
         """
         Args:
             hwnd: HWND of the game window (used for GetDC and for the
@@ -129,8 +129,12 @@ class NoteDetector:
             controller: ArduinoHIDController instance — key_down/key_up
                 are called from worker threads (the controller already
                 serializes serial writes via its internal write lock).
+            pid: the game process the run is anchored to (runners pass
+                it); 0 = read it from `hwnd` at start(). The foreground
+                gate only accepts windows of this process.
         """
         self.hwnd = hwnd
+        self._anchor_pid = pid or 0
         self.column_centers = column_centers
         self.hit_line_y = hit_line_y
         self.controller = controller
@@ -153,7 +157,7 @@ class NoteDetector:
         _active_detector = self
         # Resolve the initial focus state synchronously so the key loops
         # never see a stale default before the focus thread's first tick.
-        self._game_pid = _window_pid(self.hwnd)
+        self._game_pid = self._anchor_pid or _window_pid(self.hwnd)
         focused = self._is_game_foreground()
         self._game_focused = bool(focused)
         if not self._game_focused:
