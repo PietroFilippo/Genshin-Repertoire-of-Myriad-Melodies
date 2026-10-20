@@ -258,6 +258,63 @@ class DetectorActiveLanes(unittest.TestCase):
         self.assertEqual(detector.active_lanes(), [False] * 6)
 
 
+# A handle with bit 31 set, as the three ctypes representations in play
+# report it: signed c_int (default restype, e.g. GetForegroundWindow),
+# sign-extended HWND / c_void_p (ui.py binds FindWindowW to that), and the
+# bare 32-bit value.
+BIT31_SIGNED = -2147478988                     # 0x80001234 as c_int
+BIT31_HWND = 0xFFFFFFFF80001234                # same handle via HWND
+BIT31_RAW = 0x80001234
+
+
+class HwndComparisons(unittest.TestCase):
+    """MR12 — HWND equality across ctypes restypes (bit 31 set)."""
+
+    def test_same_hwnd_across_representations(self):
+        same = game_window.same_hwnd
+        self.assertTrue(same(BIT31_SIGNED, BIT31_HWND))
+        self.assertTrue(same(BIT31_HWND, BIT31_RAW))
+        self.assertTrue(same(BIT31_SIGNED, BIT31_RAW))
+        self.assertFalse(same(BIT31_SIGNED, 0x80001235))
+        self.assertFalse(same(0, 0))
+        self.assertFalse(same(None, BIT31_HWND))
+
+    def test_detector_gate_sees_game_focused_with_bit31_handle(self):
+        """The foreground gate must not decide "not focused" just because
+        GetForegroundWindow (signed) and FindWindowW (HWND) disagree on
+        representation — with the PID fallback unavailable too."""
+        det = detector.NoteDetector(BIT31_HWND, [10] * len(KEYS), 50,
+                                    FakeInput())
+        with mock.patch.object(detector, '_foreground_hwnd',
+                               return_value=BIT31_SIGNED), \
+                mock.patch.object(detector, '_window_pid', return_value=0):
+            self.assertIs(det._is_game_foreground(), True)
+        det.hwnd = BIT31_SIGNED
+        with mock.patch.object(detector, '_foreground_hwnd',
+                               return_value=BIT31_HWND), \
+                mock.patch.object(detector, '_window_pid', return_value=0):
+            self.assertIs(det._is_game_foreground(), True)
+        with mock.patch.object(detector, '_foreground_hwnd',
+                               return_value=0x80001235), \
+                mock.patch.object(detector, '_window_pid', return_value=0):
+            self.assertIs(det._is_game_foreground(), False)
+
+    def test_detector_window_pid_accepts_any_representation(self):
+        for h in (BIT31_SIGNED, BIT31_HWND, BIT31_RAW):
+            self.assertIsInstance(detector._window_pid(h), int)
+
+    def test_viz_focus_guard_matches_bit31_preview(self):
+        """Preview HWND (HWND restype) vs foreground (signed) for the same
+        window → the guard still hands focus back to the game."""
+        with mock.patch.object(standalone_runner, '_foreground_window',
+                               return_value=BIT31_SIGNED), \
+                mock.patch.object(standalone_runner, '_keep_topmost'), \
+                mock.patch.object(standalone_runner, '_give_focus_to',
+                                  return_value=True) as give, _quiet():
+            standalone_runner._guard_viz_focus(BIT31_HWND, GAME_HWND)
+        give.assert_called_once_with(GAME_HWND)
+
+
 class ScreenWatcherClicks(unittest.TestCase):
 
     def setUp(self):
@@ -806,6 +863,20 @@ class VisualizationWindow(unittest.TestCase):
                       on_frame=lambda n: n >= 2 and stop.set())
         self.assertEqual(self.focus_given[0], GAME_HWND)
         self.assertEqual(self.fg[0], GAME_HWND)
+
+    def test_focus_handback_on_creation_with_bit31_preview(self):
+        """MR12 — preview HWND via HWND restype, foreground reported as
+        the signed c_int of the same window: still recognised."""
+        stop = threading.Event()
+
+        def created():
+            self.fg[0] = BIT31_SIGNED
+
+        with mock.patch.object(standalone_runner, '_viz_hwnd',
+                               return_value=BIT31_HWND):
+            self._run_viz(stop, on_create=created,
+                          on_frame=lambda n: n >= 2 and stop.set())
+        self.assertEqual(self.focus_given[0], GAME_HWND)
 
     def test_safety_net_returns_focus_to_game_mid_run(self):
         """RR3"""

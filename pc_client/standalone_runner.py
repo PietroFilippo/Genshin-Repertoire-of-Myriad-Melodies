@@ -25,7 +25,7 @@ from detector import NoteDetector
 from controller import ArduinoHIDController
 from game_window import (MSG_WINDOW_NOT_FOUND, find_game_window, auto_detect,
                          get_game_geometry, read_game_geometry,
-                         scaled_layout)
+                         same_hwnd, scaled_layout)
 
 try:
     from controller import ArduinoConnectionError
@@ -185,7 +185,7 @@ def _guard_viz_focus(viz_hwnd, game_hwnd):
     if not viz_hwnd:
         return
     _keep_topmost(viz_hwnd)
-    if _foreground_window() != viz_hwnd:
+    if not same_hwnd(_foreground_window(), viz_hwnd):
         return
     target = game_hwnd or find_game_window()
     if target and _give_focus_to(target):
@@ -370,7 +370,8 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             # namedWindow's ShowWindow(SW_SHOW) may already have activated
             # the preview — give focus back to whoever had it (the game, or
             # the UI if the user just ticked Debug there).
-            if prev_fg and prev_fg != hwnd and _foreground_window() == hwnd:
+            if (prev_fg and not same_hwnd(prev_fg, hwnd)
+                    and same_hwnd(_foreground_window(), hwnd)):
                 _give_focus_to(prev_fg)
         else:
             # Preview HWND not found (non-Win32 HighGUI backend?) — fall
@@ -694,7 +695,8 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
                     break
                 new_hwnd, new_region, new_cols, new_hit = refreshed
                 if (new_region != old_region or new_cols != old_cols
-                        or new_hit != old_hit or new_hwnd != hwnd):
+                        or new_hit != old_hit
+                        or not same_hwnd(new_hwnd, hwnd)):
                     print(f"[standalone] game window moved/resized — now "
                           f"{new_region['width']}x{new_region['height']} @ "
                           f"({new_region['left']},{new_region['top']})")

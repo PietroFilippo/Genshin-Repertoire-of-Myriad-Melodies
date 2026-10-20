@@ -46,6 +46,7 @@ import threading
 import time
 
 from config import KEYS, PIXEL_THRESHOLD, KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS
+from game_window import same_hwnd
 
 _user32 = ctypes.windll.user32
 _gdi32 = ctypes.windll.gdi32
@@ -71,12 +72,9 @@ def _blue(colorref):
 # ctypes' default prototypes: `ctypes.windll.user32` is process-global, and
 # ui_core's hotkey gate compares GetForegroundWindow's default c_int result
 # against a cached HWND. Changing restype here would change it there too.
-
-def _hwnd_key(hwnd):
-    # HWNDs are 32-bit significant on Win64. Normalise so a c_int-typed
-    # GetForegroundWindow and an HWND-typed FindWindowW (ui.py binds that
-    # restype) compare equal even if the handle's high bit is set.
-    return int(hwnd or 0) & 0xFFFFFFFF
+# So GetForegroundWindow returns a signed c_int while our hwnd may come from
+# an HWND-typed FindWindowW (ui.py binds that restype): compare them only
+# through game_window.same_hwnd (low 32 bits), never with a raw `==`.
 
 
 def _foreground_hwnd():
@@ -205,7 +203,7 @@ class NoteDetector:
         fg = _foreground_hwnd()
         if not fg:
             return None
-        if _hwnd_key(fg) == _hwnd_key(self.hwnd):
+        if same_hwnd(fg, self.hwnd):
             return True
         if self._game_pid and _window_pid(fg) == self._game_pid:
             return True

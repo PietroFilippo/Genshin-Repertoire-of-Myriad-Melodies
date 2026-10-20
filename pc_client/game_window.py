@@ -35,6 +35,24 @@ def _user32():
     return ctypes.windll.user32
 
 
+def same_hwnd(a, b):
+    """HWND equality that survives ctypes restype differences. ui.py binds
+    `FindWindowW.restype = HWND` on the process-global user32 (unsigned,
+    sign-extended to 64 bits), while GetForegroundWindow keeps the default
+    c_int (signed) — so for a handle with bit 31 set a raw `==` says two
+    handles to the SAME window differ. HWNDs carry only 32 significant
+    bits: compare the low 32. Null / missing handles never match (same
+    semantics as ui_core._same_hwnd). Use this for every HWND comparison
+    in the rhythm-engine files — a false "different window" in the
+    detector's foreground gate would silently stop the bot playing."""
+    try:
+        a = int(a or 0)
+        b = int(b or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(a) and bool(b) and (a & 0xFFFFFFFF) == (b & 0xFFFFFFFF)
+
+
 def _report(status_cb, message):
     """Best-effort `last_error` emission. '' clears a previously
     reported wait-state error once the window is usable again."""
