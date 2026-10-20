@@ -656,6 +656,11 @@ def is_allowed_foreground(ui_hwnd):
     # handle with bit 31 set would never compare equal raw.
     if ui_hwnd and _same_hwnd(fg, ui_hwnd):
         return True
+    # Common case for F8/F9/F10 in-game: the cached Genshin HWND (see
+    # refresh_game_hwnd) answers with an integer compare, so the title /
+    # process lookups below only run for some other foreground window.
+    if _game_hwnd and _same_hwnd(fg, _game_hwnd):
+        return True
     title = _window_title(fg)
     if title == UI_WINDOW_TITLE:
         return True
@@ -995,10 +1000,10 @@ class KeybindManager:
     #   * the watchdog could not tell a stall from a dead hook, and each
     #     re-registration is a window where a real press IS lost
     #
-    # Hotkeys stay on mouse.on_button / keyboard.add_hotkey, which fire only
-    # on the bindings themselves and cost nothing between presses.
+    # Hotkeys therefore only do work for the bound keys/buttons themselves
+    # and cost next to nothing between presses.
     #
-    # Update: keyboard bindings moved from keyboard.add_hotkey to one
+    # Keyboard bindings moved from keyboard.add_hotkey to one
     # keyboard.hook + `_on_kb_event` (see there). That is a per-KEY-event
     # Python call, but the keyboard package already runs Python for every
     # key event (direct_callback + pre_process_event) whether or not we
@@ -1749,8 +1754,8 @@ except ImportError:
 class BotController:
     """Owns the bot worker thread and the events it watches. Exposes
     start / pause / resume / stop / toggle_debug methods called from the
-    UI thread (or from hotkey callbacks dispatched on the keyboard
-    package's listener thread)."""
+    UI thread (or from hotkey callbacks on KeybindManager's
+    hotkey-dispatch worker thread)."""
 
     STATE_IDLE = 'idle'
     STATE_RUNNING = 'running'

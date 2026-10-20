@@ -35,10 +35,11 @@
 # GetForegroundWindow every FOCUS_POLL_S and flips a plain bool; the six
 # per-key 5 ms loops only read that bool (no extra Win32 calls on the hot
 # path). While the game isn't foreground, held keys are released and no
-# KEY_DOWN is issued. Note the debug-viz OpenCV window belongs to OUR
-# process, so clicking it takes focus away from the game and pauses input
-# too — click back into Genshin to resume. That's intended: keystrokes
-# would land in the viz window, not the game, anyway.
+# KEY_DOWN is issued. The debug-viz OpenCV window belongs to OUR process;
+# standalone_runner makes it non-activating and hands focus back to the
+# game if it ever takes the foreground, because while it's focused the
+# gate (correctly) pauses input — keystrokes would land in the viz window,
+# not the game.
 
 import ctypes
 import ctypes.wintypes

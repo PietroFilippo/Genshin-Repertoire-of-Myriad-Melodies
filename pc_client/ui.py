@@ -1868,7 +1868,8 @@ class BridgeApi:
             pass
         return desired
 
-    # Hotkey callbacks run on the keyboard package's listener thread.
+    # Hotkey callbacks run on KeybindManager's hotkey-dispatch worker
+    # thread (never on the keyboard/mouse listener thread).
     # They only mutate threading.Events / BotController state (already
     # thread-safe); the UI catches up on the next drain tick.
     def _hotkey_start_stop(self):
