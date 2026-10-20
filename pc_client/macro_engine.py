@@ -7,8 +7,10 @@ The engine owns:
 - The auto-repeat suppression rule (drop consecutive `down` events
   for the same keyboard key).
 - The `double → down` event-type normalization.
-- Playback timing (sleep to each event's target time, cancellable
-  via a `threading.Event`) and the safety sweep (release inputs
+- Playback routing: an Arduino backend with `play_timed_macro` may
+  preload and schedule the whole event list on-device; every other
+  backend keeps the host scheduler below. Both paths are cancellable
+  via a `threading.Event` and share the safety sweep (release inputs
   this playback left held, plus rhythm keys + L/R mouse on exit).
 - On-disk slot format `{name, events}` with bare-list legacy
   back-compat on read.
@@ -24,13 +26,47 @@ The engine does NOT own:
   forwarding).
 - Excluded-hotkey filtering (caller's concern — which keys are
   bound to macro hotkeys differs per tool).
-- The slot-picker (1-9 + ESC + 4s timer) — coupled to each tool's
+- The slot-picker (slot range / bank keys + ESC + timer) — coupled to each tool's
   hotkey registry, kept duplicated in each tool by design.
 - State machine (idle / recording / playing). Caller wraps the
   engine and tracks state however it likes.
 """
 import json
 import time
+
+try:
+    from system_setup import boost_timer, restore_timer
+except Exception:                                   # pragma: no cover
+    def boost_timer():
+        return False
+
+    def restore_timer():
+        pass
+
+# Playback timing notes -- measured on this repo, do not "simplify" back:
+#
+# * `threading.Event.wait()` is NOT usable as the timing primitive. It
+#   resolves to WaitForSingleObject, which honours only the global OS
+#   tick: ~5.5 ms overshoot per call at the Windows default, ~0.2 ms
+#   with timeBeginPeriod(1). Worse, the boost stops being honoured
+#   mid-run once Windows power-throttles the process (measured: first
+#   ~6.5 s of an 11 s macro landed at +0.8 ms, everything after it
+#   scattered to +14 ms). That is exactly the reported symptom -- the
+#   same macro producing different timings run to run, cutting a
+#   finisher on some runs and not others, because several margins in
+#   the Mavuika combos are only 50-210 ms.
+# * `time.sleep()` on Python 3.11+ Windows uses a high-resolution
+#   waitable timer: ~0.3 ms overshoot with OR without the boost. So the
+#   wait loop sleeps in short chunks and polls `stop_evt` between them
+#   instead of waiting on it. Timing no longer depends on the OS tick.
+# * The boost is still requested (cheap, ref-counted, helps the rest of
+#   the process) but correctness no longer rests on it.
+#
+# Sleep until this close to the target, then busy-spin the remainder.
+_SPIN_WINDOW = 0.002
+# Longest single sleep chunk => worst-case stop latency. The app's
+# overall stop-latency target is ~500 ms, so 5 ms is free.
+_STOP_POLL = 0.005
 
 
 class MacroEngine:
@@ -190,30 +226,65 @@ class MacroEngine:
     # ---- playback ----
 
     def play(self, controller, stop_evt=None, rhythm_keys=()):
-        """Iterate the buffer, sleep to each event's target time,
-        dispatch to `controller`. `stop_evt` is a `threading.Event`
-        consulted between events and during the sleep — set it to
-        cancel. On exit (normal, cancelled, or exception) releases
-        every key in `rhythm_keys` plus left/right mouse so an
-        interrupted macro doesn't leave anything stuck down in-game.
+        """Play the buffer through the best scheduler the controller
+        exposes. Arduino firmware with the optional
+        `play_timed_macro(events, stop_evt)` capability preloads and
+        schedules the sequence on-device. If the method is absent or
+        returns False (old firmware / unsupported event), this falls
+        back to the existing host-side high-resolution scheduler.
+
+        `stop_evt` is a `threading.Event` consulted while waiting — set
+        it to cancel. On exit (normal, cancelled, or exception), the
+        shared safety sweep releases any host-tracked inputs plus every
+        key in `rhythm_keys` and left/right mouse so an interrupted
+        macro doesn't leave anything stuck down in-game.
 
         Caller manages state-machine transitions (mark playing on
         entry, idle on return)."""
-        start = time.time()
+        boosted = False
         held_keys = set()
         held_mouse = set()
+        cancelled = False
         try:
+            timed_player = getattr(controller, 'play_timed_macro', None)
+            if callable(timed_player):
+                try:
+                    handled = timed_player(
+                        list(self._events), stop_evt=stop_evt)
+                except Exception as exc:
+                    # An optional acceleration must never make macro
+                    # playback less compatible. The concrete Arduino
+                    # adapter normally swallows transport failures, but
+                    # third-party adapters may not.
+                    print(f"[macro] timed backend failed; using host "
+                          f"scheduler: {exc}")
+                    handled = False
+                if handled:
+                    return
+
+            boosted = boost_timer()
+            # perf_counter, not time(): time() is wall-clock and also has
+            # ~15.6 ms resolution on Windows, so the wait computation itself
+            # was coarse. perf_counter is monotonic and high-resolution.
+            start = time.perf_counter()
             for ev in self._events:
                 if stop_evt is not None and stop_evt.is_set():
                     break
                 target = start + ev.get('time', 0.0)
-                wait = target - time.time()
-                if wait > 0:
-                    if stop_evt is not None:
-                        if stop_evt.wait(wait):
-                            break
-                    else:
-                        time.sleep(wait)
+                # Sleep to just short of the target in short chunks,
+                # then busy-spin the remainder. See the timing notes at
+                # the top of the module for why this is not Event.wait.
+                while True:
+                    remaining = target - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    if remaining > _SPIN_WINDOW:
+                        time.sleep(min(remaining - _SPIN_WINDOW, _STOP_POLL))
+                    if stop_evt is not None and stop_evt.is_set():
+                        cancelled = True
+                        break
+                if cancelled:
+                    break
                 device = ev.get('device', 'keyboard')
                 etype = ev.get('event_type')
                 key = ev.get('key', '')
@@ -232,6 +303,8 @@ class MacroEngine:
                         controller.mouse_up(key)
                         held_mouse.discard(key)
         finally:
+            if boosted:
+                restore_timer()
             for k in list(held_keys):
                 controller.key_up(k)
             for b in list(held_mouse):

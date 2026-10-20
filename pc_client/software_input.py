@@ -61,7 +61,33 @@ class SoftwareInputController:
         # `mouse` packages start their listener threads lazily on
         # first hook install elsewhere in the UI (KeybindManager,
         # MacroController) — nothing for us to spin up here.
+        self._warm_keyboard_tables()
         print("[input] software backend ready (Win32 SendInput / mouse_event)")
+
+    @staticmethod
+    def _warm_keyboard_tables():
+        """Pay the `keyboard` package's lazy scan-code table build now.
+
+        Measured on this repo: the FIRST `keyboard.press(...)` in a
+        process costs **114 ms** while it enumerates the OS keyboard
+        layout; every call after it is <=0.11 ms. `mouse` has no such
+        cost (~0.000 ms), so a macro's mouse events are on time while
+        its first keyboard event is ~7 frames late.
+
+        That lands in the worst possible place: in every Mavuika combo
+        the first keyboard event is the first DASH, and a dash 114 ms
+        off its mark misses the spin hit it was supposed to cancel on —
+        which reads in-game as "she dashes and just stays idle", on the
+        first run after launch only. See mavuika-macros.md 4.28.
+
+        `key_to_scan_codes` triggers the same table build and sends
+        nothing, so this is free to call at construction.
+        """
+        try:
+            for name in ('left shift', 'shift', 'a'):
+                keyboard.key_to_scan_codes(name)
+        except Exception as e:                      # pragma: no cover
+            print(f"[sw-input] keyboard warmup skipped: {e}")
 
     # ---- keyboard ----
 

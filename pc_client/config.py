@@ -136,6 +136,6 @@ UI_KEYBINDS_DEFAULT = {
     'macro_record': 'y',         # toggle record / stop-record
     'macro_play':   'mouse:x',   # start playback (idempotent while playing)
     'macro_stop':   'mouse:x2',  # stop playback
-    'macro_save':   'u',         # arms 1-9 slot picker (4s) for save
-    'macro_load':   'f11',       # arms 1-9 slot picker (4s) for load
+    'macro_save':   'u',         # 1-9; 0 then 1-9 selects slots 10-18
+    'macro_load':   'f11',       # 1-9; 0 then 1-9 selects slots 10-18
 }

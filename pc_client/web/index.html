@@ -187,7 +187,7 @@
                 <button type="button" class="active-policy-btn macro-mode-active" data-policy="ignore">Ignore</button>
                 <button type="button" class="active-policy-btn" data-policy="interrupt">Interrupt</button>
                 <span class="help" tabindex="0" aria-label="Active macros info"
-                      data-help="Assign up to two saved slots to their own Genshin-only playback hotkeys. Only one macro plays at a time. Ignore keeps the current playback running when the other active hotkey is pressed; Interrupt stops the current playback, releases held inputs, then starts the requested saved slot.">?</span>
+                      data-help="Assign up to three saved slots to their own Genshin-only playback hotkeys. Only one macro plays at a time. Ignore keeps the current playback running when another active hotkey is pressed; Interrupt stops the current playback, releases held inputs, then starts the requested saved slot.">?</span>
             </div>
             <div class="active-macro-list">
                 <div class="active-macro-row" data-active="1">
@@ -204,6 +204,18 @@
                 </div>
                 <div class="active-macro-row" data-active="2">
                     <span class="active-label">B</span>
+                    <div class="select-wrapper active-slot-wrap">
+                        <select class="active-slot">
+                            <option value="0">No slot</option>
+                        </select>
+                    </div>
+                    <span class="hk-binding active-binding">&lt;unset&gt;</span>
+                    <button type="button" class="active-bind btn-secondary">Bind</button>
+                    <button type="button" class="active-play btn-secondary">Play</button>
+                    <button type="button" class="active-clear btn-secondary">Clear</button>
+                </div>
+                <div class="active-macro-row" data-active="3">
+                    <span class="active-label">C</span>
                     <div class="select-wrapper active-slot-wrap">
                         <select class="active-slot">
                             <option value="0">No slot</option>
@@ -239,6 +251,15 @@
                 <button type="button" class="slot" data-slot="7"><span class="slot-num">7</span><span class="slot-name">empty</span></button>
                 <button type="button" class="slot" data-slot="8"><span class="slot-num">8</span><span class="slot-name">empty</span></button>
                 <button type="button" class="slot" data-slot="9"><span class="slot-num">9</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="10"><span class="slot-num">10</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="11"><span class="slot-num">11</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="12"><span class="slot-num">12</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="13"><span class="slot-num">13</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="14"><span class="slot-num">14</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="15"><span class="slot-num">15</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="16"><span class="slot-num">16</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="17"><span class="slot-num">17</span><span class="slot-name">empty</span></button>
+                <button type="button" class="slot" data-slot="18"><span class="slot-num">18</span><span class="slot-name">empty</span></button>
             </div>
             <div class="macro-pending" id="macro-pending"></div>
         </fieldset>
@@ -261,12 +282,12 @@
                 <button type="button" class="rebind">Rebind</button>
             </div>
             <div class="hk-row" data-action="macro_save">
-                <span class="hk-label">Save (1-9)</span>
+                <span class="hk-label">Save (1-18)</span>
                 <span class="hk-binding">&mdash;</span>
                 <button type="button" class="rebind">Rebind</button>
             </div>
             <div class="hk-row" data-action="macro_load">
-                <span class="hk-label">Load (1-9)</span>
+                <span class="hk-label">Load (1-18)</span>
                 <span class="hk-binding">&mdash;</span>
                 <button type="button" class="rebind">Rebind</button>
             </div>

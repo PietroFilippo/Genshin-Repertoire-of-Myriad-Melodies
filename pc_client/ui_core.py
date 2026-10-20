@@ -10,6 +10,7 @@ Admin elevation is now handled by the PyInstaller-embedded UAC manifest
 (`uac-admin`), so the runtime no longer self-elevates. Dev launches via
 `python ui.py` show a warning message box if not admin.
 """
+import contextlib
 import ctypes
 import ctypes.wintypes
 import json
@@ -31,7 +32,12 @@ from standalone_runner import run_standalone
 from system_setup import boost_timer, restore_timer, set_dpi_aware
 
 
+APP_VERSION = '1.5.5'
+# Bumped by hand on every build that goes to the user. Printed at startup
+# and stamped into the window title so "which build is running" is never
+# a guess — a whole debugging round was lost to that ambiguity.
 UI_WINDOW_TITLE = 'Genshin Rhythm Bot'
+MACRO_SLOT_COUNT = 18
 
 
 def is_frozen():
@@ -135,8 +141,8 @@ ACTION_LABELS = {
     ACTION_MACRO_RECORD: 'Record / Stop',
     ACTION_MACRO_PLAY:   'Play Macro',
     ACTION_MACRO_STOP:   'Stop Playback',
-    ACTION_MACRO_SAVE:   'Save Slot (1-9)',
-    ACTION_MACRO_LOAD:   'Load Slot (1-9)',
+    ACTION_MACRO_SAVE:   f'Save Slot (1-{MACRO_SLOT_COUNT})',
+    ACTION_MACRO_LOAD:   f'Load Slot (1-{MACRO_SLOT_COUNT})',
 }
 # Bot hotkeys — fire while Genshin OR the UI is focused.
 BOT_ACTIONS = (ACTION_START_STOP, ACTION_PAUSE, ACTION_DEBUG)
@@ -160,7 +166,7 @@ def macros_dir():
 # --- settings persistence ---------------------------------------------------
 
 _VALID_BACKENDS = ('arduino', 'software')
-ACTIVE_MACRO_COUNT = 2
+ACTIVE_MACRO_COUNT = 3
 MACRO_CONFLICT_IGNORE = 'ignore'
 MACRO_CONFLICT_INTERRUPT = 'interrupt'
 _VALID_MACRO_CONFLICT_POLICIES = (
@@ -192,7 +198,7 @@ def _normalize_active_macros(value, reserved_hotkeys=()):
             slot = int(item.get('slot') or 0)
         except (TypeError, ValueError):
             slot = 0
-        if not (1 <= slot <= 9):
+        if not (1 <= slot <= MACRO_SLOT_COUNT):
             slot = 0
         hotkey = str(item.get('hotkey') or '').strip().lower()
         if hotkey and hotkey in used_hotkeys:
@@ -386,18 +392,76 @@ def is_allowed_foreground(ui_hwnd):
     return proc in _GAME_EXE_NAMES
 
 
+# Genshin's HWND, refreshed off the hot path.
+#
+# WHY THIS CACHE EXISTS: is_allowed_game_only() runs on the WH_MOUSE_LL /
+# WH_KEYBOARD_LL callback for every hotkey press. It used to call
+# _window_title(fg), and GetWindowTextW against a window owned by ANOTHER
+# process sends WM_GETTEXT and blocks until that process's message loop
+# replies. Doing that inside a low-level hook means a stuttering game can
+# overrun LowLevelHooksTimeout, at which point Windows silently and
+# permanently unhooks us: every later press vanishes with no error. That
+# was the "hotkey stops working until I wait a bit" bug.
+#
+# FindWindowW does not message the target, so it is safe to call from the
+# refresher thread; the hook callback then only does GetForegroundWindow
+# and an integer compare, neither of which can block.
+_game_hwnd_lock = threading.Lock()
+_game_hwnd = 0
+
+
+def refresh_game_hwnd():
+    """Re-resolve Genshin's HWND. Safe to call from a background thread;
+    must never be called from a hook callback."""
+    global _game_hwnd
+    hwnd = 0
+    try:
+        user32 = ctypes.windll.user32
+        titles = GAME_WINDOW_TITLE
+        if isinstance(titles, str):
+            titles = (titles,)
+        for title in titles:
+            hwnd = user32.FindWindowW(None, title)
+            if hwnd:
+                break
+    except Exception:
+        hwnd = 0
+    with _game_hwnd_lock:
+        _game_hwnd = hwnd or 0
+    return _game_hwnd
+
+
+_refresher_started = False
+
+
+def _start_game_hwnd_refresher(period=1.0):
+    global _refresher_started
+    if _refresher_started:
+        return
+    _refresher_started = True
+
+    def loop():
+        while True:
+            refresh_game_hwnd()
+            time.sleep(period)
+    threading.Thread(target=loop, daemon=True,
+                     name='game-hwnd-refresh').start()
+
+
 def is_allowed_game_only():
     """Stricter gate — only Genshin's window passes. Used for macro
     hotkeys + macro recording capture: the macro tool should not arm or
-    record while the user is in another app."""
+    record while the user is in another app.
+
+    HOT PATH — runs inside a low-level hook callback. Only
+    GetForegroundWindow plus an integer compare; nothing here may send a
+    window message or open a process handle (see the note above)."""
     fg = _foreground_hwnd()
     if not fg:
         return False
-    title = _window_title(fg)
-    if title in GAME_WINDOW_TITLE:
-        return True
-    proc = _foreground_process_name()
-    return proc in _GAME_EXE_NAMES
+    with _game_hwnd_lock:
+        cached = _game_hwnd
+    return bool(cached) and fg == cached
 
 
 def focus_game_window():
@@ -442,6 +506,18 @@ class KeybindManager:
     active hook at a time. Bindings starting with 'mouse:<btn>' route to
     the mouse package; everything else routes to keyboard."""
 
+    # A hotkey callback must NEVER run on the listener thread.
+    # `mouse.on_button` and `keyboard.add_hotkey` invoke handlers inline on
+    # the package's own listener thread, so any blocking work in a callback
+    # stalls ALL input hook processing for its duration. `play_slot` can
+    # join a winding-down worker for up to 2 s while holding its command
+    # lock — which froze the hooks for 2 s, swallowed every press that
+    # arrived meanwhile, and produced the reported "spamming the hotkey
+    # does nothing, wait a moment and it works". Callbacks are handed to a
+    # single dispatcher thread instead: the listener returns immediately
+    # and ordering between triggers is preserved.
+    _DISPATCH_MAX = 8
+
     def __init__(self, ui_hwnd_provider):
         # ui_hwnd_provider() returns the current UI HWND. Called per-key
         # so it stays correct if the underlying window is recreated.
@@ -451,6 +527,52 @@ class KeybindManager:
         self._bindings = {}      # action -> hotkey string
         self._callbacks = {}     # action -> python callable
         self._scopes = {}        # action -> 'app' | 'game'
+        self._dispatch_q = queue.Queue(maxsize=self._DISPATCH_MAX)
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatch_loop, daemon=True, name='hotkey-dispatch')
+        self._dispatch_thread.start()
+        self._last_hook_event = time.monotonic()
+        refresh_game_hwnd()            # prime it before any press arrives
+        _start_game_hwnd_refresher()
+
+    # NO all-events mouse hook here, and no dead-hook watchdog.
+    #
+    # Both were built on a theory the harness disproved. tools/hook_diag.py,
+    # 10 minutes, 207,613 events: the hook "died" 15 times and RECOVERED ON
+    # ITS OWN every time, with a max callback of 1.4 ms. A hook Windows
+    # unhooks for overrunning LowLevelHooksTimeout never comes back -- so
+    # that was never the mechanism. What actually happens is transient
+    # 1-2.6 s stalls in event DELIVERY: presses arrive late, not lost.
+    #
+    # Against that, both mitigations were net harmful:
+    #   * the probe hooked EVERY mouse event -- ~345 Python callbacks per
+    #     second on the listener thread, which is itself delivery load
+    #   * the watchdog could not tell a stall from a dead hook, and each
+    #     re-registration is a window where a real press IS lost
+    #
+    # Hotkeys stay on mouse.on_button / keyboard.add_hotkey, which fire only
+    # on the bindings themselves and cost nothing between presses.
+
+    def _dispatch_loop(self):
+        while True:
+            action, callback, refused = self._dispatch_q.get()
+            if callback is None:
+                print(f"[hotkey] {action} ignored - {refused}")
+                self._dispatch_q.task_done()
+                continue
+            print(f"[hotkey] {action} pressed")
+            t0 = time.monotonic()
+            try:
+                callback()
+            except Exception as e:
+                print(f"[ui] hotkey callback error ({action}): {e}")
+            finally:
+                took = (time.monotonic() - t0) * 1000
+                if took > 100:
+                    # Worth seeing: this is time the OLD code spent
+                    # blocking the input listener.
+                    print(f"[ui] hotkey {action} handler took {took:.0f} ms")
+                self._dispatch_q.task_done()
 
     @staticmethod
     def _is_mouse(binding):
@@ -467,7 +589,7 @@ class KeybindManager:
         self.clear(action)
         if not hotkey:
             return
-        wrapped = self._gate(callback, scope)
+        wrapped = self._gate(callback, scope, action)
         try:
             if self._is_mouse(hotkey):
                 btn = self._mouse_button(hotkey)
@@ -477,7 +599,11 @@ class KeybindManager:
                                          types=['down'])
                 self._mouse_hooks[action] = handle
             else:
-                handle = keyboard.add_hotkey(hotkey, wrapped, suppress=False)
+                handle = keyboard.add_hotkey(
+                    hotkey,
+                    wrapped,
+                    suppress=False,
+                )
                 self._kb_hooks[action] = handle
         except Exception as e:
             print(f"[ui] failed to bind {hotkey!r} for {action}: {e}")
@@ -513,22 +639,32 @@ class KeybindManager:
         captured into the macro)."""
         return dict(self._bindings)
 
-    def _gate(self, callback, scope):
+    def _gate(self, callback, scope, action='?'):
         def wrapper(*_args, **_kwargs):
+            # NOTHING slow may happen here. This runs on the WH_MOUSE_LL /
+            # WH_KEYBOARD_LL callback, and Windows permanently unhooks a
+            # low-level hook whose callback exceeds LowLevelHooksTimeout.
+            # Once that happens every later press vanishes with no trace --
+            # exactly the "spamming does nothing" failure. In particular NO
+            # print() here: print goes through QueueWriter, which mirrors to
+            # the original stdout, and in a --windowed build that is not a
+            # real console.
+            self._last_hook_event = time.monotonic()
             if scope == 'game':
-                if not is_allowed_game_only():
-                    return
+                ok = is_allowed_game_only()
+                why = 'Genshin not foreground'
             else:
                 try:
                     ui_hwnd = self._ui_hwnd_provider()
                 except Exception:
                     ui_hwnd = 0
-                if not is_allowed_foreground(ui_hwnd):
-                    return
+                ok = is_allowed_foreground(ui_hwnd)
+                why = 'app not foreground'
             try:
-                callback()
-            except Exception as e:
-                print(f"[ui] hotkey callback error: {e}")
+                self._dispatch_q.put_nowait(
+                    (action, callback if ok else None, None if ok else why))
+            except queue.Full:
+                pass
         return wrapper
 
 
@@ -779,7 +915,7 @@ class BotController:
 class MacroController:
     """Standalone-of-macro_tool.py adapted for the UI. Records keyboard +
     mouse events from inside Genshin (foreground-gated), replays them via
-    a shared ArduinoHIDController, and persists up to 9 numbered slots
+    a shared ArduinoHIDController, and persists numbered slots
     under `macros_dir()`.
 
     Three states: idle / recording / playing. Mutually exclusive with the
@@ -832,6 +968,7 @@ class MacroController:
         self._pending_action = None
         self._slot_hotkey_handles = []
         self._slot_timer = None
+        self._pending_slot_bank = 0
         self._pending_lock = threading.Lock()
 
     # ---- introspection ----
@@ -846,7 +983,7 @@ class MacroController:
         d = macros_dir()
         if not d.exists():
             return []
-        return [n for n in range(1, 10)
+        return [n for n in range(1, MACRO_SLOT_COUNT + 1)
                 if (d / f'macro_{n}.json').exists()]
 
     def slot_names(self):
@@ -858,7 +995,7 @@ class MacroController:
         names = {}
         if not d.exists():
             return names
-        for n in range(1, 10):
+        for n in range(1, MACRO_SLOT_COUNT + 1):
             p = d / f'macro_{n}.json'
             if not p.exists():
                 continue
@@ -950,10 +1087,21 @@ class MacroController:
     # ---- playback ----
 
     def play(self):
-        with self._command_lock:
-            repeated = self._is_repeated_play_trigger_locked(('buffer', None))
+        with self._command('play (buffer)') as ok:
+            if not ok:
+                return False
+            if self._is_repeated_play_trigger_locked(('buffer', None)):
+                return False
+            # Wait out a pending stop so the buffer Play button behaves
+            # like the slot hotkeys — see the docstring above.
             with self._lock:
-                if repeated or self._state == self.STATE_PLAYING:
+                winding_down = (self._state == self.STATE_PLAYING
+                                and self._stop_play_evt.is_set())
+                old_thread = self._play_thread if winding_down else None
+            if old_thread is not None:
+                old_thread.join(timeout=2.0)
+            with self._lock:
+                if self._state == self.STATE_PLAYING:
                     return False
                 if self._state != self.STATE_IDLE:
                     print(f"[macro] cannot play - state is {self._state}")
@@ -972,12 +1120,14 @@ class MacroController:
         return True
 
     def play_slot(self, n, conflict_policy=MACRO_CONFLICT_IGNORE):
-        with self._command_lock:
+        with self._command(f'play slot {n}') as ok:
+            if not ok:
+                return False
             try:
                 n_int = int(n)
             except (TypeError, ValueError):
                 return False
-            if not (1 <= n_int <= 9):
+            if not (1 <= n_int <= MACRO_SLOT_COUNT):
                 return False
             if self._is_repeated_play_trigger_locked(('slot', n_int)):
                 return False
@@ -1009,16 +1159,27 @@ class MacroController:
                         print("[macro] cannot play active slot while recording")
                         return False
                     if self._state == self.STATE_PLAYING:
-                        if self._playing_slot == n_int:
+                        if self._stop_play_evt.is_set():
+                            # A stop is already in flight — the worker is
+                            # winding down (safety sweep). Wait for it
+                            # instead of refusing, otherwise
+                            # stop-then-restart is a race the user has to
+                            # time by hand. Deliberately does NOT stamp
+                            # the debounce: this press is not spam.
+                            old_thread = self._play_thread
+                        elif self._playing_slot == n_int:
+                            print(f"[macro] slot {n_int} ignored - it is "
+                                  "already the macro that is playing")
                             return False
-                        if conflict_policy != MACRO_CONFLICT_INTERRUPT:
+                        elif conflict_policy != MACRO_CONFLICT_INTERRUPT:
                             print(f"[macro] slot {n_int} ignored - another macro "
                                   "is already playing")
                             return False
-                        old_thread = self._play_thread
-                        print(f"[macro] interrupting current playback for "
-                              f"slot {n_int}")
-                        self._stop_play_evt.set()
+                        else:
+                            old_thread = self._play_thread
+                            print(f"[macro] interrupting slot "
+                                  f"{self._playing_slot} for slot {n_int}")
+                            self._stop_play_evt.set()
                     else:
                         self._start_playback_locked(
                             controller, [dict(ev) for ev in events],
@@ -1026,10 +1187,14 @@ class MacroController:
                         break
                 if old_thread is None:
                     continue
-                old_thread.join(timeout=2.0)
+                joined_at = time.monotonic()
+                old_thread.join(timeout=1.0)
                 if old_thread.is_alive():
-                    print("[macro] interrupt timed out - active slot not started")
+                    print("[macro] interrupt timed out after 1.0 s - slot "
+                          f"{n_int} not started")
                     return False
+                print(f"[macro] previous playback ended in "
+                      f"{(time.monotonic() - joined_at) * 1000:.0f} ms")
         self._emit()
         return True
 
@@ -1037,8 +1202,14 @@ class MacroController:
         with self._command_lock:
             with self._lock:
                 if self._state != self.STATE_PLAYING:
+                    print(f"[macro] stop ignored - nothing is playing "
+                          f"(state {self._state})")
                     return False
                 stop_evt = self._stop_play_evt
+                # An explicit stop is a deliberate "I want to re-trigger"
+                # signal, so clear the debounce rather than making the
+                # user wait it out before starting again.
+                self._last_play_trigger_ts.clear()
             stop_evt.set()
         return True
 
@@ -1085,7 +1256,7 @@ class MacroController:
         existing slot's name is preserved (so a quick re-save doesn't
         wipe a previously-set name); pass an explicit '' to clear the
         name."""
-        if not (1 <= int(n) <= 9):
+        if not (1 <= int(n) <= MACRO_SLOT_COUNT):
             return False
         if self._state != self.STATE_IDLE:
             print(f"[macro] cannot save while {self._state}")
@@ -1112,7 +1283,7 @@ class MacroController:
         return True
 
     def load_slot(self, n):
-        if not (1 <= int(n) <= 9):
+        if not (1 <= int(n) <= MACRO_SLOT_COUNT):
             return False
         if self._state != self.STATE_IDLE:
             print(f"[macro] cannot load while {self._state}")
@@ -1137,7 +1308,7 @@ class MacroController:
         return True
 
     def clear_slot(self, n):
-        if not (1 <= int(n) <= 9):
+        if not (1 <= int(n) <= MACRO_SLOT_COUNT):
             return False
         n_int = int(n)
         path = macros_dir() / f'macro_{n_int}.json'
@@ -1160,7 +1331,7 @@ class MacroController:
     def rename_slot(self, n, name):
         """Update slot n's name in place. Does not touch events. Refuses
         on empty slot (nothing to rename)."""
-        if not (1 <= int(n) <= 9):
+        if not (1 <= int(n) <= MACRO_SLOT_COUNT):
             return False
         n_int = int(n)
         path = macros_dir() / f'macro_{n_int}.json'
@@ -1196,9 +1367,9 @@ class MacroController:
     # ---- save/load slot picker (driven by hotkeys) ----
 
     def begin_save_pending(self):
-        """Arm a 4-second slot picker — pressing 1-9 saves the current
-        macro to that slot, ESC cancels. Called from the macro_save
-        hotkey; UI buttons skip this and call save_slot directly."""
+        """Arm a 4-second slot picker — 1-9 select the first bank and
+        0 then 1-9 select slots 10-18. ESC cancels. Called from the
+        macro_save hotkey; UI buttons call save_slot directly."""
         if self._state != self.STATE_IDLE:
             print(f"[macro] cannot save while {self._state}")
             return False
@@ -1219,6 +1390,7 @@ class MacroController:
         with self._pending_lock:
             self._clear_pending_locked()
             self._pending_action = action
+            self._pending_slot_bank = 0
             for d in range(1, 10):
                 try:
                     h = keyboard.add_hotkey(
@@ -1227,6 +1399,12 @@ class MacroController:
                     self._slot_hotkey_handles.append(h)
                 except Exception as e:
                     print(f"[macro] register slot hotkey {d}: {e}")
+            try:
+                h = keyboard.add_hotkey(
+                    '0', self._slot_high_bank_async, suppress=True)
+                self._slot_hotkey_handles.append(h)
+            except Exception as e:
+                print(f"[macro] register slot-bank hotkey 0: {e}")
             try:
                 h = keyboard.add_hotkey('esc', self._slot_cancel_async,
                                         suppress=True)
@@ -1237,7 +1415,8 @@ class MacroController:
                                                self._slot_timeout_async)
             self._slot_timer.daemon = True
             self._slot_timer.start()
-        print(f"[macro] {action}: press 1-9 to choose slot, "
+        print(f"[macro] {action}: press 1-9 for slots 1-9, "
+              f"0 then 1-9 for slots 10-18, "
               f"ESC to cancel ({int(self.SLOT_TIMEOUT_S)}s)")
         self._emit()
 
@@ -1252,22 +1431,31 @@ class MacroController:
             self._slot_timer.cancel()
             self._slot_timer = None
         self._pending_action = None
+        self._pending_slot_bank = 0
 
-    def _slot_chosen_async(self, slot):
+    def _slot_chosen_async(self, digit):
         # keyboard package fires this on its listener thread; offload so
         # we don't block the listener on file IO.
         threading.Thread(target=self._handle_slot_choice,
-                         args=(slot,), daemon=True).start()
+                         args=(digit,), daemon=True).start()
 
-    def _handle_slot_choice(self, slot):
+    def _handle_slot_choice(self, digit):
         with self._pending_lock:
             action = self._pending_action
+            slot = self._pending_slot_bank + digit
             self._clear_pending_locked()
         if action == 'save':
             self.save_slot(slot)
         elif action == 'load':
             self.load_slot(slot)
         self._emit()
+
+    def _slot_high_bank_async(self):
+        # This runs on the keyboard listener. A single atomic assignment
+        # preserves 0 -> digit ordering without blocking or off-thread races.
+        # The following digit callback offloads the actual file IO.
+        if self._pending_action is not None:
+            self._pending_slot_bank = 9
 
     def _slot_cancel_async(self):
         threading.Thread(target=self._handle_slot_cancel,
@@ -1307,12 +1495,47 @@ class MacroController:
 
     # ---- internal ----
 
+    _COMMAND_LOCK_WAIT_S = 0.4
+
+    @contextlib.contextmanager
+    def _command(self, what):
+        """Acquire the command lock or give up.
+
+        A trigger that cannot get the lock promptly is STALE by the time it
+        would run — the user has usually pressed again — so drop it with a
+        log line instead of queueing. Combined with the off-listener
+        dispatch in KeybindManager, this is what makes spamming a hotkey
+        behave: presses either act now or say why they did not."""
+        if not self._command_lock.acquire(timeout=self._COMMAND_LOCK_WAIT_S):
+            print(f"[macro] {what} dropped - another command still running")
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            self._command_lock.release()
+
     def _is_repeated_play_trigger_locked(self, trigger_key):
+        """True if `trigger_key` fired within TRIGGER_DEBOUNCE_S. A press
+        that passes refreshes the window, so a held hotkey cannot
+        relaunch the instant playback exits.
+
+        This used to also swallow the press right after an explicit stop:
+        the previous worker was still winding down, so the press stamped
+        the window here and was then refused by the state check below,
+        killing every press for the next 250 ms. That was the "stop the
+        macro, press play once, nothing happens" bug. The fix is in
+        `play_slot` / `play`, which now wait the winding-down worker out
+        and start, so no refusal reaches this stamp."""
         now = time.monotonic()
         last = self._last_play_trigger_ts.get(trigger_key)
+        if last is not None and now - last < self.TRIGGER_DEBOUNCE_S:
+            print(f"[macro] {trigger_key[0]} {trigger_key[1] or ''} ignored - "
+                  f"debounce ({(now - last) * 1000:.0f} ms since last, "
+                  f"need {self.TRIGGER_DEBOUNCE_S * 1000:.0f})")
+            return True
         self._last_play_trigger_ts[trigger_key] = now
-        return (last is not None and
-                now - last < self.TRIGGER_DEBOUNCE_S)
+        return False
 
     def _resolve_controller(self):
         if self._controller_provider is None:

@@ -38,7 +38,9 @@ _MOUSE_HOTKEY_BUTTONS = set()
 
 # === Slot save/load pending state ===
 SLOT_TIMEOUT_S = 4.0
+SLOT_COUNT = 18
 _pending_action = None
+_pending_slot_bank = 0
 _slot_hotkey_handles = []
 _slot_timer = None
 _slot_lock = threading.Lock()
@@ -77,7 +79,7 @@ def _slot_exists(n):
 
 
 def _list_slots():
-    return [s for s in range(1, 10) if _slot_exists(s)]
+    return [s for s in range(1, SLOT_COUNT + 1) if _slot_exists(s)]
 
 
 # === Hotkey override file ===
@@ -331,10 +333,11 @@ def _begin_load():
 
 
 def _set_pending(action):
-    global _pending_action, _slot_timer
+    global _pending_action, _pending_slot_bank, _slot_timer
     with _slot_lock:
         _clear_pending_locked()
         _pending_action = action
+        _pending_slot_bank = 0
         for d in range(1, 10):
             try:
                 h = keyboard.add_hotkey(str(d), _slot_chosen,
@@ -343,6 +346,12 @@ def _set_pending(action):
             except Exception as e:
                 print(f"[ERROR] register slot hotkey {d}: {e}")
         try:
+            h = keyboard.add_hotkey('0', _slot_high_bank,
+                                    suppress=True)
+            _slot_hotkey_handles.append(h)
+        except Exception as e:
+            print(f"[ERROR] register slot-bank hotkey 0: {e}")
+        try:
             h = keyboard.add_hotkey('esc', _slot_cancel_user, suppress=True)
             _slot_hotkey_handles.append(h)
         except Exception:
@@ -350,12 +359,13 @@ def _set_pending(action):
         _slot_timer = threading.Timer(SLOT_TIMEOUT_S, _slot_timeout_fired)
         _slot_timer.daemon = True
         _slot_timer.start()
-    print(f"[MACRO] {action.title()}: press 1-9 to choose slot, ESC to cancel "
+    print(f"[MACRO] {action.title()}: press 1-9 for slots 1-9, "
+          f"0 then 1-9 for slots 10-18, ESC to cancel "
           f"(timeout {SLOT_TIMEOUT_S:.0f}s)")
 
 
 def _clear_pending_locked():
-    global _pending_action, _slot_timer
+    global _pending_action, _pending_slot_bank, _slot_timer
     for h in _slot_hotkey_handles:
         try:
             keyboard.remove_hotkey(h)
@@ -366,6 +376,15 @@ def _clear_pending_locked():
         _slot_timer.cancel()
         _slot_timer = None
     _pending_action = None
+    _pending_slot_bank = 0
+
+
+def _slot_high_bank():
+    global _pending_slot_bank
+    # Listener-thread hot path: an atomic assignment preserves 0 -> digit
+    # ordering; the digit callback offloads all file IO.
+    if _pending_action is not None:
+        _pending_slot_bank = 9
 
 
 def _slot_chosen(slot):
@@ -373,9 +392,10 @@ def _slot_chosen(slot):
                      args=(slot,), daemon=True).start()
 
 
-def _handle_slot_choice(slot):
+def _handle_slot_choice(digit):
     with _slot_lock:
         action = _pending_action
+        slot = _pending_slot_bank + digit
         _clear_pending_locked()
     if action == 'save':
         _save_slot(slot)
@@ -426,8 +446,8 @@ def print_menu():
         ('Toggle Record',  'record'),
         ('Play',           'play'),
         ('Stop',           'stop'),
-        ('Save (1-9)',     'save'),
-        ('Load (1-9)',     'load'),
+        ('Save (1-18)',    'save'),
+        ('Load (1-18)',    'load'),
         ('Exit script',    'exit'),
     ]
     for label, key in rows:

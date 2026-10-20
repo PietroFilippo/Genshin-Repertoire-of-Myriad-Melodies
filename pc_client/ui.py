@@ -131,8 +131,9 @@ from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
                      ACTION_MACRO_STOP, ACTION_PAUSE, ACTION_START_STOP,
                      ACTIVE_MACRO_COUNT, BOT_ACTIONS, BotController,
                      KeybindManager, MACRO_ACTIONS, MACRO_CONFLICT_IGNORE,
-                     MACRO_CONFLICT_INTERRUPT, MacroController, QueueWriter,
-                     UI_WINDOW_TITLE, focus_game_window, is_admin,
+                     MACRO_CONFLICT_INTERRUPT, MACRO_SLOT_COUNT,
+                     MacroController, QueueWriter,
+                     APP_VERSION, UI_WINDOW_TITLE, focus_game_window, is_admin,
                      is_frozen, js_event_to_hotkey, load_settings,
                      macros_dir, make_input_backend, save_settings,
                      warn_if_not_admin)
@@ -930,7 +931,7 @@ class BridgeApi:
             slot = int(slot)
         except (TypeError, ValueError):
             return {'ok': False, 'reason': 'bad_slot'}
-        if slot != 0 and not (1 <= slot <= 9):
+        if slot != 0 and not (1 <= slot <= MACRO_SLOT_COUNT):
             return {'ok': False, 'reason': 'bad_slot'}
         if slot and not (macros_dir() / f'macro_{slot}.json').exists():
             return {'ok': False, 'reason': 'empty_slot'}
@@ -1072,7 +1073,7 @@ class BridgeApi:
                 slot = int(item.get('slot') or 0)
             except (TypeError, ValueError):
                 slot = 0
-            if not (1 <= slot <= 9):
+            if not (1 <= slot <= MACRO_SLOT_COUNT):
                 slot = 0
             hotkey = str(item.get('hotkey') or '').strip().lower()
             out[i] = {'slot': slot, 'hotkey': hotkey}
@@ -1216,6 +1217,13 @@ class BridgeApi:
                     f'macro_active_{pos}', hotkey,
                     lambda pos=pos: self._hotkey_macro_active(pos),
                     scope='game')
+        # Print what is actually bound. "which button does what" has been
+        # guessed at twice; the log should just say.
+        try:
+            for act, hk in sorted(self._keybinds.get_bindings().items()):
+                print(f"[ui] bound {act:16} -> {hk!r}")
+        except Exception:
+            pass
 
     # Hotkey callbacks run on the keyboard package's listener thread.
     # They only mutate threading.Events / BotController state (already
@@ -1465,6 +1473,22 @@ def _on_shown(api, icon_path):
     api._icon_applied = True
 
 
+def _warm_input_stack():
+    """Build the `keyboard` package's scan-code table off the hot path.
+
+    Measured: the first `keyboard.press(...)` in a process costs ~114 ms
+    while it enumerates the OS keyboard layout. `key_to_scan_codes`
+    triggers the same build and sends no input, so calling it at startup
+    means the first dash of the first macro is on time."""
+    try:
+        import keyboard as _kb
+        for name in ('left shift', 'shift', 'a'):
+            _kb.key_to_scan_codes(name)
+        print('[ui] input stack warm')
+    except Exception as e:
+        print(f'[ui] input warmup skipped: {e}')
+
+
 def main():
     # In a frozen build, the embedded UAC manifest already enforced
     # elevation on launch — we'll always be admin here. Dev launches
@@ -1486,6 +1510,17 @@ def main():
 
     api = BridgeApi()
     icon = str(ICON_PATH) if ICON_PATH.exists() else None
+    # First line in the log pane on every launch. If this version does not
+    # match what you just installed, you are running a different build.
+    print(f"[ui] Genshin Rhythm Bot v{APP_VERSION}")
+    # Pay the `keyboard` package's ~110 ms scan-code table build NOW, on a
+    # background thread, instead of inside the first macro trigger. The
+    # input backend is built lazily on first use, so without this the very
+    # first hotkey press of a session carries the whole cost — visible in
+    # the log as "[input] software backend ready" landing between the
+    # press and the play. See mavuika-macros.md 4.28.
+    threading.Thread(target=_warm_input_stack, daemon=True,
+                     name='input-warmup').start()
 
     window = webview.create_window(
         title=UI_WINDOW_TITLE,

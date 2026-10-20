@@ -5,7 +5,7 @@ Automates Genshin Impact's **Repertoire of Myriad Melodies** rhythm minigame. A 
 Two rhythm modes plus a built-in macro tool:
 - **Standalone** — runs the rhythm detector indefinitely. Start it on any song; stop it whenever.
 - **Album** — auto-plays an entire country album page (12 songs) at a chosen difficulty, with optional skip-on-Canorus.
-- **Macros** — separate UI tab to record arbitrary keyboard + mouse sequences in-game and replay them through the same Arduino. 9 named save slots, inline event editor, auto-focus to the game on Play.
+- **Macros** — separate UI tab to record arbitrary keyboard + mouse sequences in-game and replay them through the same Arduino. 18 named save slots, three active-slot hotkeys, inline event editor, auto-focus to the game on Play.
 
 ---
 
@@ -142,7 +142,8 @@ Separate tab for recording/playing arbitrary input sequences through the Arduino
 
 - **Record** captures every key press / mouse click while Genshin is the foreground window — alt-tabbing pauses capture. Stop with the same hotkey or button.
 - **Play** focuses Genshin first (the bot already had focus, the macro tool didn't), waits 250 ms for the window switch, then streams events through HID with their original timing.
-- **Slots 1-9** hold named saves. Click-mode toggle: `Load` reads a slot into the buffer, `Save` writes the buffer (prompts for a name; confirms before overwriting), `Rename` changes a slot's name in place, `Clear` deletes a slot. The slot whose macro is currently in memory gets a yellow ring.
+- **Slots 1-18** hold named saves. Click-mode toggle: `Load` reads a slot into the buffer, `Save` writes the buffer (prompts for a name; confirms before overwriting), `Rename` changes a slot's name in place, `Clear` deletes a slot. The slot whose macro is currently in memory gets a yellow ring.
+- **Active Macros** assigns up to three saved slots to independent Genshin-only playback hotkeys. Playback remains one-at-a-time; choose whether another active hotkey is ignored or interrupts the current macro.
 - **Events editor** (card under hotkeys) — Show/hide toggles a table of every event in the current macro buffer. Edit time / device / key / event-type inline, `+ Add` a row, `×` delete a row. `Save` validates + sorts in Python and (if a slot is loaded) writes back to it in the same click. `Discard` reloads from the buffer.
 - Bot mode and macro mode are mutually exclusive on the Arduino — starting one while the other is running prompts to stop the other first.
 
@@ -156,10 +157,15 @@ Separate tab for recording/playing arbitrary input sequences through the Arduino
 | Macro record / stop | `Y` |
 | Macro play | `Mouse 4` |
 | Macro stop playback | `Mouse 5` |
-| Macro save (1-9 picker) | `U` |
-| Macro load (1-9 picker) | `F11` |
+| Macro save (1-18 picker) | `U` |
+| Macro load (1-18 picker) | `F11` |
 
 Bot hotkeys fire while the **game window or the bot UI** is in the foreground. Macro hotkeys are stricter: **Genshin only**, so the macro tool can't accidentally arm/record while you're typing in another app. Rebind any of them from the UI (you don't need to start the bot first); rebind capture also accepts mouse buttons (left / right / middle / mouse 4 / mouse 5).
+
+Since v1.5.5, keyboard hotkeys use non-suppressing listeners rather than exclusive Windows global registrations. For example, `F` may activate an assigned macro while Genshin is focused but remains usable in another application while the bot stays open. When upgrading from v1.5.4, close that old process once so Windows releases the key it registered globally; v1.5.5 will not claim it again.
+
+For the save/load hotkey picker, press `1`–`9` for slots 1–9. Press `0`
+first, then `1`–`9`, for slots 10–18.
 
 ### Debug visualization
 
@@ -189,7 +195,7 @@ Hard Notes shrinks every note (smaller flowers, longer hold tails). The bot hand
 ## Troubleshooting
 
 **Hotkeys do nothing while Genshin is focused.**
-You're not running as administrator. Genshin's anti-cheat blocks keyboard hooks from non-elevated processes. The `.exe` always self-elevates; if you launched from a terminal, restart the terminal as administrator.
+The packaged app always self-elevates because Genshin can block low-level keyboard hooks from non-elevated processes. If you launched from source, restart the terminal as administrator. Keyboard bindings are deliberately non-suppressing and foreground-gated: a key such as `F` can trigger a macro in Genshin without being reserved from other applications while the bot stays open. Check the Logs tab for bind errors if one particular key still fails.
 
 **The bot misses notes / fires randomly.**
 Re-check that the **Hu Tao theme** is equipped on the rhythm minigame. The water/blue default theme will never work with this detector. Run `calibrate.py` and check the per-column blue readouts — they should be ≥230 when no note is present. If not, check if you're using the hard notes modifier, if so, try bumping the in-game note speed to 2x-3x.
@@ -220,6 +226,12 @@ python -m PyInstaller pc_client\ui.py `
 ```
 
 Output: `dist\Genshin Rhythm Bot\` (`.exe` + bundled `_internal\`). Zip the onedir folder for distribution.
+
+Run the regression suite before packaging:
+
+```powershell
+venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+```
 
 ---
 

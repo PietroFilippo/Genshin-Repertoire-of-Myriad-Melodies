@@ -446,7 +446,7 @@ function activeMacrosOf(status) {
     const s = status || STATE.lastStatus || {};
     const active = Array.isArray(s.macro_active_macros)
         ? s.macro_active_macros : [];
-    return [0, 1].map((i) => {
+    return $$('.active-macro-row').map((_row, i) => {
         const item = active[i] || {};
         return {
             slot: parseInt(item.slot, 10) || 0,
@@ -682,9 +682,9 @@ function renderMacroState(macroState, eventCount, loadedSlot, slotNames, dirty,
 function renderMacroPending(pending) {
     const el = $('#macro-pending');
     if (pending === 'save') {
-        el.textContent = 'Save: press 1-9 inside Genshin to choose a slot (Esc to cancel)';
+        el.textContent = 'Save: 1-9 selects slots 1-9; 0 then 1-9 selects slots 10-18 (Esc cancels)';
     } else if (pending === 'load') {
-        el.textContent = 'Load: press 1-9 inside Genshin to choose a slot (Esc to cancel)';
+        el.textContent = 'Load: 1-9 selects slots 1-9; 0 then 1-9 selects slots 10-18 (Esc cancels)';
     } else {
         el.textContent = '';
     }
