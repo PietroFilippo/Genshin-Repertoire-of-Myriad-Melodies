@@ -1246,16 +1246,19 @@ class BridgeApi:
                     seq = None
             if page is not None:
                 page = str(page)[:64]
-                pages = getattr(self, '_editor_pages', None)
-                if pages is None:
-                    pages = self._editor_pages = {}
+                pages = getattr(self, '_editor_pages', None) or {}
                 prev = pages.get(page)
                 if seq is not None and prev is not None and seq <= prev[0]:
                     return False
-                pages.pop(page, None)          # re-insert as most recent
-                pages[page] = (seq if seq is not None else 0, bool(dirty))
-                while len(pages) > 8:          # bounded; reloads are rare
-                    pages.pop(next(iter(pages)))
+                # Copy-on-write, then publish with one assignment: the
+                # close guard reads the mirror without this lock, so it
+                # must never observe the entry popped but not re-added.
+                updated = dict(pages)
+                updated.pop(page, None)        # re-insert as most recent
+                updated[page] = (seq if seq is not None else 0, bool(dirty))
+                while len(updated) > 8:        # bounded; reloads are rare
+                    updated.pop(next(iter(updated)))
+                self._editor_pages = updated
                 return True
             if seq is not None:
                 if seq <= getattr(self, '_editor_dirty_seq', 0):
@@ -1644,8 +1647,8 @@ class BridgeApi:
         reported unsaved local edits."""
         if getattr(self, '_editor_dirty', False):
             return True
-        pages = getattr(self, '_editor_pages', None) or {}
-        return any(dirty for _seq, dirty in list(pages.values()))
+        pages = getattr(self, '_editor_pages', None) or {}   # one snapshot
+        return any(dirty for _seq, dirty in pages.values())
 
     def _macro_buffer_unsaved(self):
         """Recording in progress, or the macro buffer is dirty."""

@@ -1107,6 +1107,25 @@ class DirectionABridgeTests(unittest.TestCase):
         self.assertIs(api.macro_set_editor_dirty(True), True)
         self.assertFalse(api.allow_close())
 
+    def test_editor_dirty_refresh_never_hides_edits_from_close_guard(self):
+        """N4: a true->true re-assert must never leave a moment where the
+        lock-free close guard sees no unsaved edits. Deterministic: the
+        live mirror reports what the guard would see at the instant any
+        entry is popped from it (copy-on-write never pops the live one)."""
+        api = self.make_api()
+        seen = []
+
+        class Spy(dict):
+            def pop(self_inner, *args):
+                result = super().pop(*args)
+                seen.append(api._editor_has_edits())
+                return result
+
+        api._editor_pages = Spy({'page': (1, True)})
+        self.assertIs(api.macro_set_editor_dirty(True, 2, 'page'), True)
+        self.assertNotIn(False, seen)
+        self.assertTrue(api._editor_has_edits())
+
     def test_close_confirmed_skips_prompt_for_editor_edits(self):
         api = self.make_api()
         api._macro = self._macro_with()
