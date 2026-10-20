@@ -17,8 +17,9 @@ import time
 from config import (DEBUG_MODE, KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS,
                     INPUT_BACKEND_DEFAULT)
 from detector import NoteDetector
-from game_window import find_game_window, auto_detect
+from game_window import MSG_WINDOW_CLOSED, find_game_window, auto_detect
 from standalone_runner import (GEOMETRY_POLL_S, VIZ_EXIT_GEOMETRY,
+                               VIZ_EXIT_WINDOW_GONE, WINDOW_GONE,
                                GeometryTracker, run_visualization,
                                layout_changed)
 from system_setup import boost_timer, restore_timer, set_dpi_aware
@@ -97,6 +98,8 @@ def main():
         detector = NoteDetector(hwnd, cols, hit, controller)
         detector.start()
 
+    # Set when Genshin is closed mid-run: shut down cleanly, then exit 1.
+    game_closed = False
     try:
         if DEBUG_MODE:
             print("DEBUG_MODE on - visualization window will open. Close it "
@@ -106,6 +109,9 @@ def main():
                 reason = run_visualization(region, cols, hit, detector,
                                            pin_console=True, game_hwnd=hwnd,
                                            geometry_poll=tracker.poll)
+                if reason == VIZ_EXIT_WINDOW_GONE:
+                    game_closed = True
+                    break
                 if reason != VIZ_EXIT_GEOMETRY:
                     break
                 _rebuild_detector()
@@ -119,12 +125,17 @@ def main():
                     ctypes.windll.user32.SetWindowPos(hwnd_console, -1, 0, 0, 0, 0, 0x13)
                 old = tracker.current
                 new = tracker.poll()
+                if new == WINDOW_GONE:
+                    game_closed = True
+                    break
                 if new is not None and layout_changed(old, new):
                     _rebuild_detector()
                 time.sleep(GEOMETRY_POLL_S)
     except KeyboardInterrupt:
         print("\nCtrl+C received")
     finally:
+        if game_closed:
+            print(f"ERROR: {MSG_WINDOW_CLOSED}")
         print("Shutting down")
         detector.stop()
         controller.close()
@@ -132,6 +143,8 @@ def main():
         if timer_boosted:
             restore_timer()
         print("Shutdown complete")
+    if game_closed:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

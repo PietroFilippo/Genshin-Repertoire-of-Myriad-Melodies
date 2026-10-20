@@ -39,9 +39,11 @@ from standalone_runner import run_visualization
 
 
 # 1080p reference ROIs owned by SongPlayer. `ROI_SELECT_SONG` is
-# re-exported for album.py's post-pause results-screen check
-# (`AlbumRunner._find_select_song`), which has to recover after a
-# pause killed our watcher mid-song.
+# re-exported for album.py's results-screen recovery
+# (`AlbumRunner._find_select_song`, used by `_after_song`): a hand-off
+# that landed on the results screen, a resume that found the song
+# already over, or an end-watcher click that didn't register. (Our end
+# watcher stays alive during a pause.)
 ROI_BEGIN_PERFORMANCE = (970, 975, 320, 75)
 ROI_SELECT_SONG = (1260, 975, 260, 75)
 
@@ -126,9 +128,10 @@ class SongPlayer:
                 bool` — re-read the game window and push any change
                 back via `update_geometry` (+ the watcher). block=True
                 may wait (stop-aware) for a minimized game; block=False
-                is a cheap single read. Returns False iff the run
-                should end (stop, or window gone — already reported).
-                AlbumRunner passes its `_refresh_geometry`.
+                is a cheap single read (a minimized game keeps the last
+                geometry). Returns False iff the run should end (stop,
+                or the game window is gone — already reported), for
+                either mode. AlbumRunner passes its `_refresh_geometry`.
         """
         self.watcher = watcher
         self.controller = controller
@@ -356,15 +359,21 @@ class SongPlayer:
     def _pause_gate(self):
         """Navigation-boundary pause. Returns _GATE_CLEAR when not
         paused, _GATE_RESUMED after a pause ended (geometry re-read),
-        _GATE_STOP if stop fired (or the window is gone). The wait goes
-        through `watcher.stop_wait`, so Stop wins within ~100 ms."""
+        _GATE_STOP if stop fired (or the window is gone — also checked
+        every GEOMETRY_POLL_S while paused). The wait goes through
+        `watcher.stop_wait`, so Stop wins within ~100 ms."""
         if not self.pause_evt.is_set():
             return _GATE_STOP if self.stop_evt.is_set() else _GATE_CLEAR
         self._emit({'state': 'paused'})
         print("  paused during song intro — waiting for resume")
+        next_geom = time.time() + GEOMETRY_POLL_S
         while self.pause_evt.is_set():
             if self.watcher.stop_wait(0.1):
                 return _GATE_STOP
+            if time.time() >= next_geom:
+                next_geom = time.time() + GEOMETRY_POLL_S
+                if not self._refresh_geometry(block=False):
+                    return _GATE_STOP      # game closed (reported)
         if self.stop_evt.is_set():
             return _GATE_STOP
         print("  resumed")
@@ -388,8 +397,11 @@ class SongPlayer:
         window is moved or resized. A resize changes the lane layout and
         rebuilds the detector; a move only restarts the viz (the
         detector reads client-relative pixels, so a move doesn't affect
-        it). Returns False only if the game window disappeared (already
-        reported); True on song end or stop."""
+        it). A minimized game keeps the last-known geometry; a closed one
+        (`refresh_geometry_fn(False)` returns False, while playing or
+        paused) ends the song at once. Returns False only if the game
+        window disappeared (already reported); True on song end or
+        stop."""
         watcher_evt = threading.Event()
         end_watcher_thread = threading.Thread(
             target=self._end_watcher, args=(watcher_evt,), daemon=True)
@@ -456,10 +468,14 @@ class SongPlayer:
                            and not watcher_evt.is_set()):
                         time.sleep(0.1)
                         if time.time() >= next_geom:
-                            self._refresh_geometry(block=False)
+                            if not self._refresh_geometry(block=False):
+                                # Game closed while paused (reported).
+                                window_lost = not self.stop_evt.is_set()
+                                break
                             next_geom = time.time() + GEOMETRY_POLL_S
 
-                    if self.stop_evt.is_set() or watcher_evt.is_set():
+                    if (window_lost or self.stop_evt.is_set()
+                            or watcher_evt.is_set()):
                         break
 
                     # --- resume: fresh detector + viz for the same song
@@ -471,7 +487,12 @@ class SongPlayer:
                     continue
 
                 if st['detector'] is not None:
-                    self._refresh_geometry(block=False)
+                    if not self._refresh_geometry(block=False):
+                        # Game closed mid-song (already reported) — the
+                        # finally below stops the detector, releasing
+                        # every held key.
+                        window_lost = not self.stop_evt.is_set()
+                        break
                 layout = scaled_layout(self.scale_x, self.scale_y)
                 if st['detector'] is None or layout != st['layout']:
                     if st['detector'] is not None:
@@ -606,6 +627,12 @@ class SongPlayer:
                 pass
 
     def _fail(self, message):
+        # A step that failed because the game was closed (click refused,
+        # screen never appeared) was reported as that by
+        # `refresh_geometry_fn` (returns False) — don't bury it under a
+        # misleading "click failed" / "check the game".
+        if not self._refresh_geometry(block=False):
+            return
         self._emit({'last_error': message})
 
     def _dump(self, tag):

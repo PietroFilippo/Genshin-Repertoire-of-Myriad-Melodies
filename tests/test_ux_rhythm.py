@@ -15,6 +15,11 @@ Finding IDs in the class docstrings refer to the UX review:
   R21 failed album runs reported as "Album complete"
   R22 single- vs multi-difficulty runs leave the wheel in different places
   U23 FPS readout frozen after the debug viz closes
+  RC1 game closed mid-run: Album loops until Stop with no last_error,
+      Standalone never notices (minimized must still just wait)
+  RC2 detector focus gate trusts a recycled game HWND (another process)
+  RC3 album.py CLI ignores INPUT_BACKEND_DEFAULT (always the Arduino)
+  RC4 calibrate.py isn't DPI-aware (overlay misplaced on scaled displays)
 
 Run:  python -m unittest discover -s tests -p "test_*.py"
 """
@@ -191,6 +196,20 @@ class DetectorForegroundGate(unittest.TestCase):
         self.assertTrue(_wait_until(
             lambda: all(self.det.pressed[k] for k in KEYS)))
 
+    def test_recycled_game_hwnd_of_another_process_is_not_focused(self):
+        """RC2 — Genshin closed and Windows recycled its HWND for another
+        app's window: same handle, different owning PID → release held
+        keys and press nothing (the keys would land in that app)."""
+        self.det.start()
+        self.assertTrue(_wait_until(
+            lambda: all(self.det.pressed[k] for k in KEYS)))
+        self.pids[GAME_HWND] = 200          # handle now owned by another app
+        self.assertTrue(_wait_until(
+            lambda: not any(self.det.pressed[k] for k in KEYS)))
+        downs = len(self._downs())
+        time.sleep(0.15)                   # pixels still dark the whole time
+        self.assertEqual(len(self._downs()), downs)
+
     def test_hot_path_does_not_poll_foreground_window(self):
         self.det.start()
         time.sleep(0.3)
@@ -298,6 +317,23 @@ class HwndComparisons(unittest.TestCase):
                                return_value=0x80001235), \
                 mock.patch.object(detector, '_window_pid', return_value=0):
             self.assertIs(det._is_game_foreground(), False)
+
+    def test_detector_gate_rejects_only_a_known_pid_mismatch(self):
+        """RC2 — same HWND: a different owning PID rejects; an unknown
+        PID (lookup failed, either side) keeps the HWND-only answer."""
+        det = detector.NoteDetector(GAME_HWND, [10] * len(KEYS), 50,
+                                    FakeInput())
+        det._game_pid = 100
+        with mock.patch.object(detector, '_foreground_hwnd',
+                               return_value=GAME_HWND):
+            for live, expected in ((100, True), (0, True), (200, False)):
+                with mock.patch.object(detector, '_window_pid',
+                                       return_value=live):
+                    self.assertIs(det._is_game_foreground(), expected, live)
+            det._game_pid = 0
+            with mock.patch.object(detector, '_window_pid',
+                                   return_value=200):
+                self.assertIs(det._is_game_foreground(), True)
 
     def test_detector_window_pid_accepts_any_representation(self):
         for h in (BIT31_SIGNED, BIT31_HWND, BIT31_RAW):
@@ -541,6 +577,25 @@ class GameWindowGeometry(unittest.TestCase):
         self.assertEqual(rec.values('last_error'),
                          [game_window.MSG_WINDOW_NOT_FOUND])
 
+    def test_window_gone_only_when_closed(self):
+        """RC1 — closed vs minimized / too small / off-screen (all of
+        which read_game_geometry reports as None)."""
+        self._patch(FakeUser32(exists=False))
+        self.assertTrue(game_window.window_gone(GAME_HWND))
+        self.assertTrue(game_window.window_gone(0))
+        self.assertTrue(game_window.window_gone(None))
+        for fake in (FakeUser32(iconic=[True]), FakeUser32(size=(640, 480)),
+                     FakeUser32(origin=(-32000, -32000))):
+            self._patch(fake)
+            self.assertIsNone(game_window.read_game_geometry(GAME_HWND))
+            self.assertFalse(game_window.window_gone(GAME_HWND))
+
+    def test_window_gone_lookup_error_counts_as_present(self):
+        broken = mock.MagicMock()
+        broken.IsWindow.side_effect = OSError('boom')
+        self._patch(broken)
+        self.assertFalse(game_window.window_gone(GAME_HWND))
+
 
 # --- standalone runner --------------------------------------------------------
 
@@ -697,6 +752,59 @@ class StandaloneRunner(unittest.TestCase):
         self.assertEqual(second.column_centers[0], int(417 * 2 / 3))
         self.assertEqual(calls[1][0]['width'], 1280)
         self.assertNotIn('paused', self.rec.values('state'))
+
+    def _run_real_viz(self, fake_user32, timeout=3.0):
+        """run_standalone with the REAL viz loop + GeometryTracker +
+        read_game_geometry / window_gone over `fake_user32` (debug off,
+        so no cv2 window). A Timer sets Stop after `timeout`, so a
+        regression fails instead of hanging. Returns the elapsed time."""
+        sct = mock.MagicMock()
+        sct.__enter__.return_value = sct
+        safety = threading.Timer(timeout, self.stop.set)
+        with mock.patch.object(game_window, '_user32',
+                               return_value=fake_user32), \
+                mock.patch.object(standalone_runner, 'GEOMETRY_POLL_S',
+                                  0.01), \
+                mock.patch.object(standalone_runner.mss, 'mss',
+                                  return_value=sct), _quiet():
+            safety.start()
+            try:
+                started = time.time()
+                standalone_runner.run_standalone(
+                    self.stop, self.debug, status_cb=self.rec,
+                    pause_evt=self.pause, controller=FakeInput())
+                return time.time() - started
+            finally:
+                safety.cancel()
+
+    def test_game_closed_mid_play_ends_run_with_error(self):
+        """RC1 — Genshin closed while Standalone plays: the run ends by
+        itself (no Stop), the detector is stopped (keys released) and
+        the UI gets an actionable last_error."""
+        fake = FakeUser32()
+        closer = threading.Timer(0.1, setattr, (fake, 'exists', False))
+        closer.start()
+        self.addCleanup(closer.cancel)
+        elapsed = self._run_real_viz(fake)
+        self.assertFalse(self.stop.is_set())
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(self.rec.values('last_error'),
+                         [game_window.MSG_WINDOW_CLOSED])
+        self.assertEqual(self.rec.values('state')[-1], 'idle')
+        self.assertEqual(len(FakeDetector.instances), 1)
+        self.assertTrue(FakeDetector.instances[0].stopped)
+
+    def test_minimized_mid_play_keeps_running(self):
+        """RC1 — minimized is not closed: play waits (until Stop here)
+        with no error and no detector churn."""
+        fake = FakeUser32(iconic=[True] * 100000)
+        stopper = threading.Timer(0.3, self.stop.set)
+        stopper.start()
+        self.addCleanup(stopper.cancel)
+        elapsed = self._run_real_viz(fake)
+        self.assertGreaterEqual(elapsed, 0.25)
+        self.assertEqual(self.rec.values('last_error'), [])
+        self.assertEqual(len(FakeDetector.instances), 1)
 
     def test_fallback_arduino_failure_reports_last_error(self):
         message = "No Arduino found — plug in the Leonardo"
@@ -922,6 +1030,22 @@ class VisualizationWindow(unittest.TestCase):
         self.assertEqual(reason, standalone_runner.VIZ_EXIT_GEOMETRY)
         self.assertFalse(stop.is_set())
 
+    def test_closed_game_exits_viz_debug_on_or_off(self):
+        """RC1 — the poll keeps running with Debug off (no window) too."""
+        for debug_on in (False, True):
+            stop, debug = threading.Event(), threading.Event()
+            if debug_on:
+                debug.set()
+            polls = [None, standalone_runner.WINDOW_GONE]
+            reason = self._run_viz(
+                stop, debug=debug,
+                geometry_poll=lambda: polls.pop(0) if polls else None)
+            self.assertEqual(reason, standalone_runner.VIZ_EXIT_WINDOW_GONE,
+                             debug_on)
+            self.assertFalse(stop.is_set())
+            if debug_on:
+                self.cv2['destroyWindow'].assert_called()
+
 
 class GeometryTrackerTests(unittest.TestCase):
     """RR4 — the tracker behind Standalone / CLI mid-play polling."""
@@ -935,8 +1059,22 @@ class GeometryTrackerTests(unittest.TestCase):
         t = self._tracker()
         for geom in ((dict(REGION_1080), 1.0, 1.0), None):
             with mock.patch.object(standalone_runner, 'read_game_geometry',
-                                   return_value=geom):
+                                   return_value=geom), \
+                    mock.patch.object(standalone_runner, 'window_gone',
+                                      return_value=False):
                 self.assertIsNone(t.poll())
+
+    def test_closed_game_reported_minimized_is_not(self):
+        """RC1 — the tracker behind Standalone / CLI play tells a closed
+        game (end the run) from a minimized one (keep waiting)."""
+        t = self._tracker()
+        with mock.patch.object(game_window, '_user32',
+                               return_value=FakeUser32(iconic=[True])):
+            self.assertIsNone(t.poll())
+        with mock.patch.object(game_window, '_user32',
+                               return_value=FakeUser32(exists=False)):
+            self.assertEqual(t.poll(), standalone_runner.WINDOW_GONE)
+        self.assertEqual(t.current[0], REGION_1080)   # last-known kept
 
     def test_move_vs_resize(self):
         t = self._tracker()
@@ -966,7 +1104,11 @@ class AlbumRunnerBase(unittest.TestCase):
         self.rec = Recorder()
         self.set_mouse = mock.MagicMock()
         self.get_mouse = mock.MagicMock(return_value=(6, 10, 1))
+        # GAME_HWND isn't a real window: without this the real IsWindow
+        # would call the game closed. Tests flip it to simulate that.
+        self.window_gone = mock.MagicMock(return_value=False)
         patches = [
+            mock.patch.object(album, 'window_gone', self.window_gone),
             mock.patch.object(album, 'find_game_window',
                               return_value=GAME_HWND),
             mock.patch.object(album, 'get_game_geometry',
@@ -1289,6 +1431,145 @@ class AlbumRunnerClicksAndGeometry(AlbumRunnerBase):
                                return_value=None):
             self.assertTrue(r._refresh_geometry(block=False))
         self.assertEqual(r.watcher.region, REGION_1080)
+        self.assertEqual(self.rec.values('last_error'), [])
+
+
+class AlbumGameClosed(AlbumRunnerBase):
+    """RC1 — Genshin closed mid-album: the run ends promptly as FAILED
+    with MSG_WINDOW_CLOSED, instead of looping until Stop (rhythm phase)
+    or reporting a misleading click / navigation error after a long
+    timeout. Every test arms a Stop timer so a regression fails instead
+    of hanging."""
+
+    def setUp(self):
+        super().setUp()
+        FakeDetector.instances = []
+
+        def viz(*args, stop_evt=None, **kwargs):
+            stop_evt.wait(5.0)
+
+        for name, value in (('NoteDetector', FakeDetector),
+                            ('GEOMETRY_POLL_S', 0.02),
+                            ('run_visualization', viz)):
+            p = mock.patch.object(song_player, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def close_game(self):
+        self.window_gone.return_value = True
+
+    def runner(self, timeout=3.0):
+        r = self.make_runner()
+        r.watcher.grab = lambda: np.zeros((1080, 1920, 3), dtype=np.uint8)
+        r.song_player.dump_frame_fn = lambda tag: None
+        safety = threading.Timer(timeout, r.stop_evt.set)
+        safety.start()
+        self.addCleanup(safety.cancel)
+        return r
+
+    def closed_error_only(self):
+        self.assertEqual(self.rec.values('last_error'),
+                         [game_window.MSG_WINDOW_CLOSED])
+
+    def test_refresh_tells_closed_from_minimized(self):
+        r = self.runner()
+        with mock.patch.object(album, 'read_game_geometry',
+                               return_value=None), _quiet():
+            self.assertTrue(r._refresh_geometry(block=False))   # minimized
+            self.assertEqual(self.rec.values('last_error'), [])
+            self.close_game()
+            self.assertFalse(r._refresh_geometry(block=False))
+            self.assertFalse(r._refresh_geometry(block=True))   # sticky
+        self.closed_error_only()
+
+    def test_closed_mid_song_fails_run_promptly(self):
+        """The reported bug: rhythm phase kept polling a closed game."""
+        r = self.runner()
+        r._on_album_page = lambda frame=None: True
+        r._is_canorus = lambda frame=None: False
+        sp = r.song_player
+        sp._advance_to_song = lambda difficulty, state: song_player.SCREEN_RHYTHM
+        sp._end_watcher = lambda local_stop: local_stop.wait(5.0)
+        closer = threading.Timer(0.1, self.close_game)
+        closer.start()
+        self.addCleanup(closer.cancel)
+        with mock.patch.object(album, 'read_game_geometry',
+                               return_value=None), _quiet() as out:
+            started = time.time()
+            result = r.run(songs_count=3)
+            elapsed = time.time() - started
+        self.assertEqual(result, album.RESULT_FAILED)
+        self.assertFalse(r.stop_evt.is_set())
+        self.assertLess(elapsed, 2.0)
+        self.closed_error_only()
+        self.assertNotIn('Album complete', out.getvalue())
+        self.assertEqual(self.rec.values('album_progress')[-1]['results'],
+                         ['failed'])
+        self.assertEqual(len(FakeDetector.instances), 1)
+        self.assertTrue(FakeDetector.instances[0].stopped)
+
+    def test_closed_while_waiting_for_album_page(self):
+        r = self.runner()
+        r._on_album_page = lambda frame=None: False
+        r._find_select_song = lambda frame=None: None
+        closer = threading.Timer(0.2, self.close_game)
+        closer.start()
+        self.addCleanup(closer.cancel)
+        with _quiet():
+            started = time.time()
+            result = r._after_song()
+            elapsed = time.time() - started
+        self.assertEqual(result, album.RESULT_FAILED)
+        self.assertLess(elapsed, 1.5)
+        self.closed_error_only()
+
+    def test_next_song_click_refused_by_closed_game(self):
+        r = self.runner()
+        r.watcher.click_ref = mock.MagicMock(return_value=False)
+        self.close_game()
+        with _quiet():
+            self.assertFalse(r._next_song())
+        self.assertEqual(r.watcher.click_ref.call_count, 1)   # no retry
+        self.closed_error_only()
+
+    def test_intro_click_refused_by_closed_game(self):
+        r = self.runner()
+        r.watcher.click_ref = mock.MagicMock(return_value=False)
+        self.close_game()
+        with mock.patch.object(album, 'read_game_geometry',
+                               return_value=None), _quiet():
+            self.assertFalse(r.song_player.play('legendary'))
+        self.closed_error_only()
+
+    def test_closed_during_intro_wait_fails_fast(self):
+        """Go Perform clicked, then the game closed: the watcher's 5 s
+        wait for the difficulty screen gives up at once."""
+        r = self.runner()
+        r.watcher.click_ref = mock.MagicMock(side_effect=lambda *a: (
+            self.close_game() or True))
+        r.watcher.match = lambda *a, **k: None
+        with mock.patch.object(album, 'read_game_geometry',
+                               return_value=None), _quiet():
+            started = time.time()
+            self.assertFalse(r.song_player.play('legendary'))
+            elapsed = time.time() - started
+        self.assertLess(elapsed, 1.0)
+        self.closed_error_only()
+
+    def test_closed_while_paused_between_songs(self):
+        r = self.runner()
+        r.pause_evt.set()
+        closer = threading.Timer(0.1, self.close_game)
+        closer.start()
+        self.addCleanup(closer.cancel)
+        with mock.patch.object(album, 'WINDOW_CHECK_S', 0.02), _quiet():
+            started = time.time()
+            self.assertFalse(r._song_boundary())
+            elapsed = time.time() - started
+        self.assertFalse(r.stop_evt.is_set())
+        self.assertLess(elapsed, 1.5)
+        self.closed_error_only()
+        self.assertEqual(r._halt_result(), album.RESULT_FAILED)
 
 
 # --- SongPlayer ----------------------------------------------------------------
@@ -1454,6 +1735,23 @@ class SongPlayerIntro(SongPlayerBase):
         self.assertLess(time.time() - started, 0.5)
         self.assertEqual(result, [False])
         self.assertEqual(self.watcher.clicks, [])
+
+    def test_game_closed_while_paused_in_intro(self):
+        """RC1 — paused before a click, then the game closed: the gate
+        ends the song (no click, no waiting for a resume that can't
+        help). The album runner reported the reason."""
+        self.addCleanup(self.stop.set)
+        self.pause.set()
+        self.geometry_fn.side_effect = lambda block: False
+        result = []
+        with mock.patch.object(song_player, 'GEOMETRY_POLL_S', 0.02):
+            t = threading.Thread(target=lambda: result.append(self.play()))
+            t.start()
+            t.join(2.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result, [False])
+        self.assertEqual(self.watcher.clicks, [])
+        self.assertFalse(self.stop.is_set())
 
     def test_resume_reidentifies_screen_before_next_click(self):
         """R8 — the user went back to the album page while paused."""
@@ -1632,6 +1930,163 @@ class SongPlayerRhythmPhase(unittest.TestCase):
             self.pause.clear()
             t.join(2.0)
         self.assertEqual(out, [False])
+
+    def _closed_after_start(self, pause_first):
+        """RC1 — the game closes (non-blocking refresh says "end the
+        run") while the song plays or is paused: return False promptly
+        with the detector stopped (keys released), no Stop needed."""
+        self.addCleanup(self.stop.set)          # never leak the thread
+        closed = threading.Event()
+        self.geometry_fn.side_effect = lambda block: not closed.is_set()
+        with _quiet():
+            t, out = self._start()
+            self.assertTrue(_wait_until(lambda: FakeDetector.instances))
+            if pause_first:
+                self.pause.set()
+                time.sleep(0.1)
+            closed.set()
+            t.join(2.0)
+        self.assertFalse(t.is_alive())
+        self.assertFalse(self.stop.is_set())
+        self.assertEqual(out, [False])
+        self.assertEqual(len(FakeDetector.instances), 1)
+        self.assertTrue(FakeDetector.instances[0].stopped)
+
+    def test_game_closed_mid_song_returns_false(self):
+        self._closed_after_start(pause_first=False)
+
+    def test_game_closed_while_paused_mid_song_returns_false(self):
+        self._closed_after_start(pause_first=True)
+
+
+# --- CLI entrypoints -------------------------------------------------------------
+
+class AlbumCliBackend(unittest.TestCase):
+    """RC3 — `python pc_client/album.py` honors INPUT_BACKEND_DEFAULT (and
+    --backend) like main.py, instead of always opening the Arduino."""
+
+    def _main(self, extra_argv, backend_error=None):
+        import ui_core
+        made = []
+        ctrl = FakeInput()
+
+        def make(name, cancel_evt=None):
+            made.append(name)
+            if backend_error is not None:
+                raise backend_error
+            return ctrl
+
+        runner = mock.MagicMock()
+        runner.run.return_value = album.RESULT_COMPLETED
+        runner_cls = mock.MagicMock(return_value=runner)
+        argv = ['album.py', '--difficulty', 'hard', '--replay-canorus',
+                '--songs', '2'] + extra_argv
+        code = None
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(ui_core, 'make_input_backend',
+                                  side_effect=make), \
+                mock.patch.object(album, 'AlbumRunner', runner_cls), \
+                mock.patch.object(album, 'ctypes'), _quiet() as out:
+            try:
+                album.main()
+            except SystemExit as e:
+                code = e.code
+        return made, ctrl, runner_cls, code, out.getvalue()
+
+    def test_default_backend_comes_from_config(self):
+        from config import INPUT_BACKEND_DEFAULT
+        made, ctrl, runner_cls, code, _ = self._main([])
+        self.assertEqual(made, [INPUT_BACKEND_DEFAULT])
+        self.assertIs(runner_cls.call_args.kwargs['controller'], ctrl)
+        self.assertTrue(ctrl.closed)          # the CLI owns the backend
+        self.assertIsNone(code)
+
+    def test_backend_flag_overrides_default(self):
+        for name in ('software', 'arduino'):
+            made, ctrl, runner_cls, code, _ = self._main(['--backend', name])
+            self.assertEqual(made, [name])
+            self.assertIs(runner_cls.call_args.kwargs['controller'], ctrl)
+            self.assertIsNone(code)
+
+    def test_arduino_failure_exits_1_with_message(self):
+        msg = "No Arduino found — plug in the Leonardo"
+        made, ctrl, runner_cls, code, out = self._main(
+            ['--backend', 'arduino'],
+            backend_error=standalone_runner.ArduinoConnectionError(msg))
+        self.assertEqual(code, 1)
+        self.assertIn(f"ERROR: {msg}", out)
+        runner_cls.assert_not_called()
+
+
+class CalibrateDpi(unittest.TestCase):
+    """RC4 — calibrate.py must be DPI-aware before reading geometry."""
+
+    def test_dpi_aware_before_any_geometry_read(self):
+        import calibrate
+        order = []
+        with mock.patch.object(calibrate, 'set_dpi_aware',
+                               side_effect=lambda: order.append('dpi')), \
+                mock.patch.object(calibrate, 'auto_detect',
+                                  side_effect=lambda *a, **k:
+                                  order.append('detect')), _quiet():
+            with self.assertRaises(SystemExit):
+                calibrate.main()         # auto_detect -> None -> exit 1
+        self.assertEqual(order, ['dpi', 'detect'])
+
+
+class MainCliGameClosed(unittest.TestCase):
+    """RC1 — `python pc_client/main.py` exits cleanly (keys released,
+    backend closed, timer restored, exit 1 + message) when Genshin is
+    closed mid-run, headless or with the debug viz."""
+
+    def _run(self, debug_mode):
+        import main as cli
+        FakeDetector.instances = []
+        ctrl = FakeInput()
+        restore = mock.MagicMock()
+        sleeps = []
+
+        def sleep(secs):                  # bounds a regression: Ctrl+C
+            sleeps.append(secs)
+            if len(sleeps) > 50:
+                raise KeyboardInterrupt
+
+        patches = dict(
+            DEBUG_MODE=debug_mode,
+            set_dpi_aware=mock.MagicMock(),
+            boost_timer=mock.MagicMock(return_value=True),
+            restore_timer=restore,
+            auto_detect=mock.MagicMock(return_value=(
+                dict(REGION_1080), [417, 628, 844, 1061, 1277, 1493], 921)),
+            find_game_window=mock.MagicMock(return_value=GAME_HWND),
+            make_input_backend=mock.MagicMock(return_value=ctrl),
+            NoteDetector=FakeDetector,
+            ctypes=mock.MagicMock(),
+            cv2=mock.MagicMock(),
+            time=mock.MagicMock(sleep=sleep),
+            run_visualization=mock.MagicMock(
+                side_effect=lambda *a, **k: k['geometry_poll']() and (
+                    standalone_runner.VIZ_EXIT_WINDOW_GONE)))
+        code = None
+        with mock.patch.multiple(cli, **patches), \
+                mock.patch.object(game_window, '_user32',
+                                  return_value=FakeUser32(exists=False)), \
+                _quiet() as out:
+            try:
+                cli.main()
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue(), ctrl, restore
+
+    def test_game_closed_exits_cleanly(self):
+        for debug_mode in (False, True):
+            code, out, ctrl, restore = self._run(debug_mode)
+            self.assertEqual(code, 1, debug_mode)
+            self.assertIn(game_window.MSG_WINDOW_CLOSED, out)
+            self.assertIn('Shutdown complete', out)
+            self.assertTrue(all(d.stopped for d in FakeDetector.instances))
+            self.assertTrue(ctrl.closed)
+            restore.assert_called_once()
 
 
 if __name__ == '__main__':

@@ -17,6 +17,8 @@ from config import (GAME_WINDOW_TITLE, REF_WIDTH, REF_HEIGHT,
 # `status_cb({'last_error': ...})`). Short, plain-English, actionable.
 MSG_WINDOW_NOT_FOUND = ("Genshin Impact window not found — start the game, "
                         "then press Start.")
+# Also the reason a run ends when the game is closed mid-run (rhythm
+# phase, album navigation) — see `window_gone`.
 MSG_WINDOW_CLOSED = ("Genshin Impact window closed — start the game, "
                      "then press Start.")
 MSG_WINDOW_MINIMIZED = ("Genshin Impact is minimized — restore the game "
@@ -130,13 +132,34 @@ def _geometry(left, top, width, height):
     return capture_region, scale_x, scale_y
 
 
+def window_gone(hwnd):
+    """Non-blocking: True when the game window no longer exists (Genshin
+    was closed) — `IsWindow` is false, or there is no handle at all.
+
+    A minimized, hidden, too-small or off-screen window is NOT gone:
+    callers keep waiting for it. An error reading the state counts as
+    "still there", so a ctypes hiccup can never end a run. `IsWindow`
+    reads kernel-side window state and never messages the game, so this
+    is safe every few hundred ms from any thread (not on the detector's
+    5 ms hot path, though)."""
+    if not hwnd:
+        return True
+    try:
+        # HWND-wrapped: a handle that went through an HWND restype
+        # (sign-extended to 64 bits) overflows the default c_int argument.
+        return not _user32().IsWindow(ctypes.wintypes.HWND(hwnd))
+    except Exception:
+        return False
+
+
 def read_game_geometry(hwnd):
     """Non-blocking single read of the game's capture geometry.
 
     Returns (capture_region, scale_x, scale_y) when the window exists, is
     restored and is at least 800x600 on screen; None otherwise
     (minimized, too small, off-screen, or the window is gone). Callers
-    treat None as "keep the last-known geometry".
+    treat None as "keep the last-known geometry" and use `window_gone`
+    to tell a closed game (end the run) from a minimized one (wait).
 
     Cheap — IsWindow / IsIconic / GetClientRect / ClientToScreen read
     kernel-side window state and never message the game — so it is

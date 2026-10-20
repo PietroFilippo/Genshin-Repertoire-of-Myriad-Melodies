@@ -13,6 +13,7 @@ import sys
 
 from game_window import find_game_window, get_game_geometry, auto_detect
 from config import KEYS, REF_COLUMN_X, REF_HIT_LINE_Y, PIXEL_THRESHOLD
+from system_setup import set_dpi_aware
 
 
 def main():
@@ -21,6 +22,11 @@ def main():
     print("========================================")
     print("Make sure Genshin Impact is running and visible on screen.")
     print()
+
+    # Before any geometry read or capture: without it Windows scales the
+    # client rect / capture coordinates on high-DPI displays and the
+    # overlay lands off the real hit line (same setup as main.py / UI).
+    set_dpi_aware()
 
     # Auto-detect game window
     detected = auto_detect()

@@ -23,9 +23,10 @@ from config import (KEYS, PIXEL_THRESHOLD, KEY_POLL_DELAY_S,
                     Y_SAMPLE_OFFSETS)
 from detector import NoteDetector
 from controller import ArduinoHIDController
-from game_window import (MSG_WINDOW_NOT_FOUND, find_game_window, auto_detect,
-                         get_game_geometry, read_game_geometry,
-                         same_hwnd, scaled_layout)
+from game_window import (MSG_WINDOW_CLOSED, MSG_WINDOW_NOT_FOUND,
+                         find_game_window, auto_detect, get_game_geometry,
+                         read_game_geometry, same_hwnd, scaled_layout,
+                         window_gone)
 
 try:
     from controller import ArduinoConnectionError
@@ -46,6 +47,12 @@ VIZ_EXIT_QUIT = 'quit'
 # The game window was resized (lane layout changed) — rebuild the detector
 # and re-enter with the new geometry. A plain move is handled in place.
 VIZ_EXIT_GEOMETRY = 'geometry'
+# The game window no longer exists (Genshin was closed) — the caller ends
+# the run. A minimized / hidden game is NOT this: play just waits for it.
+VIZ_EXIT_WINDOW_GONE = 'window_gone'
+
+# `GeometryTracker.poll()` result when the game window no longer exists.
+WINDOW_GONE = 'window_gone'
 
 # Non-blocking geometry poll cadence during active play (window moved /
 # resized while a song runs) — same cadence as the album's SongPlayer.
@@ -208,8 +215,9 @@ class GeometryTracker:
     during active play. `poll()` is cheap (`read_game_geometry` never
     messages the game) — call it every ~GEOMETRY_POLL_S. Returns the new
     (capture_region, column_centers, hit_line_y) when anything changed,
-    else None (no change, or the window isn't usable right now — keep
-    the last-known geometry)."""
+    WINDOW_GONE when the game window no longer exists (Genshin closed —
+    end the run), else None (no change, or the window is minimized /
+    off-screen right now — keep the last-known geometry)."""
 
     def __init__(self, hwnd, capture_region, column_centers, hit_line_y,
                  tag='[standalone]'):
@@ -229,7 +237,9 @@ class GeometryTracker:
     def poll(self):
         geom = read_game_geometry(self.hwnd)
         if geom is None:
-            return None
+            # Minimized / off-screen: keep waiting. Closed: say so, or the
+            # run would keep "playing" a game that no longer exists.
+            return WINDOW_GONE if window_gone(self.hwnd) else None
         region, scale_x, scale_y = geom
         cols, hit = scaled_layout(scale_x, scale_y)
         new = (dict(region), cols, hit)
@@ -296,15 +306,17 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             whether to resume (re-enter this function) or quit.
         game_hwnd: Genshin's HWND — where focus goes back to if the
             preview ever ends up foreground (see the focus note above).
-        geometry_poll: optional callable() -> None | (capture_region,
-            column_centers, hit_line_y), e.g. `GeometryTracker.poll`.
-            Called every GEOMETRY_POLL_S whether debug is on or off. A
-            move retargets the capture in place; a resize returns
-            VIZ_EXIT_GEOMETRY so the caller rebuilds the detector.
+        geometry_poll: optional callable() -> None | WINDOW_GONE |
+            (capture_region, column_centers, hit_line_y), e.g.
+            `GeometryTracker.poll`. Called every GEOMETRY_POLL_S whether
+            debug is on or off. A move retargets the capture in place; a
+            resize returns VIZ_EXIT_GEOMETRY so the caller rebuilds the
+            detector; WINDOW_GONE returns VIZ_EXIT_WINDOW_GONE.
 
     Returns why the loop exited: VIZ_EXIT_STOP (stop_evt), VIZ_EXIT_PAUSE
-    (pause_evt), VIZ_EXIT_QUIT ('q' / window closed with no debug_evt) or
-    VIZ_EXIT_GEOMETRY (game window resized; see geometry_poll).
+    (pause_evt), VIZ_EXIT_QUIT ('q' / window closed with no debug_evt),
+    VIZ_EXIT_GEOMETRY (game window resized; see geometry_poll) or
+    VIZ_EXIT_WINDOW_GONE (game closed; see geometry_poll).
     """
     window_open = False
 
@@ -411,6 +423,13 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             if geometry_poll is not None and time.time() >= next_geom_poll:
                 next_geom_poll = time.time() + GEOMETRY_POLL_S
                 new_geom = geometry_poll()
+                if new_geom == WINDOW_GONE:
+                    # Genshin was closed — nothing left to play.
+                    if window_open:
+                        close_window()
+                        window_open = False
+                    exit_reason = VIZ_EXIT_WINDOW_GONE
+                    break
                 if new_geom is not None:
                     if layout_changed(
                             (capture_region, column_centers, hit_line_y),
@@ -600,7 +619,10 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
     cleared. On resume the game geometry is re-read (the window may have
     moved / resized) and a fresh detector is spun up. During play the
     geometry is polled every GEOMETRY_POLL_S: a resize rebuilds the
-    detector, a move retargets the viz capture.
+    detector, a move retargets the viz capture, and a closed game ends
+    the run (MSG_WINDOW_CLOSED). A minimized game just waits. While
+    paused nothing is polled: a game closed (or restarted) during the
+    pause is handled by the re-find on resume.
 
     `controller` lets the UI inject a long-lived InputBackend
     shared across bot runs + the macro tool (only one process can hold
@@ -651,7 +673,8 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
     # this every GEOMETRY_POLL_S (non-blocking). A move retargets the viz
     # capture in place (the detector reads client-relative pixels, so it
     # doesn't care); a resize exits the viz with VIZ_EXIT_GEOMETRY and we
-    # rebuild the detector for the new lane layout below.
+    # rebuild the detector for the new lane layout below; a closed game
+    # exits it with VIZ_EXIT_WINDOW_GONE and ends the run.
     tracker = GeometryTracker(hwnd, capture_region, column_centers,
                               hit_line_y)
 
@@ -731,6 +754,14 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
                 detector.stop()
 
             if _stopped():
+                break
+            if reason == VIZ_EXIT_WINDOW_GONE:
+                # Genshin closed mid-play: the detector above already
+                # released every key; end the run with an actionable
+                # reason instead of polling a game that's gone.
+                print("[standalone] Genshin Impact window closed — "
+                      "ending the run")
+                _error(MSG_WINDOW_CLOSED)
                 break
             if reason == VIZ_EXIT_GEOMETRY:
                 # Resized mid-play — tracker holds the new layout; loop

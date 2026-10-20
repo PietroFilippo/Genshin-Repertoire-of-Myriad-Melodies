@@ -64,7 +64,7 @@ DEFAULT_MATCH_THRESHOLD = 0.85
 class ScreenWatcher:
     def __init__(self, region, scale_x, scale_y, controller, stop_evt,
                  templates, match_threshold=DEFAULT_MATCH_THRESHOLD,
-                 live_geometry_fn=None):
+                 live_geometry_fn=None, window_gone_fn=None):
         """
         Args:
             region: dict with keys top/left/width/height — the mss
@@ -89,6 +89,12 @@ class ScreenWatcher:
                 mouse-down so a window change the caller's periodic poll
                 hasn't published yet still stops the click. None = no
                 live check (caller-published geometry only).
+            window_gone_fn: optional `callable() -> bool`, True once the
+                game window no longer exists (e.g. `game_window.
+                window_gone(hwnd)`; AlbumRunner passes a wrapper that
+                also reports it). `wait_for` gives up as soon as it says
+                so instead of polling a closed game until the timeout.
+                None = no check.
         """
         if stop_evt is None:
             raise ValueError("ScreenWatcher requires a stop_evt — "
@@ -101,6 +107,7 @@ class ScreenWatcher:
         # (live check) at the same time.
         self._geom_lock = threading.Lock()
         self._live_geometry_fn = live_geometry_fn
+        self._window_gone_fn = window_gone_fn
         self.controller = controller
         self.stop_evt = stop_evt
         self.templates = templates
@@ -321,10 +328,14 @@ class ScreenWatcher:
         """Poll until `templates[tpl_name]` is present (or absent if
         present=False) inside `ref_roi` (1080p reference coords).
         Returns True iff the desired state is reached within timeout.
-        Stop-aware: bails immediately on stop_evt (returns False)."""
+        Stop-aware: bails immediately on stop_evt (returns False), and on
+        a closed game when `window_gone_fn` is set (returns False too —
+        the caller tells the cases apart)."""
         end = time.time() + timeout
         while time.time() < end:
             if self.stop_evt.is_set():
+                return False
+            if self._window_gone():
                 return False
             frame = self.grab()
             roi = self.ref_rect_to_local(*ref_roi)
@@ -334,6 +345,16 @@ class ScreenWatcher:
             if self.stop_wait(0.2):
                 return False
         return False
+
+    def _window_gone(self):
+        fn = self._window_gone_fn
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception as e:
+            print(f"    [watcher] window check failed: {e}")
+            return False
 
     def stop_wait(self, secs):
         """Cancellable sleep. Blocks up to `secs` and returns True if

@@ -15,7 +15,8 @@ Per-song flow (current English UI):
     advance via next-song click
 
 Run from inside a country album page (NOT the All Albums grid):
-    python pc_client/album.py
+    python pc_client/album.py [--backend software|arduino]
+(default backend: INPUT_BACKEND_DEFAULT in config.py, like main.py).
 """
 import argparse
 import ctypes
@@ -28,12 +29,17 @@ import cv2
 
 from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
                     ALBUM_MATCH_THRESHOLD, ALBUM_NEXT_SONG_XY,
-                    ALBUM_SONG_COUNT, KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS)
-from game_window import (MSG_WINDOW_NOT_FOUND, find_game_window,
-                         get_game_geometry, read_game_geometry)
+                    ALBUM_SONG_COUNT, INPUT_BACKEND_DEFAULT,
+                    KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS)
+from game_window import (MSG_WINDOW_CLOSED, MSG_WINDOW_NOT_FOUND,
+                         find_game_window, get_game_geometry,
+                         read_game_geometry, window_gone)
 from screen_watcher import ScreenWatcher
 from song_player import ROI_GO_PERFORM, ROI_SELECT_SONG, SongPlayer
-from standalone_runner import make_fallback_arduino
+from standalone_runner import MSG_ARDUINO_UNAVAILABLE, make_fallback_arduino
+
+# How often the album's pause waits check that the game still exists.
+WINDOW_CHECK_S = 0.5
 
 
 # 1080p reference ROIs (search bounding boxes), derived from screenshots
@@ -52,9 +58,12 @@ ROI_CANORUS = {
 # song-flow state machine, which also needs Go Perform to verify a
 # mid-song hand-off). `ROI_GO_PERFORM` / `ROI_SELECT_SONG` are re-
 # imported above for the album-page check and for
-# `AlbumRunner._find_select_song`, which handles the post-pause
-# results-screen recovery the song-player's watcher can't see (the
-# watcher dies on pause).
+# `AlbumRunner._find_select_song`, which serves `_after_song`'s
+# results-screen recovery: a mid-song hand-off that landed on the
+# results screen, a resume that found the song already over, or an
+# end-watcher Select Song click that didn't register. (SongPlayer's end
+# watcher stays alive during a pause; this is the backstop for the
+# cases it doesn't cover.)
 
 # `AlbumRunner.run()` outcomes.
 RESULT_COMPLETED = 'completed'
@@ -89,9 +98,12 @@ class AlbumRunner:
             stop_evt: external Event — when set, abort cleanly. UI uses this
                 for the Stop button.
             pause_evt: external Event — when set, the album loop blocks at
-                the next safe boundary (between songs). Mid-song pause
-                aborts the current song (releases keys via detector.stop)
-                and waits at the next boundary. Clear to resume.
+                the next safe boundary. Between songs it waits at the
+                song boundary; during the intro click chain it holds
+                before the next click; mid-song it stops the detector
+                (releasing keys) and the viz while SongPlayer's end
+                watcher stays alive, and resume starts a fresh detector
+                on the same song. Clear to resume.
             debug_evt: external Event — when set, the rhythm-mode portion
                 of `SongPlayer.play` spawns a viz thread that mirrors
                 `standalone_runner.run_visualization`'s overlay. Toggling
@@ -156,6 +168,8 @@ class AlbumRunner:
         # cleared). Lets a generic failure message avoid overwriting a
         # specific one already on screen (e.g. "window closed").
         self._last_error = ''
+        # Sticky: the game window no longer exists (see _window_gone).
+        self._window_closed = False
         # album_progress state (reset + first emitted at run() start).
         self._progress = {'index': 0, 'total': 0,
                           'difficulty': self.difficulties[0],
@@ -221,11 +235,14 @@ class AlbumRunner:
             # `live_geometry_fn` lets every click re-read the game's
             # client rect right before mouse-down, catching a move /
             # resize our ~0.5 s poll hasn't published yet.
+            # `window_gone_fn` ends the watcher's waits as soon as the
+            # game is closed (reported once, by _window_gone).
             self.watcher = ScreenWatcher(
                 region=self.region, scale_x=self.scale_x, scale_y=self.scale_y,
                 controller=self.controller, stop_evt=self.stop_evt,
                 templates=self.tpl, match_threshold=ALBUM_MATCH_THRESHOLD,
-                live_geometry_fn=lambda: read_game_geometry(self.hwnd))
+                live_geometry_fn=lambda: read_game_geometry(self.hwnd),
+                window_gone_fn=self._window_gone)
 
             # Per-song state machine: intro click chain → detector + viz +
             # end-watcher → pause-resume → cleanup. AlbumRunner stays as
@@ -250,8 +267,8 @@ class AlbumRunner:
             # the screen edges. Linear
             # (accel=0) gives a constant mickey:pixel ratio that converges in
             # 1-2 iters. Saved here and restored in close() so this works the
-            # same whether the CLI or the UI is driving the runner — the CLI
-            # also wraps with its own save/restore as belt-and-suspenders.
+            # same whether the CLI or the UI is driving the runner (neither
+            # touches EPP itself; both call close()).
             # Last step of __init__ on purpose (see the assets note above).
             try:
                 self._saved_mouse = _get_mouse_params()
@@ -298,21 +315,42 @@ class AlbumRunner:
 
         block=True waits — stop-aware — while the game is minimized
         (song boundaries, resume). block=False is a single cheap read
-        that keeps the last-known geometry when the window isn't usable
-        right now (SongPlayer calls it every ~0.5 s mid-song).
+        that keeps the last-known geometry while the window is minimized
+        / off-screen (SongPlayer calls it every ~0.5 s mid-song), but
+        ends the run once the game is closed.
 
         Returns False iff the run should end: stop fired, or the game
         window is gone (already reported as last_error)."""
+        if self._window_closed:
+            return False
         if block:
             geom = get_game_geometry(self.hwnd, stop_evt=self.stop_evt,
                                      status_cb=self._emit)
             if geom is None:
+                if not self.stop_evt.is_set():
+                    # Gone — get_game_geometry reported MSG_WINDOW_CLOSED.
+                    self._window_closed = True
                 return False
         else:
             geom = read_game_geometry(self.hwnd)
             if geom is None:
-                return True
+                return not self._window_gone()
         self._apply_geometry(*geom)
+        return True
+
+    def _window_gone(self):
+        """True once the game window no longer exists (Genshin closed;
+        `game_window.window_gone`, a non-blocking IsWindow). Reports
+        MSG_WINDOW_CLOSED the first time. Sticky: the run is bound to
+        this HWND and can't recover, so every later step fails fast. A
+        minimized / off-screen game is NOT gone."""
+        if not self._window_closed:
+            if not window_gone(self.hwnd):
+                return False
+            self._window_closed = True
+            print("ERROR: Genshin Impact window closed — ending the album "
+                  "run")
+            self._emit({'last_error': MSG_WINDOW_CLOSED})
         return True
 
     def _apply_geometry(self, region, scale_x, scale_y):
@@ -391,14 +429,14 @@ class AlbumRunner:
         """Click the next song on the album wheel. One retry if the
         click didn't land (the Arduino backend's `move_to` can miss
         convergence). Returns True once a click went through and the
-        wheel settled; False on stop (including during the settle wait)
-        or a second miss (reported as last_error)."""
+        wheel settled; False on stop (including during the settle wait),
+        a closed game, or a second miss (reported as last_error)."""
         for attempt in range(2):
             if self.watcher.click_ref(*ALBUM_NEXT_SONG_XY):
                 # Settle wait — Stop here must propagate, otherwise the
                 # final wheel reset would report the run as completed.
                 return not self.watcher.stop_wait(0.8)
-            if self.stop_evt.is_set():
+            if self.stop_evt.is_set() or self._window_gone():
                 return False
             if attempt == 0:
                 print("  WARN: next-song click didn't land; retrying")
@@ -409,10 +447,13 @@ class AlbumRunner:
     def _wait_for_album_page(self, timeout=60.0):
         """Poll up to `timeout` for the album page anchor. Worst-case
         blocker for stop-responsiveness (60s default), so the poll uses
-        stop-aware sleep."""
+        stop-aware sleep, and gives up at once if the game was closed
+        (reported by _window_gone)."""
         end = time.time() + timeout
         while time.time() < end:
             if self.stop_evt.is_set():
+                return False
+            if self._window_gone():
                 return False
             if self._on_album_page():
                 return True
@@ -436,20 +477,20 @@ class AlbumRunner:
         """Pause boundary + results-screen recovery + wait for the album
         page. Returns None once the album page is back, else
         RESULT_STOPPED / RESULT_FAILED."""
-        # Pause may have fired mid-song — song_player.play aborted
-        # and we land here. Wait at the boundary before clicking
-        # next-song.
+        # Pause may still be set — e.g. the song ended (and the end
+        # watcher clicked through) while the bot was paused mid-song.
+        # Wait at the boundary before clicking next-song.
         if not self._song_boundary():
             return self._halt_result()
 
-        # After a mid-song pause the rhythm game may have ended while
-        # the bot was idle, leaving the results screen up (the watcher
-        # was killed on pause, so nobody clicked Select Song). Check
-        # for it now and click through if present.
+        # The results screen can still be up here: a mid-song hand-off
+        # that landed on the results screen, a resume that found the
+        # song already over, or an end-watcher Select Song click that
+        # didn't register. Click through if present.
         if not self._on_album_page():
             res = self._find_select_song()
             if res is not None:
-                print("  clicking Select Song (results screen after pause)")
+                print("  clicking Select Song (results screen still up)")
                 _, (cx, cy) = res
                 if (not self.watcher.click_local(cx, cy)
                         and not self.stop_evt.is_set()):
@@ -493,8 +534,13 @@ class AlbumRunner:
 
     def _fail(self, log_line, user_message=None):
         """Log + report an unrecoverable album error. Returns
-        RESULT_FAILED so call sites can `return self._fail(...)`."""
+        RESULT_FAILED so call sites can `return self._fail(...)`.
+        A step that failed because the game was closed (click refused,
+        page never came back) reports that instead of `user_message`,
+        which would send the user looking for the wrong problem."""
         print(log_line)
+        if self._window_gone():
+            return RESULT_FAILED
         if user_message:
             self._emit({'last_error': user_message})
         return RESULT_FAILED
@@ -563,14 +609,20 @@ class AlbumRunner:
         return result
 
     def _await_resume(self):
-        """Block while pause_evt is set; bail out if stop fires. Called at
-        safe boundaries between songs."""
+        """Block while pause_evt is set; bail out if stop fires or the
+        game is closed (reported; the caller's geometry re-read then
+        ends the run). Called at safe boundaries between songs."""
         if not self.pause_evt.is_set():
             return
         self._emit({'state': 'paused'})
         print("  paused — waiting for resume")
+        next_check = time.time() + WINDOW_CHECK_S
         while self.pause_evt.is_set() and not self.stop_evt.is_set():
             time.sleep(0.1)
+            if time.time() >= next_check:
+                next_check = time.time() + WINDOW_CHECK_S
+                if self._window_gone():
+                    return
         if not self.stop_evt.is_set():
             self._emit({'state': 'running'})
             print("  resumed")
@@ -867,6 +919,10 @@ def main():
         '--songs', type=int, default=ALBUM_SONG_COUNT,
         help=f"Number of songs to run (1..{ALBUM_SONG_COUNT}). "
              f"Defaults to the full album ({ALBUM_SONG_COUNT}).")
+    parser.add_argument(
+        '--backend', choices=('software', 'arduino'),
+        help="Input backend. Defaults to INPUT_BACKEND_DEFAULT in "
+             f"config.py (currently '{INPUT_BACKEND_DEFAULT}').")
     args = parser.parse_args()
 
     replay = args.replay_canorus or _prompt_replay_canorus()
@@ -893,15 +949,37 @@ def main():
             except Exception:
                 pass
 
-    # EPP save / restore is handled by AlbumRunner (so UI mode gets it
-    # too). See AlbumRunner.__init__ for the rationale.
+    # Same backend choice as main.py: INPUT_BACKEND_DEFAULT (config.py)
+    # unless --backend overrides it; ui_settings.json is the UI's, not
+    # ours. Imported here, not at module top: ui_core imports this module.
+    from ui_core import make_input_backend
+    backend = args.backend or INPUT_BACKEND_DEFAULT
+    print(f"Input backend: {backend}")
     try:
-        runner = AlbumRunner(replay_canorus=replay, difficulty=difficulty)
-    except (RuntimeError, SystemExit) as e:
-        # AlbumSetupError (game window / Arduino), ArduinoConnectionError
-        # (a RuntimeError), a missing template, or an older adapter's
-        # sys.exit — fail cleanly instead of a traceback.
+        controller = make_input_backend(backend)
+    except SystemExit:
+        # Older adapters sys.exit on a missing board.
+        print(f"ERROR: {MSG_ARDUINO_UNAVAILABLE}")
+        _restore_timer()
+        sys.exit(1)
+    except (RuntimeError, ImportError) as e:
+        # ArduinoConnectionError (a RuntimeError) carries the user-facing
+        # reason; ImportError = the backend's package isn't installed.
         print(f"ERROR: {e}")
+        _restore_timer()
+        sys.exit(1)
+
+    # EPP save / restore is handled by AlbumRunner (so UI mode gets it
+    # too). See AlbumRunner.__init__ for the rationale. The runner doesn't
+    # own an injected backend, so we close it ourselves.
+    try:
+        runner = AlbumRunner(replay_canorus=replay, difficulty=difficulty,
+                             controller=controller)
+    except (RuntimeError, SystemExit) as e:
+        # AlbumSetupError (game window not found / closed) or a missing
+        # template — fail cleanly instead of a traceback.
+        print(f"ERROR: {e}")
+        controller.close()
         _restore_timer()
         sys.exit(1)
     result = RESULT_STOPPED
@@ -911,6 +989,7 @@ def main():
         print("\nCtrl+C")
     finally:
         runner.close()
+        controller.close()
         _restore_timer()
         print("Shutdown complete")
     if result == RESULT_FAILED:

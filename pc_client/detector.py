@@ -200,11 +200,21 @@ class NoteDetector:
         """True if Genshin (or another window owned by the game process,
         e.g. an in-game overlay) is foreground, False if some other app
         is, None if there is no foreground window right now (transient,
-        mid alt-tab)."""
+        mid alt-tab). Runs on the focus thread (and once in start()),
+        never on the per-key hot path."""
         fg = _foreground_hwnd()
         if not fg:
             return None
         if same_hwnd(fg, self.hwnd):
+            # Recycled-HWND guard: if Genshin closed and Windows handed
+            # its handle to another app's window, the owning PID differs.
+            # Only a KNOWN mismatch rejects — an unknown PID (lookup
+            # failed) keeps the HWND-only answer, so a failed lookup can
+            # never lock the real game out (same rule as ui_core's gate).
+            if self._game_pid:
+                live = _window_pid(fg)
+                if live and live != self._game_pid:
+                    return False
             return True
         if self._game_pid and _window_pid(fg) == self._game_pid:
             return True
