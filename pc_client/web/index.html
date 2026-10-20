@@ -29,22 +29,22 @@
     <!-- Main tab -->
     <section class="panel panel-active" data-panel="main">
         <fieldset class="card">
-            <legend>Input backend</legend>
+            <legend>Input method</legend>
             <div class="row row-grid">
-                <label for="input-backend">Mode</label>
+                <label for="input-backend">Send input via</label>
                 <div class="select-wrapper">
                     <select id="input-backend">
                         <option value="software">Software (Win32 SendInput)</option>
                         <option value="arduino">Arduino HID (hardware)</option>
                     </select>
                 </div>
-                <span class="help" tabindex="0" aria-label="Input backend info"
-                      data-help="Applies to everything that injects input into the game — rhythm bot, album auto-clicker, and macro playback. Software mode (default) uses Win32 SendInput / mouse_event — no hardware, works for the rhythm minigame, album navigation, and menu-driven macros. Arduino mode drives a Leonardo over USB serial; real HID hardware so it also works for combat input that the anti-cheat blocks for synthetic input. Switching while bot or macro is running prompts to stop them first.">?</span>
+                <span class="help" tabindex="0" aria-label="Input method info"
+                      data-help="Applies to everything that injects input into the game — rhythm bot, album auto-clicker, and macro playback. Software (default) uses Win32 SendInput / mouse_event — no hardware, works for the rhythm minigame, album navigation, and menu-driven macros, but only while this app runs as administrator. Arduino drives a Leonardo over USB serial; real HID hardware so it also works for combat input that the anti-cheat blocks for synthetic input. Switching while bot or macro is running prompts to stop them first.">?</span>
             </div>
         </fieldset>
 
         <fieldset class="card">
-            <legend>Mode</legend>
+            <legend>Run mode</legend>
             <div class="row">
                 <label class="radio">
                     <input type="radio" name="mode" value="standalone" checked>
@@ -52,14 +52,14 @@
                     <span>Standalone</span>
                 </label>
                 <span class="help" tabindex="0" aria-label="Standalone mode info"
-                      data-help="Runs the rhythm detector indefinitely on whatever song is currently playing. Start it after you've manually opened a song.">?</span>
+                      data-help="Runs the rhythm detector indefinitely on whatever song is currently playing. Start it after you've manually opened a song. Requires the Hu Tao theme equipped in the rhythm minigame — the detector reads its bright hit-line, and other themes make it misfire.">?</span>
                 <label class="radio">
                     <input type="radio" name="mode" value="album">
                     <span class="radio-mark"></span>
                     <span>Album</span>
                 </label>
                 <span class="help" tabindex="0" aria-label="Album mode info"
-                      data-help="Auto-plays one country album page (Mondstadt / Liyue / Inazuma / ...) end to end. Open a country album page first, then press Start. Tip: switching Standalone → Album while a song is already playing picks up from the current song instead of going through the menu — press Stop first if you want to start from song 1. See the ? icons next to Songs and Difficulty for how those interact.">?</span>
+                      data-help="Auto-plays one country album page (Mondstadt / Liyue / Inazuma / ...) end to end. Open a country album page first, then press Start. Tip: switching Standalone → Album while a song is already playing picks up from the current song instead of going through the menu — press Stop first if you want to start from song 1. See the ? icons next to Songs and Difficulty for how those interact. Requires the Hu Tao theme (like Standalone) and the game's text language set to English — the menu buttons are recognized by their English labels.">?</span>
             </div>
         </fieldset>
 
@@ -113,7 +113,7 @@
                 <span>Replay songs already at Canorus</span>
             </label>
             <span class="help" tabindex="0" aria-label="Replay-canorus info"
-                  data-help="When enabled, every song in the album is played even if it's already at Canorus rank. Disabled = skip already-Canorus'd songs to save time.">?</span>
+                  data-help="Album mode only. When enabled, every song in the album is played even if it's already at Canorus rank. Disabled = skip already-Canorus'd songs to save time.">?</span>
         </div>
 
         <div class="row checkbox-row">
@@ -123,7 +123,7 @@
                 <span>Show debug visualization</span>
             </label>
             <span class="help" tabindex="0" aria-label="Debug visualization info"
-                  data-help="Opens an OpenCV preview window showing the rhythm lane, sample dots, blue-channel readouts, FPS, and a live key-press log. Useful for tuning; small CPU cost.">?</span>
+                  data-help="Opens an OpenCV preview window showing the rhythm lane, sample dots, blue-channel readouts, FPS, and a live key-press log. Useful for tuning; small CPU cost. Tick it before Start to open the window with the run, or toggle it (or the hotkey) while running; closing the window turns it off.">?</span>
         </div>
 
         <div class="bottom-row">
@@ -176,7 +176,7 @@
                 <button type="button" id="macro-stop-play" class="btn-secondary" disabled>Stop</button>
                 <span class="macro-status" id="macro-status">idle &middot; 0 events</span>
                 <span class="help" tabindex="0" aria-label="Macro info"
-                      data-help="Record a sequence of keyboard + mouse actions inside Genshin and play it back through the selected input backend. Recording captures input only while Genshin is focused; alt-tabbing to another app pauses capture. Hotkeys for record / play / stop / save / load also fire only inside the game.">?</span>
+                      data-help="Record key presses and mouse-button clicks inside Genshin and play them back through the selected input backend. Cursor movement and the scroll wheel are not recorded. Recording captures presses only while Genshin is focused; alt-tabbing to another app pauses capture (keys you were already holding still record their release). Play from this tab first switches to Genshin and refuses if the game isn't running. Hotkeys for record / play / stop / save / load also fire only inside the game. With the Software backend, replayed keys and clicks can trigger your own macro hotkeys if they share a key or mouse button — bind hotkeys to keys the macro doesn't use. Errors show in the status box until the next successful action.">?</span>
             </div>
         </fieldset>
 
@@ -239,7 +239,7 @@
                 <button type="button" class="macro-mode-btn" data-mode="rename">Rename</button>
                 <button type="button" class="macro-mode-btn" data-mode="clear">Clear</button>
                 <span class="help" tabindex="0" aria-label="Slot info"
-                      data-help="Pick a click-mode then tap a slot. Load reads slot N into the current macro buffer (the loaded slot gets a yellow ring). Save prompts for a name and writes the current buffer to slot N. Rename changes a saved slot's name without touching its events. Clear deletes slot N. Filled slots glow accent-blue with their name shown; empty slots are dim and tagged 'empty'.">?</span>
+                      data-help="Pick a click-mode then tap a slot. Load reads slot N into the current macro buffer (the loaded slot gets a yellow ring) and asks first if that would discard unsaved changes. Save prompts for a name and writes the current buffer to slot N. Rename changes a saved slot's name without touching its events. Clear deletes slot N and unassigns any active macro using it. Filled slots glow accent-blue with their name shown (hover for the full name); empty slots are dim and tagged 'empty'. Slots are locked while recording or playing.">?</span>
             </div>
             <div class="slot-grid">
                 <button type="button" class="slot" data-slot="1"><span class="slot-num">1</span><span class="slot-name">empty</span></button>
@@ -303,7 +303,7 @@
                 <button type="button" id="evt-save" class="btn-primary" disabled>Save</button>
                 <span class="evt-dirty-tag" id="evt-dirty-tag"></span>
                 <span class="help" tabindex="0" aria-label="Events info"
-                      data-help="Inspect and edit the events in the current macro buffer. Each row is a single key/mouse press or release at a given time. Edit time / device / key / event_type inline. Save replaces the buffer and (if a slot is currently loaded) writes back to that slot. Discard reverts your edits to the on-disk buffer. Times are seconds from the start of the macro and are sorted on Save.">?</span>
+                      data-help="Inspect and edit the events in the current macro buffer. Each row is a single key/mouse press or release at a given time. Edit time / device / key / event_type inline. Save replaces the buffer and (if a slot is currently loaded) writes back to that slot; if a different macro was loaded or recorded since you started editing, Save refuses instead of overwriting it. Rows with an unknown key or button are dropped on Save. Discard reverts your edits to the current buffer. Times are seconds from the start of the macro and are sorted on Save.">?</span>
             </div>
             <div class="evt-list-wrapper" id="evt-list-wrapper" hidden>
                 <table class="evt-table">

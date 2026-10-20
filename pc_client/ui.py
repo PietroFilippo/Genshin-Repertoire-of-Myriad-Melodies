@@ -137,6 +137,15 @@ from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
                      is_frozen, js_event_to_hotkey, load_settings,
                      macros_dir, make_input_backend, save_settings,
                      warn_if_not_admin)
+from ui_core import bot_options_for_settings, clamp_song_count, normalize_bot_options, normalize_difficulty
+from ui_core import normalize_hotkey, validate_hotkey
+from ui_core import FOCUS_GAME_NOT_FOUND, FOCUS_GAME_STOPPED, focus_game_window_ex
+# Imported defensively: a missing pyserial must only break the Arduino
+# path (make_input_backend imports controller lazily for the same reason).
+try:
+    from controller import ArduinoConnectionError
+except ImportError:
+    ArduinoConnectionError = RuntimeError
 
 
 def _resource_dir():
@@ -154,6 +163,9 @@ INDEX_PATH = WEB_DIR / 'index.html'
 ICON_PATH = _resource_dir() / 'assets' / 'icon.ico'
 
 POLL_MS = 50          # status drain cadence — matches Tk version
+# Unchanged status is re-pushed at most this often (keep-alive) — every
+# other tick pushes only when the status changed or there is log text.
+STATUS_KEEPALIVE_S = 1.0
 LOG_QUEUE_SIZE = 10000
 
 # Stable identity for Windows so the taskbar doesn't group us under
@@ -493,14 +505,20 @@ class BridgeApi:
         # always stored as a list of one or more difficulty names; a
         # single-element list reproduces the old single-difficulty
         # flat loop, multi-element triggers the per-position interleave
-        # in AlbumRunner.
+        # in AlbumRunner. Seeded from the persisted `bot_options` (mode,
+        # songs, difficulty, replay_canorus — validated field-by-field);
+        # `debug` always starts off.
         self._opts = {
-            'mode': 'standalone',
-            'songs': ALBUM_SONG_COUNT,
-            'difficulty': [ALBUM_DIFFICULTY],
-            'replay_canorus': False,
+            **normalize_bot_options(self._settings.get('bot_options')),
             'debug': False,
         }
+        # One-line Hu Tao theme reminder on the first Start of a session.
+        self._theme_reminder_shown = False
+        # Last backend-build failure message (user-facing), surfaced as
+        # the bot's last_error when the bot was the caller.
+        self._backend_error = ''
+        # Window rect saved by toggle_maximize (None = not maximized).
+        self._restore_rect = None
 
         self._status_lock = threading.Lock()
         self._status = {
@@ -509,6 +527,8 @@ class BridgeApi:
             'song': '',
             'fps': 0.0,
             'debug': False,
+            # Why the last bot run ended badly (cleared on every Start).
+            'last_error': '',
             'admin': is_admin(),
             'keybinds': dict(self._settings['keybinds']),
             'macro_state': MacroController.STATE_IDLE,
@@ -540,9 +560,15 @@ class BridgeApi:
         # Start / Record).
         self._arduino = None
         self._arduino_lock = threading.Lock()
+        # Serializes engine-ownership transitions — bot start, macro
+        # record/play start, backend switch — so two API/hotkey threads
+        # can't both observe "the other engine is idle" and start on the
+        # same backend. Reentrant so a *_force path can stop the other
+        # engine and start its own under one hold.
+        self._engine_lock = threading.RLock()
 
         self._bot = BotController(self._enqueue_status,
-                                  controller_provider=self._get_arduino)
+                                  controller_provider=self._bot_backend)
         self._macro = MacroController(controller_provider=self._get_arduino,
                                       on_status=self._enqueue_status)
         self._keybinds = KeybindManager(self._ui_hwnd)
@@ -565,6 +591,11 @@ class BridgeApi:
         # once the JS appendLog binding is reachable.
         sys.stdout = QueueWriter(self._log_queue, mirror=self._orig_stdout)
         sys.stderr = QueueWriter(self._log_queue, mirror=self._orig_stderr)
+        # First line in the log pane on every launch. If this version does
+        # not match what you just installed, you are running a different
+        # build. Must come after the redirect above, or a --windowed .exe
+        # (no console) never shows it.
+        print(f"[ui] Genshin Rhythm Bot v{APP_VERSION}")
         self._install_keybinds()
         self._drain_thread = threading.Thread(
             target=self._drain_loop, daemon=True, name='ui-drain')
@@ -578,6 +609,19 @@ class BridgeApi:
         if self._detached:
             return
         self._detached = True
+        # Hide the window before any blocking teardown. `closing` runs
+        # synchronously on the WinForms UI thread, and the bot / macro
+        # joins below can take seconds mid-album — hidden, that wait is
+        # invisible instead of a frozen window. Pure visibility change:
+        # the hook / drain / WebView2 ordering below is untouched
+        # (WebView2 is only disposed after this handler returns).
+        self._hide_window_for_teardown()
+        # Ask the bot to wind down now (non-blocking) so its exit overlaps
+        # the drain join + hook release; _bot.shutdown() below still joins.
+        try:
+            self._bot.stop()
+        except Exception:
+            pass
         sys.stdout = self._orig_stdout
         sys.stderr = self._orig_stderr
         self._stopping = True
@@ -640,9 +684,12 @@ class BridgeApi:
     # ---- JS-callable methods ----
 
     def get_initial_state(self):
+        with self._status_lock:
+            last_error = self._status.get('last_error', '')
         with self._lock:
             return {
                 **self._opts,
+                'last_error': last_error,
                 'admin': is_admin(),
                 'keybinds': dict(self._settings['keybinds']),
                 'difficulties': list(ALBUM_DIFFICULTY_COORDS),
@@ -657,19 +704,34 @@ class BridgeApi:
             }
 
     def start_stop(self):
-        if self._bot.is_running():
-            self._bot.stop()
-            return True
-        if self._macro.is_busy():
-            # Hotkey path arrives here — JS path uses start_stop_force
-            # after a confirm prompt. Refuse so we never run the bot
-            # concurrently with a macro on the same Arduino.
-            print('[ui] macro is active — stop it first '
-                  '(or use the UI Start button to confirm)')
-            return False
+        # Ownership check + start under _engine_lock so a macro Play /
+        # backend switch on another thread can't observe "bot idle" and
+        # start alongside us. Stop is non-blocking, so the hold is short.
+        with self._engine_lock:
+            if self._bot.is_running():
+                self._bot.stop()
+                return True
+            if self._macro.is_busy():
+                # Hotkey path arrives here — JS path uses start_stop_force
+                # after a confirm prompt. Refuse so we never run the bot
+                # concurrently with a macro on the same Arduino.
+                print('[ui] macro is active — stop it first '
+                      '(or use the UI Start button to confirm)')
+                return False
+            return self._start_bot_locked()
+
+    def _start_bot_locked(self):
+        """Start the bot with the current Main-tab options. Caller holds
+        _engine_lock and has checked that the macro is idle."""
         with self._lock:
             opts = dict(self._opts)
         mode = opts.pop('mode', 'standalone')
+        if not self._theme_reminder_shown:
+            self._theme_reminder_shown = True
+            print('[ui] Reminder: the rhythm detector needs the Hu Tao '
+                  'theme equipped in the rhythm minigame — other themes '
+                  'misread notes. Album mode also expects the game text '
+                  'in English.')
         ok = self._bot.start(mode, opts)
         if not ok:
             print('[ui] start failed (already running?)')
@@ -681,15 +743,30 @@ class BridgeApi:
         return True
 
     def toggle_debug(self):
-        if self._bot.is_running():
-            self._bot.toggle_debug()
+        """Live debug-viz toggle (F10 / JS). Only acts while running —
+        idle presets go through set_debug. Keeps _opts['debug'] in sync
+        so the checkbox and the next Start agree with the live state."""
+        with self._lock:
+            if self._bot.is_running():
+                self._opts['debug'] = bool(self._bot.toggle_debug())
         return True
 
     def set_mode(self, mode):
         if mode in ('standalone', 'album'):
             with self._lock:
                 self._opts['mode'] = mode
+                self._persist_bot_options_locked()
         return True
+
+    def _persist_bot_options_locked(self):
+        """Mirror the persisted subset of _opts (mode / songs / difficulty
+        / replay_canorus) into ui_settings.json. Caller holds self._lock —
+        same discipline as rebind's save. No-op when nothing changed."""
+        opts = bot_options_for_settings(self._opts)
+        if self._settings.get('bot_options') == opts:
+            return
+        self._settings['bot_options'] = opts
+        save_settings(self._settings)
 
     def restart_in_mode(self, mode):
         """Live mode switch from the JS layer. If the bot is running,
@@ -700,6 +777,7 @@ class BridgeApi:
             return False
         with self._lock:
             self._opts['mode'] = mode
+            self._persist_bot_options_locked()
             opts = dict(self._opts)
         opts.pop('mode', None)
 
@@ -716,21 +794,29 @@ class BridgeApi:
                 and old_state == BotController.STATE_RUNNING):
             opts['mid_song_start'] = True
 
-        if not self._bot.is_running():
-            return True
-        ok = self._bot.restart_in_mode(mode, opts)
+        # The whole stop → join → start runs under _engine_lock so a
+        # macro Play / backend switch can't slip in between the old run's
+        # exit and the new run's start. Bounded by BotController's 5 s
+        # join. BotController itself refuses the start if a Stop landed
+        # meanwhile (command generation) — the user's Stop always wins.
+        with self._engine_lock:
+            if not self._bot.is_running():
+                return True
+            if self._macro.is_busy():
+                return False
+            ok = self._bot.restart_in_mode(mode, opts)
         if not ok:
-            print(f'[ui] restart_in_mode({mode}) failed')
+            print(f'[ui] switch to {mode} mode did not start a new run '
+                  '(Stop requested, or the old run did not exit in time)')
         return bool(ok)
 
     def set_songs(self, n):
-        try:
-            n = int(n)
-        except (TypeError, ValueError):
+        n = clamp_song_count(n)
+        if n is None:
             return False
-        n = max(1, min(ALBUM_SONG_COUNT, n))
         with self._lock:
             self._opts['songs'] = n
+            self._persist_bot_options_locked()
         return True
 
     def set_difficulty(self, d):
@@ -740,58 +826,90 @@ class BridgeApi:
         4-element list) or a single difficulty string. Empty / fully-
         invalid input is rejected so the user can't end up with no
         difficulty selected."""
-        order = list(ALBUM_DIFFICULTY_COORDS)
-        if isinstance(d, (list, tuple)):
-            chosen = [x for x in d if isinstance(x, str)
-                      and x in ALBUM_DIFFICULTY_COORDS]
-            if not chosen:
-                return False
-            # Canonicalize ordering so [legendary, normal] and
-            # [normal, legendary] produce the same playback sequence.
-            seen = set(chosen)
-            normalized = [name for name in order if name in seen]
-        elif d == 'all':
-            normalized = list(order)
-        elif isinstance(d, str) and d in ALBUM_DIFFICULTY_COORDS:
-            normalized = [d]
-        else:
+        # Canonicalizes ordering so [legendary, normal] and
+        # [normal, legendary] produce the same playback sequence.
+        normalized = normalize_difficulty(d)
+        if not normalized:
             return False
         with self._lock:
             self._opts['difficulty'] = normalized
+            self._persist_bot_options_locked()
         return True
 
     def set_replay_canorus(self, v):
         with self._lock:
             self._opts['replay_canorus'] = bool(v)
+            self._persist_bot_options_locked()
         return True
 
     def set_debug(self, v):
+        """Checkbox → explicit SET, never a toggle: a toggle could fight
+        the F10 hotkey or a viz window the user already closed (which
+        clears the event without the checkbox having moved). While idle
+        this is just the preset the next Start uses."""
         v = bool(v)
         with self._lock:
             self._opts['debug'] = v
-        # If running, mirror checkbox into a live toggle so it matches the
-        # hotkey behavior (same shape as the Tk version).
-        if self._bot.is_running() and self._status.get('debug') != v:
-            self._bot.toggle_debug()
+            self._bot.set_debug(v)
         return True
 
     def rebind(self, action, payload):
-        """Translate a JS keydown payload to a `keyboard` package hotkey
-        and rebind. Returns the new hotkey string, or None on parse fail."""
-        hotkey = js_event_to_hotkey(payload)
-        if not hotkey:
-            return None
-        hotkey = hotkey.strip().lower()
+        """Translate a JS keydown / mousedown payload to a hotkey and
+        rebind `action`. Returns the new hotkey string, or
+        {'ok': False, 'reason': ...} with reason one of
+        'duplicate_hotkey', 'left_click_reserved', 'unsupported_key',
+        'rhythm_key', 'bad_action', 'install_failed'. Everything is
+        validated, installed and verified BEFORE the settings are saved,
+        so a refused key leaves the previous binding saved and installed
+        (it used to save first and then only log
+        "failed to bind" after the old binding was already gone)."""
+        if action not in BOT_ACTIONS and action not in MACRO_ACTIONS:
+            return {'ok': False, 'reason': 'bad_action'}
+        hotkey, reason = validate_hotkey(action, js_event_to_hotkey(payload))
+        if reason:
+            return {'ok': False, 'reason': reason}
         with self._lock:
             if self._hotkey_in_use_locked(hotkey, current_action=action):
                 return {'ok': False, 'reason': 'duplicate_hotkey'}
+            previous = self._settings['keybinds'].get(action)
             self._settings['keybinds'][action] = hotkey
-            save_settings(self._settings)
         self._install_keybinds()
+        if self._keybinds.get_bindings().get(action) != hotkey:
+            # Validated yet still not installed: restore the old binding
+            # instead of persisting one that does nothing.
+            with self._lock:
+                if self._settings['keybinds'].get(action) == hotkey:
+                    self._settings['keybinds'][action] = previous
+            self._install_keybinds()
+            return {'ok': False, 'reason': 'install_failed'}
+        with self._lock:
+            save_settings(self._settings)
+            keybinds = dict(self._settings['keybinds'])
         # Push the new keybind map immediately rather than waiting for the
         # next drain tick.
-        self._enqueue_status({'keybinds': dict(self._settings['keybinds'])})
+        self._enqueue_status({'keybinds': keybinds})
         return hotkey
+
+    @staticmethod
+    def _capture_token(token):
+        try:
+            return int(token) if token is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def capture_begin(self, token=None):
+        """JS opened a hotkey-capture prompt (Main or Macros tab). Every
+        global hotkey press is DROPPED until capture_end, so pressing F8 to
+        try it as a binding can't also stop the bot. Auto-expires after
+        KeybindManager.CAPTURE_SUSPEND_MAX_S in case capture_end is lost.
+        `token` (increasing per prompt) keeps out-of-order begin/end
+        bridge calls from cancelling a newer prompt's suspension."""
+        return bool(self._keybinds.suspend(token=self._capture_token(token)))
+
+    def capture_end(self, token=None):
+        """JS closed a capture prompt (bound, Esc, left click, blur,
+        timeout). Re-enables hotkeys unless a newer prompt is open."""
+        return bool(self._keybinds.resume(token=self._capture_token(token)))
 
     def clear_log(self):
         # JS already cleared the pane; just drain the backlog so a fast
@@ -805,66 +923,66 @@ class BridgeApi:
 
     # ---- macro (called from the Macros tab) ----
 
+    # Macro bridge methods return {'ok': bool, 'reason': str, 'message':
+    # str, ...}. `message` is human-readable; user-actionable failures are
+    # ALSO published as `macro_error` in the status so the Macros pill
+    # shows them (and in-game hotkey failures surface the same way).
+
     def macro_toggle_record(self, force=False):
         """Start or stop recording. If the bot is running, refuse unless
         `force` is set — JS prompts the user with window.confirm and
-        re-calls with force=True."""
-        if self._bot.is_running():
-            if not force:
-                return {'ok': False, 'reason': 'bot_running'}
-            self._stop_bot_blocking()
-        excluded_kb, excluded_mouse = self._macro_excluded_bindings()
-        ok = self._macro.toggle_record(excluded_kb=excluded_kb,
-                                       excluded_mouse=excluded_mouse)
-        return {'ok': bool(ok)}
+        re-calls with force=True. Check + (forced bot stop) + start run
+        under _engine_lock so a bot Start can't slip in between."""
+        if self._macro.state() == MacroController.STATE_RECORDING:
+            # Stopping takes over nothing — no engine hand-off needed.
+            return dict(self._macro.stop_record())
+        with self._engine_lock:
+            refusal = self._macro_claim_engine_locked(force)
+            if refusal is not None:
+                return refusal
+            excluded_kb, excluded_mouse = self._macro_excluded_bindings()
+            res = self._macro.toggle_record(excluded_kb=excluded_kb,
+                                            excluded_mouse=excluded_mouse)
+        return dict(res)
 
     def macro_play(self, force=False):
-        if self._bot.is_running():
-            if not force:
-                return {'ok': False, 'reason': 'bot_running'}
-            self._stop_bot_blocking()
-        # UI-button entry — user is in the UI, not the game. Pull
-        # Genshin to the foreground so HID keystrokes from playback
-        # land in the game, not the UI / desktop. Brief sleep covers
-        # the Win11 window-switch animation; without it the first
-        # event in a t≈0 macro can land on the UI window.
-        focus_game_window()
-        time.sleep(0.05)
-        return {'ok': bool(self._macro.play())}
+        with self._engine_lock:
+            refusal = self._macro_claim_engine_locked(force)
+            if refusal is not None:
+                return refusal
+            # Refusals that don't need the game (empty buffer, busy) are
+            # answered without yanking focus to Genshin first.
+            if (self._macro.state() != MacroController.STATE_RECORDING
+                    and self._macro.event_count() > 0):
+                # UI-button entry — user is in the UI, not the game. Pull
+                # Genshin to the foreground so keystrokes from playback
+                # land in the game, not the UI / desktop — and refuse if
+                # that can't be verified.
+                refusal = self._focus_game_for_macro()
+                if refusal is not None:
+                    return refusal
+            return self._explain_backend_failure(self._macro.play())
 
     def macro_stop(self):
-        return {'ok': bool(self._macro.stop_play())}
+        return dict(self._macro.stop_play())
 
-    def macro_save_slot(self, n, name=None):
-        try:
-            n = int(n)
-        except (TypeError, ValueError):
-            return {'ok': False, 'reason': 'bad_slot'}
-        return {'ok': bool(self._macro.save_slot(n, name=name))}
+    def macro_save_slot(self, n, name=None, expected_rev=None):
+        return dict(self._macro.save_slot(n, name=name,
+                                          expected_rev=expected_rev))
 
     def macro_load_slot(self, n):
-        try:
-            n = int(n)
-        except (TypeError, ValueError):
-            return {'ok': False, 'reason': 'bad_slot'}
-        return {'ok': bool(self._macro.load_slot(n))}
+        return dict(self._macro.load_slot(n))
 
     def macro_clear_slot(self, n):
-        try:
-            n = int(n)
-        except (TypeError, ValueError):
-            return {'ok': False, 'reason': 'bad_slot'}
-        ok = bool(self._macro.clear_slot(n))
-        if ok:
-            self._clear_active_slot_refs(n)
-        return {'ok': ok}
+        """Delete slot n. Active macros pointing at it are unassigned;
+        their letters come back in `unassigned` (e.g. ['B'])."""
+        res = dict(self._macro.clear_slot(n))
+        if res.get('ok'):
+            res['unassigned'] = self._clear_active_slot_refs(res.get('slot'))
+        return res
 
     def macro_rename_slot(self, n, name):
-        try:
-            n = int(n)
-        except (TypeError, ValueError):
-            return {'ok': False, 'reason': 'bad_slot'}
-        return {'ok': bool(self._macro.rename_slot(n, name))}
+        return dict(self._macro.rename_slot(n, name))
 
     # ---- input backend selector ----
 
@@ -878,39 +996,65 @@ class BridgeApi:
         name = (name or '').lower()
         if name not in ('arduino', 'software'):
             return {'ok': False, 'reason': 'bad_backend'}
-        with self._lock:
-            current = self._settings.get('input_backend', 'arduino')
-        if name == current:
-            return {'ok': True, 'reason': 'unchanged'}
-        if self._bot.is_running() or self._macro.is_busy():
-            if not force:
-                return {'ok': False, 'reason': 'busy'}
-            self._stop_bot_blocking()
-            self._stop_macro_blocking()
-        with self._arduino_lock:
-            ard = self._arduino
-            self._arduino = None
-        if ard is not None:
-            try:
-                ard.close()
-            except Exception as e:
-                print(f"[ui] backend close error during switch: {e}")
-        with self._lock:
-            self._settings['input_backend'] = name
-            save_settings(self._settings)
+        # Check → (forced stop) → swap all under _engine_lock so no bot /
+        # macro start can interleave. The joins inside are the existing
+        # bounded ones (bot 5 s, macro 2 s).
+        with self._engine_lock:
+            with self._lock:
+                current = self._settings.get('input_backend', 'arduino')
+            if name == current:
+                return {'ok': True, 'reason': 'unchanged'}
+            if self._bot.is_running() or self._macro.is_busy():
+                if not force:
+                    return {'ok': False, 'reason': 'busy'}
+                self._stop_bot_blocking()
+                self._stop_macro_blocking()
+                if self._bot.is_running() or self._macro.is_busy():
+                    # Never swap a backend out from under a live worker.
+                    print('[ui] bot/macro did not stop in time — input '
+                          'backend not switched; try again')
+                    return {'ok': False, 'reason': 'still_busy'}
+            # Flip the setting and drop the cached backend in ONE
+            # _arduino_lock hold. _get_arduino reads the setting under
+            # the same lock, so a lazy build can never produce the OLD
+            # backend type after this point (it used to: the setting was
+            # written only after close()). The old backend is closed while
+            # still holding the lock so a new Arduino can't try to open
+            # the COM port before the old handle is released.
+            with self._arduino_lock:
+                ard = self._arduino
+                self._arduino = None
+                with self._lock:
+                    self._settings['input_backend'] = name
+                    save_settings(self._settings)
+                if ard is not None:
+                    try:
+                        ard.close()
+                    except Exception as e:
+                        print(f"[ui] backend close error during switch: {e}")
         self._enqueue_status({'input_backend': name})
         print(f"[ui] input backend set to {name!r}")
         return {'ok': True}
 
     def macro_get_events(self):
-        """Returns the buffer for the events editor. Each event is
-        {time, device, key, event_type}."""
-        return self._macro.get_events()
+        """Buffer for the events editor: {'events': [{time, device, key,
+        event_type}, ...], 'rev': int, 'loaded': slot|0, 'dirty': bool,
+        'state': str}. The editor pins `rev` + `loaded` and sends them
+        back on Save."""
+        return self._macro.get_events_snapshot()
 
-    def macro_set_events(self, events):
-        """Replace the buffer with a JS-edited list. Returns ok=False
-        when the macro is busy (recording / playing)."""
-        return {'ok': bool(self._macro.set_events(events))}
+    def macro_set_events(self, events, expected_rev=None, expected_slot=None,
+                         persist=False):
+        """Replace the buffer with a JS-edited list. With `persist`, also
+        write it back to the loaded slot in the same command (no
+        set-then-save race). Refuses with reason 'stale' when the buffer
+        changed since the editor fetched `expected_rev` / `expected_slot`,
+        'empty' when persisting would leave a loaded slot with no events
+        (JS offers Clear slot instead), or recording / playing / busy.
+        Extras: rev, count, dropped, applied, saved_slot, loaded."""
+        return dict(self._macro.apply_events(
+            events, expected_rev=expected_rev, expected_slot=expected_slot,
+            persist=bool(persist)))
 
     def macro_get_active_config(self):
         with self._lock:
@@ -934,36 +1078,66 @@ class BridgeApi:
         if slot != 0 and not (1 <= slot <= MACRO_SLOT_COUNT):
             return {'ok': False, 'reason': 'bad_slot'}
         if slot and not (macros_dir() / f'macro_{slot}.json').exists():
-            return {'ok': False, 'reason': 'empty_slot'}
+            msg = f'Slot {slot} is empty - save a macro there first.'
+            self._macro.set_error(msg)
+            return {'ok': False, 'reason': 'empty_slot', 'message': msg}
+        duplicate_of = None
         with self._lock:
             active = self._active_macros_locked()
             if slot:
                 for i, item in enumerate(active):
                     if i != idx and item.get('slot') == slot:
-                        return {'ok': False, 'reason': 'duplicate_slot'}
-            active[idx]['slot'] = slot
-            self._settings['macro_active_macros'] = active
-            save_settings(self._settings)
+                        duplicate_of = i
+                        break
+            if duplicate_of is None:
+                active[idx]['slot'] = slot
+                self._settings['macro_active_macros'] = active
+                save_settings(self._settings)
+        if duplicate_of is not None:
+            # Used to snap the dropdown back with no explanation.
+            msg = (f'Slot {slot} is already assigned to active macro '
+                   f'{self._active_letter(duplicate_of)}.')
+            self._macro.set_error(msg)
+            return {'ok': False, 'reason': 'duplicate_slot', 'message': msg}
         self._install_keybinds()
         self._push_active_status()
+        self._macro.clear_error()
         return {'ok': True}
 
     def macro_set_active_hotkey(self, pos, payload):
         idx = self._active_macro_index(pos)
         if idx is None:
             return {'ok': False, 'reason': 'bad_index'}
-        hotkey = js_event_to_hotkey(payload)
-        if not hotkey:
-            return {'ok': False, 'reason': 'bad_hotkey'}
-        hotkey = hotkey.strip().lower()
+        # Same rules as rebind (left click / unmappable keys refused),
+        # checked before anything is saved.
+        hotkey, reason = validate_hotkey(
+            f'macro_active_{idx + 1}', js_event_to_hotkey(payload))
+        if reason:
+            return {'ok': False, 'reason': reason}
+        action = f'macro_active_{idx + 1}'
         with self._lock:
             if self._hotkey_in_use_locked(hotkey, current_active_index=idx):
                 return {'ok': False, 'reason': 'duplicate_hotkey'}
             active = self._active_macros_locked()
+            previous = active[idx].get('hotkey', '')
+            slot = active[idx].get('slot') or 0
             active[idx]['hotkey'] = hotkey
             self._settings['macro_active_macros'] = active
-            save_settings(self._settings)
         self._install_keybinds()
+        # Install + verify BEFORE saving, as in rebind. Only an entry with
+        # a slot is installed (see _install_keybinds); if that install
+        # failed, restore the previous hotkey instead of persisting one
+        # that does nothing.
+        if slot and self._keybinds.get_bindings().get(action) != hotkey:
+            with self._lock:
+                active = self._active_macros_locked()
+                if active[idx].get('hotkey') == hotkey:
+                    active[idx]['hotkey'] = previous
+                    self._settings['macro_active_macros'] = active
+            self._install_keybinds()
+            return {'ok': False, 'reason': 'install_failed'}
+        with self._lock:
+            save_settings(self._settings)
         self._push_active_status()
         return {'ok': True, 'hotkey': hotkey}
 
@@ -991,33 +1165,102 @@ class BridgeApi:
         return {'ok': True}
 
     def macro_play_active(self, pos, force=False):
-        if self._bot.is_running():
-            if not force:
-                return {'ok': False, 'reason': 'bot_running'}
-            self._stop_bot_blocking()
-        focus_game_window()
-        time.sleep(0.05)
-        return self._play_active_macro(pos)
+        idx = self._active_macro_index(pos)
+        if idx is None:
+            return {'ok': False, 'reason': 'bad_index'}
+        with self._engine_lock:
+            refusal = self._macro_claim_engine_locked(force)
+            if refusal is not None:
+                return refusal
+            with self._lock:
+                slot = self._active_macros_locked()[idx].get('slot') or 0
+            if (slot and self._macro.state() != MacroController.STATE_RECORDING
+                    and (macros_dir() / f'macro_{slot}.json').exists()):
+                refusal = self._focus_game_for_macro()
+                if refusal is not None:
+                    return refusal
+            return self._play_active_macro(pos)
+
+    def _macro_claim_engine_locked(self, force):
+        """Caller holds _engine_lock. None when the bot is idle (or was
+        force-stopped AND its worker really exited); otherwise a refusal
+        dict for JS: 'bot_running' (JS confirms, re-calls with force) or
+        'bot_stop_timeout' (the forced stop didn't finish — never start a
+        macro on a backend the bot may still be writing to)."""
+        if not self._bot.is_running():
+            return None
+        if not force:
+            return {'ok': False, 'reason': 'bot_running'}
+        if self._stop_bot_blocking() and not self._bot.is_running():
+            return None
+        msg = "The bot didn't stop in time - macro not started. Try again."
+        self._macro.set_error(msg)
+        return {'ok': False, 'reason': 'bot_stop_timeout', 'message': msg}
+
+    def _focus_game_for_macro(self):
+        """Bring Genshin to the front before UI-button playback and
+        verify it got there. None on success; otherwise a refusal dict
+        (also published as macro_error) — playback must never start
+        into the UI or whatever other window is in front."""
+        hwnd, reason = focus_game_window_ex(timeout=1.0,
+                                            stop_evt=self._drain_stop)
+        if hwnd:
+            # Brief settle covers the Win11 window-switch animation;
+            # without it the first event in a t≈0 macro can land on the
+            # UI window.
+            time.sleep(0.05)
+            return None
+        if reason == FOCUS_GAME_NOT_FOUND:
+            msg = "Genshin isn't running - start the game, then press Play."
+        elif reason == FOCUS_GAME_STOPPED:
+            return {'ok': False, 'reason': reason}
+        else:
+            msg = ("Couldn't bring Genshin to the front - click into the "
+                   "game and use the macro hotkey instead.")
+        self._macro.set_error(msg)
+        return {'ok': False, 'reason': reason, 'message': msg}
+
+    @staticmethod
+    def _active_letter(idx):
+        """Row label the UI shows for active macro index idx (A, B, C)."""
+        return chr(ord('A') + int(idx))
 
     def start_stop_force(self):
         """Same as start_stop but stops a running macro first. Called by
-        JS after the user confirms the cross-mode prompt."""
-        if self._macro.is_busy():
-            self._stop_macro_blocking()
-        return self.start_stop()
+        JS after the user confirms the cross-mode prompt. Returns
+        {'ok': bool}; {'ok': False, 'reason': 'busy'} when the macro did
+        not actually stop within its bounded wait — the bot is never
+        started alongside a still-running macro."""
+        with self._engine_lock:
+            if self._bot.is_running():
+                # Raced with another Start — never turn a force-START
+                # into a Stop.
+                return {'ok': True, 'reason': 'already_running'}
+            if self._macro.is_busy():
+                self._stop_macro_blocking()
+                if self._macro.is_busy():
+                    print('[ui] macro did not stop in time — bot not '
+                          'started; try again')
+                    return {'ok': False, 'reason': 'busy'}
+            return {'ok': bool(self._start_bot_locked())}
 
     def _stop_bot_blocking(self):
         """Synchronously stop the bot worker — bounded wait so a stuck
         worker doesn't freeze the UI thread. 5s matches BotController's
-        own shutdown join timeout."""
+        own shutdown join timeout. Returns True when the bot is no longer
+        running afterwards (callers must not take over the backend
+        otherwise)."""
         if not self._bot.is_running():
-            return
+            return True
         self._bot.stop()
         t = self._bot._thread
         if t is not None:
             t.join(timeout=5.0)
+        return not self._bot.is_running()
 
     def _stop_macro_blocking(self):
+        """Stop recording / playback synchronously (playback join bounded
+        at 2 s). Returns True when the macro is idle afterwards."""
         if self._macro.state() == MacroController.STATE_RECORDING:
             self._macro.stop_record()
         elif self._macro.state() == MacroController.STATE_PLAYING:
@@ -1025,6 +1268,7 @@ class BridgeApi:
             t = self._macro._play_thread
             if t is not None:
                 t.join(timeout=2.0)
+        return not self._macro.is_busy()
 
     def minimize(self):
         if self._window is not None:
@@ -1035,12 +1279,82 @@ class BridgeApi:
         return True
 
     def toggle_maximize(self):
-        if self._window is not None:
-            try:
-                self._window.toggle_fullscreen()
-            except Exception:
-                pass
-        return True
+        """Maximize to the monitor's WORK AREA (taskbar stays visible), or
+        restore the previous rect. Returns {'maximized': bool} so the
+        titlebar can swap its glyph.
+
+        Not window.toggle_fullscreen() (covers the taskbar — that was the
+        bug) and not window.maximize() either: for a frameless WinForms
+        form (FormBorderStyle.None) DefWindowProc sizes the maximized
+        window to the full monitor, i.e. it covers the taskbar too. So
+        snap the rect ourselves with plain Win32 calls."""
+        hwnd = self._ui_hwnd()
+        if not hwnd:
+            return {'maximized': self._restore_rect is not None}
+        try:
+            W = ctypes.wintypes
+            # Private WinDLL instance: the argtypes below must not leak
+            # onto the shared ctypes.windll.user32 function objects that
+            # other modules (and pywebview) call with their own args.
+            user32 = ctypes.WinDLL('user32')
+
+            class _MONITORINFO(ctypes.Structure):
+                _fields_ = [('cbSize', W.DWORD), ('rcMonitor', W.RECT),
+                            ('rcWork', W.RECT), ('dwFlags', W.DWORD)]
+
+            user32.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
+            user32.GetWindowRect.restype = W.BOOL
+            user32.MonitorFromWindow.argtypes = [W.HWND, W.DWORD]
+            user32.MonitorFromWindow.restype = W.HMONITOR
+            user32.GetMonitorInfoW.argtypes = [
+                W.HMONITOR, ctypes.POINTER(_MONITORINFO)]
+            user32.GetMonitorInfoW.restype = W.BOOL
+            user32.SetWindowPos.argtypes = [
+                W.HWND, W.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+            user32.SetWindowPos.restype = W.BOOL
+            SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
+            MONITOR_DEFAULTTONEAREST = 2
+
+            if self._restore_rect is None:
+                cur = W.RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(cur)):
+                    return {'maximized': False}
+                mi = _MONITORINFO()
+                mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                mon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                if not mon or not user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                    return {'maximized': False}
+                work = mi.rcWork
+                if user32.SetWindowPos(
+                        hwnd, None, work.left, work.top,
+                        work.right - work.left, work.bottom - work.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE):
+                    self._restore_rect = (cur.left, cur.top,
+                                          cur.right - cur.left,
+                                          cur.bottom - cur.top)
+            else:
+                x, y, w, h = self._restore_rect
+                self._restore_rect = None
+                user32.SetWindowPos(hwnd, None, x, y, w, h,
+                                    SWP_NOZORDER | SWP_NOACTIVATE)
+        except Exception as e:
+            print(f"[ui] maximize failed: {e}")
+        return {'maximized': self._restore_rect is not None}
+
+    def _hide_window_for_teardown(self):
+        """SW_HIDE the UI window (see detach). Uses only the cached HWND
+        — no lookups during teardown. Safe if the window is already gone
+        (`closed` fallback path)."""
+        hwnd = getattr(self, '_hwnd_cache', 0)
+        if not hwnd:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            if user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd):
+                user32.ShowWindow(hwnd, 0)  # SW_HIDE
+        except Exception:
+            pass
 
     def close(self):
         if self._window is not None:
@@ -1081,18 +1395,20 @@ class BridgeApi:
 
     def _hotkey_in_use_locked(self, hotkey, current_action=None,
                               current_active_index=None):
-        hotkey = (hotkey or '').strip().lower()
+        # Compare canonical forms so 'escape' == 'esc' and
+        # 'shift+ctrl+f8' == 'ctrl+shift+f8'.
+        hotkey = normalize_hotkey(hotkey)
         if not hotkey:
             return False
         for action, binding in self._settings.get('keybinds', {}).items():
             if action == current_action:
                 continue
-            if str(binding or '').strip().lower() == hotkey:
+            if normalize_hotkey(binding) == hotkey:
                 return True
         for i, item in enumerate(self._active_macros_locked()):
             if i == current_active_index:
                 continue
-            if str(item.get('hotkey') or '').strip().lower() == hotkey:
+            if normalize_hotkey(item.get('hotkey')) == hotkey:
                 return True
         return False
 
@@ -1107,19 +1423,24 @@ class BridgeApi:
         })
 
     def _clear_active_slot_refs(self, slot):
-        changed = False
+        """Unassign `slot` from every active macro (its hotkey stays
+        bound). Returns the affected row letters, e.g. ['B']."""
+        letters = []
         with self._lock:
             active = self._active_macros_locked()
-            for item in active:
+            for i, item in enumerate(active):
                 if item.get('slot') == slot:
                     item['slot'] = 0
-                    changed = True
-            if changed:
+                    letters.append(self._active_letter(i))
+            if letters:
                 self._settings['macro_active_macros'] = active
                 save_settings(self._settings)
-        if changed:
+        if letters:
+            print(f"[macro] slot {slot} unassigned from active macro "
+                  f"{', '.join(letters)}")
             self._install_keybinds()
             self._push_active_status()
+        return letters
 
     def _play_active_macro(self, pos):
         idx = self._active_macro_index(pos)
@@ -1133,8 +1454,20 @@ class BridgeApi:
                 'macro_conflict_policy', MACRO_CONFLICT_IGNORE)
         if not slot:
             return {'ok': False, 'reason': 'inactive'}
-        return {'ok': bool(self._macro.play_slot(
-            slot, conflict_policy=policy))}
+        return self._explain_backend_failure(
+            self._macro.play_slot(slot, conflict_policy=policy))
+
+    def _explain_backend_failure(self, res):
+        """MacroController only knows "no backend"; _get_arduino left the
+        real reason (port not found, ...) in _backend_error. Put it in the
+        user-facing macro_error."""
+        res = dict(res)
+        detail = getattr(self, '_backend_error', '')
+        if res.get('reason') == 'no_backend' and detail:
+            msg = f'Input backend unavailable: {detail}'
+            self._macro.set_error(msg)
+            res['message'] = msg
+        return res
 
     def _ui_hwnd(self):
         """HWND of the pywebview window. Cached after first successful
@@ -1239,37 +1572,51 @@ class BridgeApi:
 
     def _hotkey_debug(self):
         self._log_hotkey('debug')
-        if self._bot.is_running():
-            self._bot.toggle_debug()
+        # Same path as the JS toggle so _opts['debug'] stays in sync.
+        self.toggle_debug()
 
     # Macro hotkeys can't pop a confirmation dialog (no JS in this
     # thread), so cross-mode conflicts are refused with a log line. The
     # user can still trigger via UI buttons, which DO confirm.
+    #
+    # Starts (record / play / active) hold _engine_lock across the bot
+    # check + start so a bot Start can't slip in between. The record
+    # hotkey's own binding is passed through as `chord` so a modifier
+    # chord (ctrl+y) never leaks into the recording at either end.
     def _hotkey_macro_record(self):
         self._log_hotkey('macro_record')
-        if self._bot.is_running():
-            print('[macro] bot is running — stop bot first '
-                  '(or use the UI button to confirm)')
+        with self._lock:
+            chord = self._settings['keybinds'].get(ACTION_MACRO_RECORD)
+        if self._macro.state() == MacroController.STATE_RECORDING:
+            self._macro.stop_record(chord=chord)
             return
-        excluded = self._macro_excluded_bindings()
-        self._macro.toggle_record(excluded_kb=excluded[0],
-                                  excluded_mouse=excluded[1])
+        with self._engine_lock:
+            if self._bot.is_running():
+                print('[macro] bot is running — stop bot first '
+                      '(or use the UI button to confirm)')
+                return
+            excluded = self._macro_excluded_bindings()
+            self._macro.toggle_record(excluded_kb=excluded[0],
+                                      excluded_mouse=excluded[1],
+                                      chord=chord)
 
     def _hotkey_macro_play(self):
         self._log_hotkey('macro_play')
-        if self._bot.is_running():
-            print('[macro] bot is running — stop bot first '
-                  '(or use the UI button to confirm)')
-            return
-        self._macro.play()
+        with self._engine_lock:
+            if self._bot.is_running():
+                print('[macro] bot is running — stop bot first '
+                      '(or use the UI button to confirm)')
+                return
+            self._explain_backend_failure(self._macro.play())
 
     def _hotkey_macro_active(self, pos):
         self._log_hotkey(f'macro_active_{pos}')
-        if self._bot.is_running():
-            print('[macro] bot is running — stop bot first '
-                  '(or use the UI button to confirm)')
-            return
-        self._play_active_macro(pos)
+        with self._engine_lock:
+            if self._bot.is_running():
+                print('[macro] bot is running — stop bot first '
+                      '(or use the UI button to confirm)')
+                return
+            self._play_active_macro(pos)
 
     def _hotkey_macro_stop(self):
         self._log_hotkey('macro_stop')
@@ -1288,7 +1635,9 @@ class BridgeApi:
         Used so the macro hooks don't capture the very keys that control
         them (record-toggle, save, etc.). Modifier-combos like 'ctrl+y'
         are skipped — pressing bare 'y' won't trigger them, so the user
-        can still record 'y' if they want."""
+        can still record 'y' if they want. The record chord's own presses
+        at the start / end of a recording are filtered separately (the
+        `chord` argument of MacroController.start_record / stop_record)."""
         kb_names = set()
         mouse_btns = set()
         for binding in self._keybinds.get_bindings().values():
@@ -1301,28 +1650,76 @@ class BridgeApi:
                 kb_names.add(b)
         return kb_names, mouse_btns
 
-    def _get_arduino(self):
+    def _get_arduino(self, cancel_evt=None):
         """Lazy-build the chosen input backend (Arduino HID or
         software SendInput, per `_settings['input_backend']`). Returns
-        the controller or None on init failure. The Arduino backend
-        calls `sys.exit` on port-not-found so we trap SystemExit too —
-        UI keeps running so the user can fix wiring or switch to the
-        software backend. Failures don't latch: the next caller retries
-        from scratch."""
+        the controller or None on init failure (the user-facing reason is
+        left in `self._backend_error`). The Arduino backend raises
+        `ArduinoConnectionError` (older builds: `sys.exit`, so SystemExit
+        is still trapped) — UI keeps running so the user can fix wiring
+        or switch to the software backend. Failures don't latch: the next
+        caller retries from scratch.
+
+        A cached backend that reports `healthy == False` (e.g. the board
+        was unplugged mid-session) is closed and rebuilt rather than
+        handed out again. `cancel_evt` (the bot's stop event when the bot
+        worker is the caller) aborts the Arduino's ~2 s connect settle.
+
+        The setting is read under _arduino_lock — set_input_backend flips
+        it under the same lock, so a build here can't produce a stale
+        backend type mid-switch. Must never take _engine_lock: the bot
+        worker calls this while other threads may hold _engine_lock and
+        join that worker."""
         with self._arduino_lock:
-            if self._arduino is not None:
-                return self._arduino
+            ctrl = self._arduino
+            if ctrl is not None:
+                try:
+                    healthy = bool(getattr(ctrl, 'healthy', True))
+                except Exception:
+                    healthy = False
+                if healthy:
+                    return ctrl
+                print('[ui] input backend reported unhealthy — reconnecting')
+                self._arduino = None
+                try:
+                    ctrl.close()
+                except Exception as e:
+                    print(f'[ui] unhealthy backend close error: {e}')
             with self._lock:
                 backend = self._settings.get('input_backend', 'arduino')
+            self._backend_error = ''
             try:
-                self._arduino = make_input_backend(backend)
+                self._arduino = make_input_backend(backend,
+                                                   cancel_evt=cancel_evt)
+            except ArduinoConnectionError as e:
+                self._backend_error = (str(e) or
+                                       f'{backend} backend failed to start')
+                if cancel_evt is not None and cancel_evt.is_set():
+                    print(f'[ui] {backend} backend connect cancelled')
+                else:
+                    print(f'[ui] {backend} backend unavailable: '
+                          f'{self._backend_error}')
             except SystemExit:
+                self._backend_error = (
+                    f'{backend} backend failed to start — check the '
+                    'connection, or switch Input method in the Main tab')
                 print(f'[ui] {backend} backend init failed — '
                       'check connection and try again, or switch to '
                       'the other backend in the UI.')
             except Exception as e:
+                self._backend_error = f'{backend} backend error: {e}'
                 print(f'[ui] {backend} backend init error: {e}')
             return self._arduino
+
+    def _bot_backend(self, cancel_evt=None):
+        """BotController's controller_provider. Same shared instance as
+        the macro tool gets, but a failure raises with the user-facing
+        reason so BotController can show it as last_error ("Input backend
+        unavailable — <reason>") instead of silently falling back."""
+        ctrl = self._get_arduino(cancel_evt=cancel_evt)
+        if ctrl is None:
+            raise RuntimeError(self._backend_error or 'see Logs')
+        return ctrl
 
     def _log_hotkey(self, action):
         """Diagnostic — prints arrival timestamp + bot state. Enabled with
@@ -1337,12 +1734,57 @@ class BridgeApi:
         with self._status_lock:
             self._status.update(update)
 
+    def _sync_debug_opts(self):
+        """Fold the live debug-viz flag into _opts while the bot runs
+        (closing the viz window clears the event without going through
+        set_debug) and return what the UI shows: the live state while
+        running, the preset for the next Start otherwise."""
+        with self._lock:
+            if self._bot.is_running():
+                live = self._bot.debug_enabled
+                if self._opts.get('debug') != live:
+                    self._opts['debug'] = live
+            return bool(self._opts.get('debug'))
+
+    def _check_backend_health(self):
+        """While a bot run is live, surface a backend that died mid-run
+        (e.g. Arduino unplugged) as last_error — the detector keeps
+        "playing" into a dead link otherwise. Called ~1 Hz from the drain;
+        reading `healthy` is a non-blocking probe (see controller.py).
+        Only fills an empty last_error, so it fires once per run (Start
+        clears it) and never clobbers a more specific runner message."""
+        if not self._bot.is_running() or self._bot.is_stopping():
+            return
+        ctrl = self._arduino
+        if ctrl is None:
+            return
+        try:
+            healthy = bool(getattr(ctrl, 'healthy', True))
+        except Exception:
+            healthy = False
+        if healthy:
+            return
+        with self._lock:
+            backend = self._settings.get('input_backend', 'arduino')
+        msg = ('Arduino disconnected — press Stop, then Start to reconnect'
+               if backend == 'arduino' else
+               'Input backend stopped working — press Stop, then Start')
+        if self._bot.report_error(msg):
+            print(f'[ui] {msg}')
+
     def _drain_loop(self):
         """Single-thread drain: snapshot status + drain log queue every
         POLL_MS, push both to the page in one evaluate_js call. Decoupling
-        here keeps the JS channel quiet under burst log writes."""
+        here keeps the JS channel quiet under burst log writes. A tick
+        only pushes when the status changed or there is log text, plus a
+        STATUS_KEEPALIVE_S keep-alive so a push the page missed (not ready
+        yet, reload) self-heals — idle ticks no longer pay a blocking
+        evaluate_js."""
         period = POLL_MS / 1000.0
         next_tick = time.monotonic()
+        last_status = None
+        last_push = 0.0
+        last_health_check = 0.0
         while not self._drain_stop.is_set():
             try:
                 # Drain *all* queued log chunks each tick.
@@ -1352,10 +1794,21 @@ class BridgeApi:
                         chunks.append(self._log_queue.get_nowait())
                 except queue.Empty:
                     pass
+                if time.monotonic() - last_health_check >= 1.0:
+                    last_health_check = time.monotonic()
+                    self._check_backend_health()
+                debug = self._sync_debug_opts()
                 with self._status_lock:
                     status = dict(self._status)
-                    status['admin'] = is_admin()
-                self._push(status, ''.join(chunks) if chunks else '')
+                status['admin'] = is_admin()
+                status['debug'] = debug
+                log_text = ''.join(chunks) if chunks else ''
+                now = time.monotonic()
+                if (log_text or status != last_status
+                        or now - last_push >= STATUS_KEEPALIVE_S):
+                    if self._push(status, log_text):
+                        last_status = status
+                        last_push = now
             except Exception as e:
                 # Best-effort logging, but don't let drain crash on a
                 # transient evaluate_js failure (e.g. window torn down).
@@ -1373,8 +1826,10 @@ class BridgeApi:
                 next_tick = time.monotonic()
 
     def _push(self, status, log_text):
+        """One evaluate_js with status (+ log text). Returns True if the
+        call went through, False if skipped / failed (drain retries)."""
         if self._window is None or self._stopping:
-            return
+            return False
         # JSON-encode on the Python side so the JS argument is a literal
         # — avoids any worry about quote escaping in the evaluate_js
         # source string.
@@ -1391,7 +1846,8 @@ class BridgeApi:
         except Exception:
             # Window gone or page not ready yet — silent skip so the next
             # tick still runs.
-            pass
+            return False
+        return True
 
 
 def _on_closed(api):
@@ -1510,17 +1966,9 @@ def main():
 
     api = BridgeApi()
     icon = str(ICON_PATH) if ICON_PATH.exists() else None
-    # First line in the log pane on every launch. If this version does not
-    # match what you just installed, you are running a different build.
-    print(f"[ui] Genshin Rhythm Bot v{APP_VERSION}")
-    # Pay the `keyboard` package's ~110 ms scan-code table build NOW, on a
-    # background thread, instead of inside the first macro trigger. The
-    # input backend is built lazily on first use, so without this the very
-    # first hotkey press of a session carries the whole cost — visible in
-    # the log as "[input] software backend ready" landing between the
-    # press and the play. See mavuika-macros.md 4.28.
-    threading.Thread(target=_warm_input_stack, daemon=True,
-                     name='input-warmup').start()
+    # (The version banner is printed by attach_window, right after stdio
+    # is redirected — printed here it only reached the console, which a
+    # --windowed .exe doesn't have, so it never showed up in Logs.)
 
     window = webview.create_window(
         title=UI_WINDOW_TITLE,
@@ -1536,6 +1984,15 @@ def main():
     )
 
     api.attach_window(window)
+    # Pay the `keyboard` package's ~110 ms scan-code table build NOW, on a
+    # background thread, instead of inside the first macro trigger. The
+    # input backend is built lazily on first use, so without this the very
+    # first hotkey press of a session carries the whole cost — visible in
+    # the log as "[input] software backend ready" landing between the
+    # press and the play. See mavuika-macros.md 4.28. Started after
+    # attach_window so its log line reaches the Logs tab.
+    threading.Thread(target=_warm_input_stack, daemon=True,
+                     name='input-warmup').start()
     # Hook `closing` (fires before WebView2/Edge starts its own shutdown)
     # so we can release the keyboard / mouse subscribers + signal threads
     # to stop while the host browser is still alive. `closed` fires after
