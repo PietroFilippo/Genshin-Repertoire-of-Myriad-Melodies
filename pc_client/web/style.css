@@ -1640,6 +1640,9 @@ select option { background: var(--bg-2); color: var(--ink); }
    select's own value ("Score sheet" / "Light" / "Dark") names itself. */
 @media (max-width: 760px) {
     .hs-theme label { display: none; }
+    /* With "not admin" and "game not found" both showing, the default
+       gaps overflow the strip at 640 px and clip the Input help icon. */
+    .health { gap: 10px; padding: 0 10px; }
 }
 
 /* 640 px: the slot pill was ellipsized to nothing ("… unsaved"). The
@@ -1793,8 +1796,11 @@ html[data-maximized="1"] .rz { display: none; }
    10 px scrollbar (and a horizontal one, if ever) is never under a grab
    zone: a drag on the scrollbar scrolls, a drag in the 6 px gutter
    resizes. The gutter shows the page background like the panel itself,
-   so nothing visible changes. Maximized: no zones, so no gutter. */
-.panel { margin-right: var(--rz-edge); margin-bottom: var(--rz-edge); }
+   so nothing visible changes. Maximized: no zones, so no gutter. The
+   bottom gutter is the full corner size: the 12 px SE corner would
+   otherwise sit over the scrollbar thumb's lower tip when scrolled to
+   the end. */
+.panel { margin-right: var(--rz-edge); margin-bottom: var(--rz-corner); }
 html[data-maximized="1"] .panel { margin-right: 0; margin-bottom: 0; }
 
 /* --- events editor: the Key column ------------------------------------- */
