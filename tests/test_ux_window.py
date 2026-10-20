@@ -8,7 +8,11 @@ toggle_maximize persistence, the startup restore (exact rect, then
 re-maximize), the close-time save, settings sanitation for window_rect /
 window_maximized / theme, the launch-time on-screen check (off-screen
 fallback, frame compensation, oversize fit), set_theme persistence and
-get_initial_state's new fields (no side effects).
+get_initial_state's new fields (no side effects), and the
+interleavings from review (InterleavingTests: release-then-move,
+minimize mid-drag, stale resize saves vs maximize / close, a late
+resize step vs maximize, `shown` + `loaded` racing the startup
+restore).
 
 Every Win32 call goes through a fake _UiWin32 (api._win32 / win=), and
 BridgeApi instances are hand-built (object.__new__), so no window, hook or
@@ -87,6 +91,9 @@ class FakeWin:
     def button_down(self, vk):
         return bool(self.feed) or self.hold
 
+    def window_thread_id(self, hwnd):
+        return 0                    # never the test thread
+
     def is_zoomed(self, hwnd):
         return self.zoomed
 
@@ -162,14 +169,17 @@ class ResizeMathTests(unittest.TestCase):
 def _make_api(win=None, settings=None):
     api = object.__new__(ui.BridgeApi)
     api._lock = threading.Lock()
-    api._resize_lock = threading.Lock()
+    api._window_op_lock = threading.RLock()
     api._resize_thread = None
+    api._resize_cancel = None
     api._settings = dict(settings or {})
     api._tearing_down = False
     api._restore_rect = None
     api._normal_rect = None
+    api._geom_gen = 0
     api._startup_rect = None
     api._startup_maximize = False
+    api._startup_claimed = False
     api._hwnd_cache = HWND
     api._window = None
     api._win32 = win or FakeWin()
@@ -364,60 +374,58 @@ class MaximizeAndRestoreTests(unittest.TestCase):
         self.assertIsNone(api._restore_rect)
         self.save.assert_not_called()
 
-    def test_startup_maximize_is_one_shot_and_waits_for_hwnd(self):
-        win = FakeWin()
+    def test_startup_restore_waits_for_hwnd_and_is_one_shot(self):
+        win = FakeWin(rect=(300, 200, 1099, 851))     # a pixel off
         api = _make_api(win)
+        api._startup_rect = (300, 200, 1100, 850)
         api._startup_maximize = True
         api._hwnd_cache = 0
         with mock.patch.object(ui.BridgeApi, '_ui_hwnd', return_value=0):
-            self.assertFalse(api._apply_startup_maximize())
+            self.assertFalse(api._restore_startup_window())
         self.assertTrue(api._startup_maximize)          # still pending
+        self.assertIsNotNone(api._startup_rect)
         api._hwnd_cache = HWND
-        self.assertTrue(api._apply_startup_maximize())
+        self.assertTrue(api._restore_startup_window())
+        self.assertEqual(win.set_calls, [(300, 200, 1100, 850), win.work])
+        self.assertEqual(api._restore_rect, (300, 200, 800, 650))
         self.assertFalse(api._startup_maximize)
-        self.assertEqual(win.rect, win.work)
-        self.assertFalse(api._apply_startup_maximize())  # consumed
+        self.assertIsNone(api._startup_rect)
+        self.assertFalse(api._restore_startup_window())  # consumed
         self.assertEqual(api.toggle_maximize(), {'maximized': False})
+        self.assertEqual(win.rect, (300, 200, 1100, 850))
 
-    def test_startup_maximize_reads_maximized_throughout(self):
+    def test_startup_restore_without_maximize(self):
+        win = FakeWin(rect=(300, 200, 1100, 850))     # already exact
+        api = _make_api(win)
+        api._startup_rect = (300, 200, 1100, 850)
+        self.assertTrue(api._restore_startup_window())
+        self.assertEqual(win.set_calls, [])
+        self.assertEqual(api._normal_rect, (300, 200, 800, 650))
+        self.assertIsNone(api._restore_rect)
+
+    def test_startup_restore_reads_maximized_throughout(self):
         """The page / drain never see a one-tick "restored" while the
         startup re-maximize is in flight, and a second caller (`shown` +
-        `loaded`) doesn't toggle twice."""
+        `loaded`) doesn't run the sequence again."""
         api = _make_api(FakeWin())
         api._startup_maximize = True
         seen = []
 
         def fake_toggle():
             seen.append(api._is_maximized())
-            seen.append(api._apply_startup_maximize())     # concurrent call
+            seen.append(api._restore_startup_window())     # concurrent call
             api._restore_rect = (1, 2, 700, 700)
             return {'maximized': True}
         api.toggle_maximize = fake_toggle
-        self.assertTrue(api._apply_startup_maximize())
+        self.assertTrue(api._restore_startup_window())
         self.assertEqual(seen, [True, False])
         self.assertFalse(api._startup_maximize)
         self.assertTrue(api._is_maximized())
 
-    def test_startup_geometry_snaps_to_exact_rect_once(self):
-        win = FakeWin(rect=(300, 200, 1099, 851))     # a pixel off
-        api = _make_api(win)
-        api._startup_rect = (300, 200, 1100, 850)
-        self.assertTrue(api._apply_startup_geometry())
-        self.assertEqual(win.rect, (300, 200, 1100, 850))
-        self.assertEqual(api._normal_rect, (300, 200, 800, 650))
-        self.assertIsNone(api._startup_rect)
-        self.assertFalse(api._apply_startup_geometry())
-        self.assertEqual(len(win.set_calls), 1)
-
-    def test_startup_window_restores_rect_then_maximizes(self):
-        win = FakeWin(rect=(300, 200, 1100, 850))
-        api = _make_api(win)
-        api._startup_rect = (300, 200, 1100, 850)
-        api._startup_maximize = True
-        ui._apply_startup_window(api)
-        self.assertEqual(win.rect, win.work)
-        self.assertEqual(api._restore_rect, (300, 200, 800, 650))
-        self.assertEqual(win.set_calls, [win.work])     # rect already exact
+    def test_startup_window_hook_survives_errors(self):
+        api = _make_api(FakeWin())
+        api._restore_startup_window = mock.Mock(side_effect=OSError('x'))
+        ui._apply_startup_window(api)                   # no raise
 
 
 @unittest.skipIf(ui is None, 'ui.py not importable headless')
@@ -829,6 +837,281 @@ class DrainTrackingTests(unittest.TestCase):
         api._hwnd_cache = 0
         api._track_window_rect()
         self.assertEqual(api._normal_rect, (10, 20, 800, 700))
+
+
+class _TimelineClock:
+    """Stands in for ui's `time` module inside the resize loop: each
+    sleep() is one poll interval passing (TimelineWin.phase += 1), so what
+    the user does between two polls is scripted, not raced."""
+
+    def __init__(self, win):
+        self.win = win
+
+    def sleep(self, _secs):
+        self.win.phase += 1
+
+    @staticmethod
+    def monotonic():
+        return time.monotonic()
+
+
+class TimelineWin(FakeWin):
+    """Per-poll script of what the user does: phases[i] = (button held,
+    cursor, minimized) during poll interval i. The start cursor is what
+    start_window_resize reads (main thread); while minimized the window
+    reports Windows' (-32000, -32000) parking rect."""
+
+    MINIMIZED = (-32000, -32000, -31840, -31972)
+
+    def __init__(self, phases, start_cursor=(500, 500), **kw):
+        super().__init__(**kw)
+        self.phases = phases
+        self.phase = 0
+        self.start_cursor = start_cursor
+
+    def _now(self):
+        return self.phases[min(self.phase, len(self.phases) - 1)]
+
+    @staticmethod
+    def _resize_thread():
+        return threading.current_thread().name == 'ui-resize'
+
+    def cursor_pos(self):
+        return self._now()[1] if self._resize_thread() else self.start_cursor
+
+    def button_down(self, vk):
+        return self._now()[0]
+
+    def is_iconic(self, hwnd):
+        return self._resize_thread() and self._now()[2] or self.iconic
+
+    def window_rect(self, hwnd):
+        return self.MINIMIZED if self.is_iconic(hwnd) else self.rect
+
+
+class BlockingWin(FakeWin):
+    """Parks the resize thread inside its first window_rect read
+    (block='read') or SetWindowPos (block='set') until `release` is set —
+    the window in which another thread interleaves. A parked SetWindowPos
+    takes effect when released, like a message the UI thread processes
+    late."""
+
+    def __init__(self, block, **kw):
+        super().__init__(**kw)
+        self.block = block
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def _park(self, kind):
+        if (self.block == kind and not self.entered.is_set()
+                and threading.current_thread().name == 'ui-resize'):
+            self.entered.set()
+            self.release.wait(3.0)
+
+    def window_rect(self, hwnd):
+        self._park('read')
+        return super().window_rect(hwnd)
+
+    def set_window_rect(self, hwnd, rect):
+        self._park('set')
+        return super().set_window_rect(hwnd, rect)
+
+
+@unittest.skipIf(ui is None, 'ui.py not importable headless')
+class InterleavingTests(unittest.TestCase):
+    """Review findings P1-P5 (each failed on fdc3979)."""
+
+    def setUp(self):
+        p = mock.patch.object(ui, 'save_settings')
+        self.save = p.start()
+        self.addCleanup(p.stop)
+
+    def _join_resize(self, api):
+        t = api._resize_thread
+        t.join(3.0)
+        self.assertFalse(t.is_alive())
+
+    # P5 ------------------------------------------------------------------
+
+    def test_release_then_move_between_polls_applies_nothing_more(self):
+        win = TimelineWin([(True, (510, 500), False),
+                           (False, (600, 500), False)])   # released, moved
+        api = _make_api(win)
+        with mock.patch.object(ui, 'time', _TimelineClock(win)):
+            self.assertEqual(api.start_window_resize('e'), {'ok': True})
+            self._join_resize(api)
+        self.assertEqual(win.rect, (100, 100, 830, 820))   # +10 only
+        self.assertEqual(win.set_calls, [(100, 100, 830, 820)])
+        self.assertEqual(api._settings['window_rect']['width'], 730)
+
+    # P1 ------------------------------------------------------------------
+
+    def test_minimized_mid_drag_never_records_the_minimized_rect(self):
+        win = TimelineWin([(True, (510, 500), False),
+                           (True, (520, 500), True),        # minimized
+                           (False, (530, 500), True)])      # released
+        api = _make_api(win)
+        with mock.patch.object(ui, 'time', _TimelineClock(win)):
+            api.start_window_resize('e')
+            self._join_resize(api)
+        self.assertEqual(win.set_calls, [(100, 100, 830, 820)])
+        self.assertEqual(api._normal_rect, (100, 100, 730, 720))
+        self.assertEqual(api._settings['window_rect'],
+                         {'x': 100, 'y': 100, 'width': 730, 'height': 720})
+        # ...then closed while still minimized: the last restored rect.
+        win.iconic = True
+        api._tearing_down = True
+        api._persist_window_geometry_on_close()
+        self.assertEqual(api._settings['window_rect'],
+                         {'x': 100, 'y': 100, 'width': 730, 'height': 720})
+        self.assertIs(api._settings['window_maximized'], False)
+
+    def test_minimized_rect_is_never_tracked(self):
+        win = FakeWin(rect=(100, 100, 820, 820))
+        api = _make_api(win)
+        api._track_window_rect()
+        win.rect = TimelineWin.MINIMIZED         # IsIconic lagging behind
+        api._track_window_rect()
+        self.assertEqual(api._normal_rect, (100, 100, 720, 720))
+
+    # P2 ------------------------------------------------------------------
+
+    def _park_final_read(self, api, win):
+        win.feed = [(500, 500), (520, 500)]      # one step, then released
+        self.assertEqual(api.start_window_resize('e'), {'ok': True})
+        self.assertTrue(win.entered.wait(2.0))   # parked in its final read
+
+    def test_stale_resize_save_cannot_overwrite_close(self):
+        win = BlockingWin('read')
+        api = _make_api(win)
+        self._park_final_read(api, win)
+        # Maximize + close while the resize's final save is pending.
+        api._restore_rect = (100, 100, 720, 720)
+        api._tearing_down = True
+        api._persist_window_geometry_on_close()
+        self.assertIs(api._settings['window_maximized'], True)
+        win.release.set()
+        self._join_resize(api)
+        self.assertIs(api._settings['window_maximized'], True)
+        self.assertEqual(api._settings['window_rect'],
+                         {'x': 100, 'y': 100, 'width': 720, 'height': 720})
+
+    def test_stale_resize_save_cannot_overwrite_maximize(self):
+        win = BlockingWin('read')
+        api = _make_api(win)
+        self._park_final_read(api, win)
+        with mock.patch.object(ui, 'RESIZE_CANCEL_WAIT_S', 0.05,
+                               create=True):
+            self.assertEqual(api.toggle_maximize(), {'maximized': True})
+        self.assertIs(api._settings['window_maximized'], True)
+        win.release.set()
+        self._join_resize(api)
+        self.assertIs(api._settings['window_maximized'], True)
+        self.assertEqual(api._restore_rect, (100, 100, 740, 720))
+        self.assertEqual(api._normal_rect, (100, 100, 740, 720))
+
+    # P4 ------------------------------------------------------------------
+
+    def test_in_flight_resize_step_cannot_undo_the_maximize(self):
+        win = BlockingWin('set')
+        win.feed = [(500, 500), (520, 500)]
+        win.hold = True                          # still dragging
+        api = _make_api(win)
+        api.start_window_resize('e')
+        self.assertTrue(win.entered.wait(2.0))   # a SetWindowPos in flight
+        result = {}
+        toggler = threading.Thread(
+            target=lambda: result.update(api.toggle_maximize()))
+        toggler.start()
+        time.sleep(0.1)
+        win.release.set()                        # the late step lands
+        toggler.join(3.0)
+        self._join_resize(api)
+        self.assertEqual(result, {'maximized': True})
+        self.assertEqual(win.rect, win.work)
+        self.assertEqual(win.set_calls[-1], win.work)
+        self.assertEqual(api._restore_rect, (100, 100, 740, 720))
+
+    def test_no_resize_step_after_cancel(self):
+        win = FakeWin()
+        win.hold = True
+        api = _make_api(win)
+        api.start_window_resize('e')
+        self.assertTrue(api._cancel_resize(HWND))
+        n = len(win.set_calls)
+        win.cursor = (900, 900)
+        time.sleep(0.03)
+        self.assertEqual(len(win.set_calls), n)
+        self.save.assert_not_called()
+
+    def test_cancel_never_waits_on_the_window_thread(self):
+        win = FakeWin()
+        win.hold = True
+        win.window_thread_id = lambda hwnd: threading.get_native_id()
+        api = _make_api(win)
+        api.start_window_resize('e')
+        t0 = time.monotonic()
+        self.assertFalse(api._cancel_resize(HWND))   # cancelled, no join
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self._join_resize(api)
+
+    def test_resize_waits_for_a_running_maximize(self):
+        api = _make_api(FakeWin())
+        holding, done = threading.Event(), threading.Event()
+
+        def maximize_in_progress():
+            with api._window_op_lock:
+                holding.set()
+                done.wait(3.0)
+        h = threading.Thread(target=maximize_in_progress)
+        h.start()
+        self.assertTrue(holding.wait(1.0))
+        try:
+            with mock.patch.object(ui, 'RESIZE_START_WAIT_S', 0.05):
+                self.assertEqual(api.start_window_resize('e'),
+                                 {'ok': False, 'reason': 'busy'})
+        finally:
+            done.set()
+            h.join(2.0)
+        self.assertIsNone(api._resize_thread)
+
+    # P3 ------------------------------------------------------------------
+
+    def test_shown_and_loaded_cannot_split_restore_and_maximize(self):
+        target = (300, 200, 1100, 850)
+
+        class StartupWin(FakeWin):
+            def __init__(self):
+                super().__init__(rect=(300, 200, 1099, 851))
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def set_window_rect(self, hwnd, rect):
+                if tuple(rect) == target and not self.entered.is_set():
+                    self.entered.set()
+                    self.release.wait(3.0)
+                return super().set_window_rect(hwnd, rect)
+
+        win = StartupWin()
+        api = _make_api(win)
+        api._startup_rect = target
+        api._startup_maximize = True
+        shown = threading.Thread(target=ui._apply_startup_window, args=(api,))
+        shown.start()
+        self.assertTrue(win.entered.wait(2.0))   # mid-restore
+        loaded = threading.Thread(target=ui._apply_startup_window,
+                                  args=(api,))
+        loaded.start()
+        loaded.join(0.5)
+        win.release.set()
+        shown.join(3.0)
+        loaded.join(3.0)
+        self.assertEqual(win.rect, win.work)
+        self.assertEqual(api._restore_rect, (300, 200, 800, 650))
+        self.assertTrue(api._is_maximized())
+        self.assertEqual(win.set_calls.count(win.work), 1)
+        self.assertEqual(api.toggle_maximize(), {'maximized': False})
+        self.assertEqual(win.rect, target)
 
 
 if __name__ == '__main__':

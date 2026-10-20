@@ -531,6 +531,12 @@ RESIZE_POLL_S = 0.010
 # Hard cap on one resize — a lost button-up (secure desktop, ...) can't
 # leave the loop running forever.
 RESIZE_MAX_S = 60.0
+# toggle_maximize / the startup restore wait this long for a cancelled
+# resize's in-flight SetWindowPos to land before snapping.
+RESIZE_CANCEL_WAIT_S = 1.0
+# start_window_resize waits this long for a running maximize / startup
+# restore before answering 'busy'.
+RESIZE_START_WAIT_S = 2.0
 # How often the drain refreshes the remembered restored rect (one
 # GetWindowRect + IsIconic + IsZoomed — kernel reads, no messages).
 WINDOW_RECT_POLL_S = 1.0
@@ -603,6 +609,9 @@ class _UiWin32:
         u.AdjustWindowRectEx.argtypes = [
             ctypes.POINTER(W.RECT), W.DWORD, W.BOOL, W.DWORD]
         u.AdjustWindowRectEx.restype = W.BOOL
+        u.GetWindowThreadProcessId.argtypes = [
+            W.HWND, ctypes.POINTER(W.DWORD)]
+        u.GetWindowThreadProcessId.restype = W.DWORD
         # Windows 10 1607+; absent → scale 1.0.
         self._dpi_for_window = None
         self._dpi_for_system = None
@@ -668,6 +677,13 @@ class _UiWin32:
             return bool(self._u.GetAsyncKeyState(vk) & 0x8000)
         except Exception:
             return False
+
+    def window_thread_id(self, hwnd):
+        """Native id of the thread that owns `hwnd` (0 if unknown)."""
+        try:
+            return int(self._u.GetWindowThreadProcessId(hwnd, None))
+        except Exception:
+            return 0
 
     def is_zoomed(self, hwnd):
         try:
@@ -829,7 +845,7 @@ def initial_window_geometry(settings, win=None):
     """(create_window kwargs {width, height, x, y} in logical px, target)
     from the remembered `window_rect`. `target` is the exact physical
     (left, top, right, bottom) the window should end up at — applied once
-    it is shown (BridgeApi._apply_startup_geometry) — or None.
+    it is shown (BridgeApi._restore_startup_window) — or None.
 
     Falls back to the default size centered (x = y = None → WinForms
     CenterScreen, target None) when there is no rect, Win32 fails, or its
@@ -929,19 +945,26 @@ class BridgeApi:
         # Last known restored (not maximized / minimized) window rect,
         # refreshed ~1 Hz by the drain, after a resize and before a
         # maximize; what detach persists when the window is minimized or
-        # maximized at close. None until first seen.
+        # maximized at close. None until first seen. Never a minimized /
+        # maximized rect (see "remembered geometry" below).
         self._normal_rect = None
+        # Bumped under _lock by every geometry owner; stale writers drop.
+        self._geom_gen = 0
         # Exact physical rect to put the window at once it is shown (the
-        # remembered one; set by main() from initial_window_geometry).
-        # One shot — consumed by _apply_startup_geometry.
+        # remembered one; set by main() from initial_window_geometry) and
+        # whether to re-maximize then (it was maximized at the last
+        # close). One shot, claimed once by _restore_startup_window.
         self._startup_rect = None
-        # Re-maximize once the window is shown (it was maximized at the
-        # last close). One shot — consumed by _apply_startup_maximize.
         self._startup_maximize = self._settings.get('window_maximized') is True
-        self._startup_maximize_claimed = False
-        # One edge / corner resize at a time (start_window_resize).
-        self._resize_lock = threading.Lock()
+        self._startup_claimed = False
+        # Serializes the geometry owners — toggle_maximize, the startup
+        # restore, starting a resize. Reentrant (the startup restore calls
+        # toggle_maximize). Never taken on the UI thread: holders may wait
+        # on it inside a cross-thread SetWindowPos.
+        self._window_op_lock = threading.RLock()
+        # The one running edge / corner resize and its cancel event.
         self._resize_thread = None
+        self._resize_cancel = None
         # _UiWin32 override for tests; None = the process-wide instance.
         self._win32 = None
         # Set once the user agreed to discard unsaved macro work (in-app
@@ -2003,89 +2026,108 @@ class BridgeApi:
         snap the rect ourselves with plain Win32 calls (_UiWin32: a
         private WinDLL('user32') with explicit prototypes).
 
-        Also persists `window_maximized` + the restored rect, so the next
-        launch reopens the same way (see _apply_startup_maximize)."""
+        Owns the geometry while it runs (_window_op_lock): bumps the
+        geometry generation, cancels a running edge resize and waits for
+        its in-flight SetWindowPos (bounded; never on the window's own
+        thread), so a late resize step can't undo the snap. Persists
+        `window_maximized` + the restored rect. No-op once closing."""
         hwnd = self._ui_hwnd()
-        if not hwnd:
+        if not hwnd or self._tearing_down:
             return {'maximized': self._restore_rect is not None}
-        changed = False
-        try:
-            win = self._win()
-            if self._restore_rect is None:
-                cur = win.window_rect(hwnd)
-                if cur is None:
-                    return {'maximized': False}
-                work = win.monitor_work_area(hwnd)
-                if work is None:
-                    return {'maximized': False}
-                if win.set_window_rect(hwnd, work):
-                    self._restore_rect = (cur[0], cur[1],
-                                          cur[2] - cur[0], cur[3] - cur[1])
-                    if not (win.is_zoomed(hwnd) or win.is_iconic(hwnd)):
-                        self._normal_rect = self._restore_rect
-                    changed = True
-            else:
-                x, y, w, h = self._restore_rect
-                self._restore_rect = None
-                win.set_window_rect(hwnd, (x, y, x + w, y + h))
-                self._normal_rect = (x, y, w, h)
-                changed = True
-        except Exception as e:
-            print(f"[ui] maximize failed: {e}")
-        maximized = self._restore_rect is not None
-        if changed:
-            self._save_window_geometry(
-                self._restore_rect or self._normal_rect, maximized, hwnd)
-        return {'maximized': maximized}
+        with self._window_op_lock:
+            self._bump_geom_gen()
+            self._cancel_resize(hwnd)
+            saved = None
+            try:
+                win = self._win()
+                if self._restore_rect is None:
+                    if win.is_iconic(hwnd):
+                        return {'maximized': False}
+                    # The restored rect: the live one, or — natively
+                    # zoomed (Win+Up) — the last one seen restored.
+                    restore = (self._read_normal_rect(win, hwnd)
+                               or self._normal_rect)
+                    if restore is None:
+                        cur = win.window_rect(hwnd)
+                        if cur is None:
+                            return {'maximized': False}
+                        restore = (cur[0], cur[1],
+                                   cur[2] - cur[0], cur[3] - cur[1])
+                    work = win.monitor_work_area(hwnd)
+                    if work is None:
+                        return {'maximized': False}
+                    if win.set_window_rect(hwnd, work):
+                        self._restore_rect = restore
+                        saved = restore
+                else:
+                    x, y, w, h = self._restore_rect
+                    self._restore_rect = None
+                    win.set_window_rect(hwnd, (x, y, x + w, y + h))
+                    saved = (x, y, w, h)
+            except Exception as e:
+                print(f"[ui] maximize failed: {e}")
+            maximized = self._restore_rect is not None
+            if saved is not None:
+                self._save_window_geometry(saved, maximized, hwnd,
+                                           normal=True)
+            return {'maximized': maximized}
 
-    def _apply_startup_geometry(self):
-        """Put the just-shown window exactly at the remembered rect
-        (_startup_rect) when it isn't there already — create_window's
-        logical size is frame-compensated but can be a pixel off after
-        DPI rounding. One shot, consumed once the HWND is known."""
-        target = getattr(self, '_startup_rect', None)
-        if target is None or self._tearing_down:
+    def _restore_startup_window(self):
+        """Once the window is shown: snap it to the exact remembered rect
+        (_startup_rect — create_window's frame-compensated logical size can
+        be a pixel off after DPI rounding), then work-area maximize it if
+        it was maximized at the last close (not
+        create_window(maximized=True), which for a frameless form covers
+        the taskbar; Restore then returns to that rect).
+
+        `shown` and `loaded` both call this, on two threads: the WHOLE
+        restore-then-maximize sequence is claimed once under _lock (the
+        claim is released before any Win32 call) and runs under
+        _window_op_lock, so the other caller can neither maximize before
+        the restore nor restore after the maximize. Stays pending until
+        the HWND resolves; _startup_maximize is cleared only at the end,
+        so _is_maximized() never reads a one-tick False in between."""
+        if self._tearing_down:
+            return False
+        if (getattr(self, '_startup_rect', None) is None
+                and not getattr(self, '_startup_maximize', False)):
             return False
         hwnd = self._ui_hwnd()
         if not hwnd:
-            return False
-        self._startup_rect = None
-        win = self._win()
-        cur = win.window_rect(hwnd)
-        moved = False
-        if cur != tuple(target):
-            moved = win.set_window_rect(hwnd, target)
-            print(f"[ui] window restored to {target} (was {cur})")
-        l, t, r, b = target
-        if moved or cur == tuple(target):
-            self._normal_rect = (l, t, r - l, b - t)
-        return moved
-
-    def _apply_startup_maximize(self):
-        """Re-maximize (work area, via toggle_maximize) a window that was
-        maximized at the last close. Called once the window is shown —
-        not create_window(maximized=True), which for a frameless form
-        covers the taskbar. The window was created at the remembered
-        restored rect, so Restore returns there. One shot, consumed only
-        once the HWND is known (`shown` and `loaded` both call this)."""
-        if not getattr(self, '_startup_maximize', False):
-            return False
-        if self._tearing_down or not self._ui_hwnd():
             return False
         with self._lock:
-            # `shown` and `loaded` run this on two threads: one claims it.
-            if (not self._startup_maximize
-                    or getattr(self, '_startup_maximize_claimed', False)):
+            if getattr(self, '_startup_claimed', False):
                 return False
-            self._startup_maximize_claimed = True
+            self._startup_claimed = True
+            target = self._startup_rect
+            maximize = self._startup_maximize
         try:
-            if self._restore_rect is not None:
-                return False
-            return bool(self.toggle_maximize().get('maximized'))
+            with self._window_op_lock:
+                self._cancel_resize(hwnd)
+                if target is not None and not self._tearing_down:
+                    self._restore_startup_rect(hwnd, tuple(target))
+                if (maximize and not self._tearing_down
+                        and self._restore_rect is None):
+                    self.toggle_maximize()
         finally:
-            # Cleared only now, so _is_maximized() never reads False in
-            # between (the drain would push a one-tick "restored").
-            self._startup_maximize = False
+            with self._lock:
+                self._startup_rect = None
+                self._startup_maximize = False
+        return True
+
+    def _restore_startup_rect(self, hwnd, target):
+        win = self._win()
+        cur = win.window_rect(hwnd)
+        ok = cur == target
+        if not ok:
+            ok = win.set_window_rect(hwnd, target)
+            print(f"[ui] window restored to {target} (was {cur})")
+        if ok:
+            l, t, r, b = target
+            with self._lock:
+                self._normal_rect = (l, t, r - l, b - t)
+                self._geom_gen = getattr(self, '_geom_gen', 0) + 1
+        return ok
 
     # ---- frameless resize (start_window_resize) ----
 
@@ -2101,7 +2143,8 @@ class BridgeApi:
         {'ok': False, 'reason': ...}: 'bad_edge' (anything not listed),
         'maximized' (maximized or minimized — like a native window, a
         maximized one has no resize edges; Restore first), 'busy' (a resize
-        is already running), 'closing', 'no_window', 'win32_failed'.
+        or a maximize is already running), 'closing', 'no_window',
+        'win32_failed'.
 
         Why a polling thread and not ReleaseCapture + WM_NCLBUTTONDOWN
         (HTLEFT...) → DefWindowProc's native sizing loop: the press lands
@@ -2122,7 +2165,11 @@ class BridgeApi:
         if not hwnd:
             return {'ok': False, 'reason': 'no_window'}
         win = self._win()
-        with self._resize_lock:
+        # Serialized with toggle_maximize / the startup restore: a resize
+        # never starts in the middle of a snap.
+        if not self._window_op_lock.acquire(timeout=RESIZE_START_WAIT_S):
+            return {'ok': False, 'reason': 'busy'}
+        try:
             t = self._resize_thread
             if t is not None and t.is_alive():
                 return {'ok': False, 'reason': 'busy'}
@@ -2137,59 +2184,147 @@ class BridgeApi:
             # Same int(min * scale) pywebview used for MinimumSize.
             min_w = int(UI_WINDOW_MIN_SIZE[0] * scale)
             min_h = int(UI_WINDOW_MIN_SIZE[1] * scale)
+            cancel = threading.Event()
             t = threading.Thread(
                 target=self._resize_loop,
                 args=(hwnd, edge, start, cursor, min_w, min_h,
-                      win.primary_button_vk(), win),
+                      win.primary_button_vk(), win,
+                      getattr(self, '_geom_gen', 0), cancel),
                 daemon=True, name='ui-resize')
+            self._resize_cancel = cancel
             self._resize_thread = t
             t.start()
+        finally:
+            self._window_op_lock.release()
         return {'ok': True}
 
     def _resize_loop(self, hwnd, edge, start, cursor, min_w, min_h, vk,
-                     win):
-        """Follow the cursor every RESIZE_POLL_S until the button `vk` is
-        up, teardown starts, the window gets maximized, or RESIZE_MAX_S
-        passes. The cursor is read before the button so the last applied
-        size is where the button was released. Holds no lock while
-        SetWindowPos waits on the UI thread. Persists the final rect
-        (unless tearing down — detach persists then — or maximized —
-        toggle_maximize did)."""
+                     win, gen, cancel):
+        """Follow the cursor every RESIZE_POLL_S while the button `vk` is
+        held. Each poll checks the button FIRST — once it is up nothing
+        more is applied (a move after the release must not resize) — then
+        stops if the window got minimized / natively maximized, and
+        re-checks `live` right before every SetWindowPos. `live` ends with
+        teardown, a toggle_maximize / startup restore (cancel event,
+        geometry generation, _restore_rect) or RESIZE_MAX_S. Holds no lock
+        while SetWindowPos waits on the UI thread. Then commits the final
+        restored rect (_finish_resize)."""
         sx, sy = cursor
         last = start
         deadline = time.monotonic() + RESIZE_MAX_S
+
+        def live():
+            return not (cancel.is_set() or self._tearing_down
+                        or self._restore_rect is not None
+                        or getattr(self, '_geom_gen', 0) != gen
+                        or time.monotonic() >= deadline)
         try:
-            while (not self._tearing_down and self._restore_rect is None
-                   and time.monotonic() < deadline):
+            while live():
+                if not win.button_down(vk):
+                    break
+                if win.is_iconic(hwnd) or win.is_zoomed(hwnd):
+                    break
                 pos = win.cursor_pos()
                 if pos is not None:
                     rect = resize_rect(edge, start, pos[0] - sx, pos[1] - sy,
                                        min_w, min_h)
-                    if rect != last and win.set_window_rect(hwnd, rect):
-                        last = rect
-                if not win.button_down(vk):
-                    break
+                    if rect != last:
+                        if not live():
+                            break
+                        if win.set_window_rect(hwnd, rect):
+                            last = rect
                 time.sleep(RESIZE_POLL_S)
         except Exception as e:
             print(f"[ui] window resize failed: {e}")
-        if self._tearing_down or self._restore_rect is not None:
-            return
+        if (cancel.is_set() or self._tearing_down
+                or self._restore_rect is not None
+                or getattr(self, '_geom_gen', 0) != gen):
+            return              # the new owner (toggle / detach) saves
         try:
-            final = win.window_rect(hwnd) or last
-            self._normal_rect = (final[0], final[1],
-                                 final[2] - final[0], final[3] - final[1])
-            self._save_window_geometry(self._normal_rect, False, hwnd, win)
+            self._finish_resize(win, hwnd, gen, start, last)
         except Exception as e:
             print(f"[ui] window size not saved: {e}")
 
-    # ---- remembered geometry ----
+    def _finish_resize(self, win, hwnd, gen, start, last):
+        """Record + persist the rect a resize left. The live rect when the
+        window is restored; minimized / natively maximized meanwhile, the
+        last rect this resize applied while it was restored — never the
+        minimized / maximized one. Generation-checked under _lock
+        (_save_window_geometry): dropped if a toggle / startup restore /
+        close took over after `gen` was read."""
+        rect = self._read_normal_rect(win, hwnd)
+        if rect is None:
+            if last == start:
+                return
+            rect = (last[0], last[1], last[2] - last[0], last[3] - last[1])
+        self._save_window_geometry(rect, False, hwnd, win, gen=gen,
+                                   normal=True)
 
-    def _save_window_geometry(self, rect, maximized, hwnd=None, win=None):
+    def _cancel_resize(self, hwnd=0):
+        """Stop a running resize and wait (RESIZE_CANCEL_WAIT_S) for its
+        in-flight SetWindowPos to land. Never waits on the resize thread
+        itself or on the window's own (UI) thread — the resize's
+        SetWindowPos may be parked waiting for exactly that thread. True
+        when no resize is running afterwards."""
+        t = getattr(self, '_resize_thread', None)
+        cancel = getattr(self, '_resize_cancel', None)
+        if t is None or not t.is_alive():
+            return True
+        if cancel is not None:
+            cancel.set()
+        if t is threading.current_thread() or self._on_window_thread(hwnd):
+            return False
+        t.join(RESIZE_CANCEL_WAIT_S)
+        return not t.is_alive()
+
+    def _on_window_thread(self, hwnd):
+        if not hwnd:
+            return False
+        try:
+            tid = self._win().window_thread_id(hwnd)
+        except Exception:
+            return False
+        return bool(tid) and tid == threading.get_native_id()
+
+    # ---- remembered geometry ----
+    # _restore_rect: the pre-maximize rect while work-area maximized.
+    # _normal_rect: the last rect seen while RESTORED — never a minimized
+    #   (-32000, -32000) or maximized one; what close persists when the
+    #   window is minimized / maximized then.
+    # _geom_gen: bumped under _lock by every geometry owner (toggle, the
+    #   startup restore, a committed resize, close). A writer that read
+    #   the window before a bump drops its stale result.
+
+    def _bump_geom_gen(self):
+        with self._lock:
+            self._geom_gen = getattr(self, '_geom_gen', 0) + 1
+
+    @staticmethod
+    def _read_normal_rect(win, hwnd):
+        """(x, y, w, h) while the window is restored, else None. Checked
+        before AND after the read, so a minimize / maximize landing in
+        between can't slip its rect through."""
+        if win.is_iconic(hwnd) or win.is_zoomed(hwnd):
+            return None
+        r = win.window_rect(hwnd)
+        if r is None or win.is_iconic(hwnd) or win.is_zoomed(hwnd):
+            return None
+        if r[0] <= -32000 and r[1] <= -32000:       # minimized position
+            return None
+        return (r[0], r[1], r[2] - r[0], r[3] - r[1])
+
+    def _save_window_geometry(self, rect, maximized, hwnd=None, win=None,
+                              gen=None, normal=False, final=False):
         """Persist `window_rect` (from `rect` = physical (x, y, w, h),
         converted to logical px with the window's DPI; None keeps the saved
-        one) and `window_maximized`. Writes only when something changed.
-        Bounded wait on self._lock — this also runs on the UI thread at
-        close."""
+        one) and `window_maximized`; writes only when something changed.
+
+        Decided under self._lock (bounded wait — close runs this on the UI
+        thread): once teardown began only the close save (`final`) goes
+        through, and it bumps the generation; a `gen`-stamped save (a
+        resize) is dropped when the generation moved or the window is
+        maximized. `normal=True` also records `rect` as _normal_rect (and
+        bumps the generation) in the same step."""
         upd = {'window_maximized': bool(maximized)}
         if rect is not None:
             win = win or self._win()
@@ -2204,6 +2339,16 @@ class BridgeApi:
             print('[ui] window size not saved (settings busy)')
             return False
         try:
+            if self._tearing_down and not final:
+                return False
+            if gen is not None and (
+                    getattr(self, '_geom_gen', 0) != gen
+                    or self._restore_rect is not None):
+                return False
+            if normal or final:
+                self._geom_gen = getattr(self, '_geom_gen', 0) + 1
+            if normal and rect is not None:
+                self._normal_rect = tuple(rect)
             if all(self._settings.get(k) == v for k, v in upd.items()):
                 return False
             self._settings.update(upd)
@@ -2213,26 +2358,32 @@ class BridgeApi:
             self._lock.release()
 
     def _track_window_rect(self):
-        """Drain-side (~1 Hz): remember the restored rect while the window
-        is neither work-area maximized, minimized nor natively zoomed.
-        Cached HWND only; never raises."""
+        """Drain-side (~1 Hz) and close: remember the restored rect while
+        the window is neither work-area maximized, minimized nor natively
+        zoomed. Committed only if no geometry owner bumped the generation
+        since the read. Cached HWND only; never raises."""
         try:
             hwnd = getattr(self, '_hwnd_cache', 0)
             if not hwnd or getattr(self, '_restore_rect', None) is not None:
                 return
-            win = self._win()
-            if win.is_iconic(hwnd) or win.is_zoomed(hwnd):
+            gen = getattr(self, '_geom_gen', 0)
+            r = self._read_normal_rect(self._win(), hwnd)
+            if r is None or not self._lock.acquire(timeout=0.2):
                 return
-            r = win.window_rect(hwnd)
-            if r is not None:
-                self._normal_rect = (r[0], r[1], r[2] - r[0], r[3] - r[1])
+            try:
+                if (getattr(self, '_geom_gen', 0) == gen
+                        and self._restore_rect is None):
+                    self._normal_rect = r
+            finally:
+                self._lock.release()
         except Exception:
             pass
 
     def _persist_window_geometry_on_close(self):
-        """detach(): save the restored rect + maximized flag. A window
-        closed while minimized / natively maximized keeps the last rect
-        the drain saw. Cached HWND only; never raises."""
+        """detach(): save the restored rect + maximized flag — the last
+        word (`final`; _tearing_down already makes every other save drop).
+        A window closed while minimized / natively maximized keeps the
+        last restored rect. Cached HWND only; never raises."""
         try:
             hwnd = getattr(self, '_hwnd_cache', 0)
             if not hwnd:
@@ -2242,7 +2393,8 @@ class BridgeApi:
             restore = getattr(self, '_restore_rect', None)
             maximized = restore is not None or win.is_zoomed(hwnd)
             rect = restore or getattr(self, '_normal_rect', None)
-            self._save_window_geometry(rect, maximized, hwnd, win)
+            self._save_window_geometry(rect, maximized, hwnd, win,
+                                       final=True)
         except Exception as e:
             print(f"[ui] window size not saved: {e}")
 
@@ -3089,13 +3241,12 @@ def _apply_startup_window(api):
     """Now that the HWND is real (after _on_shown's taskbar-button
     refresh): snap to the exact remembered rect, then work-area maximize
     if the window was maximized at the last close (Restore then returns
-    to that rect). Each step is one shot and stays pending until the
-    HWND resolves."""
-    for step in (api._apply_startup_geometry, api._apply_startup_maximize):
-        try:
-            step()
-        except Exception as e:
-            print(f"[ui] startup window restore failed: {e}")
+    to that rect). One claimed sequence (`shown` and `loaded` both land
+    here); stays pending until the HWND resolves."""
+    try:
+        api._restore_startup_window()
+    except Exception as e:
+        print(f"[ui] startup window restore failed: {e}")
 
 
 def _warm_input_stack():
