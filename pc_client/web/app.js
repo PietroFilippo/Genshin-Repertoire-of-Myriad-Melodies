@@ -2180,14 +2180,14 @@ function renderMacroState(s) {
 const _PENDING_TEXT = {
     save: 'Save (in Genshin): press 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc or leaving the game cancels.',
     load: 'Load (in Genshin): press 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc or leaving the game cancels.',
-    confirm_record: 'Unsaved macro — press the Record hotkey again within 3 s to discard it and record.',
-    confirm_load: 'Unsaved macro — press the Load hotkey again within 3 s to discard it and load a slot.',
+    confirm_record: 'Unsaved macro — press the Record hotkey again within 4 s to discard it and record.',
+    confirm_load: 'Unsaved macro — press the Load hotkey again within 4 s to discard it and load a slot.',
 };
 const _PENDING_IDLE_TEXT = 'Save / Load: press the key, then 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc cancels.';
 
 // `macro_pending`: '' | 'save' | 'load' (slot picker armed) |
 // 'confirm_record' | 'confirm_load' (in-game Record / Load over unsaved
-// work needs a second press within 3 s). `macro_pending_hint` is the
+// work needs a second press within 4 s). `macro_pending_hint` is the
 // ready-made sentence for whichever is armed and is shown verbatim.
 function renderMacroPending(s) {
     s = s || {};

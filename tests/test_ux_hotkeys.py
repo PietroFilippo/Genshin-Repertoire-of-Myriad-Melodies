@@ -1013,7 +1013,6 @@ class BridgeRebindValidatesBeforeSaving(unittest.TestCase):
 _NODE = shutil.which('node')
 
 
-@unittest.skipIf(_NODE is None, 'node not on PATH')
 class AppScopeFastPathChecksPid(unittest.TestCase):
     """F4: is_allowed_foreground's cached-HWND fast path must also match
     the PID the HWND was cached with — Windows can hand a closed game's
@@ -1097,6 +1096,7 @@ class AppScopeFastPathChecksPid(unittest.TestCase):
 _REAL_REFRESH_GAME_HWND = ui_core.refresh_game_hwnd
 
 
+@unittest.skipIf(_NODE is None, 'node not on PATH')
 class CaptureGuardJs(unittest.TestCase):
     """HK1 / HK2: runs tests/capture_guard.test.js, which loads the real
     app.js in a vm with a fake DOM + bridge and drives the capture flow."""
