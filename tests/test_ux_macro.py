@@ -24,6 +24,9 @@ import mouse  # noqa: E402
 import ui_core  # noqa: E402
 from ui_core import MacroController  # noqa: E402
 
+# The real helper, kept before any test patches the module attribute.
+_ORIGINAL_ALERT = ui_core._play_alert_sound
+
 
 def _ev(t, key, event_type, device='keyboard'):
     return {'time': t, 'device': device, 'key': key, 'event_type': event_type}
@@ -80,6 +83,10 @@ class _TempSlots(unittest.TestCase):
         self.dir = Path(self._td.name)
         p = mock.patch.object(ui_core, 'macros_dir', return_value=self.dir)
         p.start()
+        self.addCleanup(p.stop)
+        # No real system sounds from the discard guard in tests.
+        p = mock.patch.object(ui_core, '_play_alert_sound')
+        self.beep = p.start()
         self.addCleanup(p.stop)
         self.addCleanup(self._td.cleanup)
         self.status = []
@@ -353,9 +360,10 @@ class RecordingFilterTests(_TempSlots):
         self.macro.start_record((), ())
         self.macro._on_kb_event(_kb('a', 'down', 30))
         self.macro._on_kb_event(_kb('a', 'up', 30))
+        # A tick: the in-memory status group, without the slot-file fields.
         self.assertTrue(_wait_for(lambda: any(
-            set(s) == {'macro_events', 'macro_status_gen'}
-            and s['macro_events'] == 2 for s in self.status)))
+            'macro_slots' not in s and s.get('macro_events') == 2
+            for s in self.status)))
         self.macro.stop_record()
 
     def test_recording_bumps_revision_and_discards_with_warning(self):
@@ -434,7 +442,7 @@ class SlotPickerTests(_TempSlots):
         self.macro.apply_events([_ev(0, 'a', 'down')])
         self.chosen = []
         p = mock.patch.object(self.macro, 'save_slot',
-                              side_effect=lambda n: self.chosen.append(n))
+                              side_effect=lambda n, **_kw: self.chosen.append(n))
         p.start()
         self.addCleanup(p.stop)
 
@@ -882,7 +890,7 @@ class DiscardGuardTests(_TempSlots):
         self.assertFalse(self.macro.confirm_discard_hotkey('record', 'Y'))
         snap = self.macro.snapshot()
         self.assertEqual('confirm_record', snap['macro_pending'])
-        self.assertIn('press Y again within 3 s', snap['macro_pending_hint'])
+        self.assertIn('press Y again within 4 s', snap['macro_pending_hint'])
         self.assertTrue(self.macro.confirm_discard_hotkey('record', 'Y'))
         self.assertEqual('', self.macro.snapshot()['macro_pending'])
 
@@ -960,7 +968,7 @@ class PickerReleaseTests(_TempSlots):
         self.macro.apply_events([_ev(0, 'a', 'down')])
         self.chosen = []
         p = mock.patch.object(self.macro, 'save_slot',
-                              side_effect=lambda n: self.chosen.append(n))
+                              side_effect=lambda n, **_kw: self.chosen.append(n))
         p.start()
         self.addCleanup(p.stop)
 
@@ -1194,6 +1202,209 @@ class BridgeTeardownTests(_BridgeBase):
         self.api._tearing_down = True
         self.assertTrue(self.api.macro_toggle_record(False)['ok'])
         self.assertEqual(MacroController.STATE_IDLE, self.macro.state())
+
+
+# ---- Review round 3 (MR9-MR13) -------------------------------------------
+
+def _merged(status):
+    merged = {}
+    for update in status:
+        merged.update(update)
+    return merged
+
+
+class PartialVsFullStatusTests(_HookedRecording):
+    """MR9: a live-count tick can't supersede a stalled full snapshot's
+    state with nothing; field groups are ordered independently."""
+
+    def test_tick_during_stalled_start_snapshot_still_shows_recording(self):
+        self.macro._emit()                           # UI shows 'idle'
+        self.macro.LIVE_COUNT_INTERVAL_S = 0.02
+        real = self.macro.slot_names
+        entered, gate = threading.Event(), threading.Event()
+        block = {'on': True}
+
+        def slow_names():
+            if block['on']:
+                block['on'] = False
+                entered.set()
+                gate.wait(2.0)
+            return real()
+
+        self.macro.slot_names = slow_names
+        starter = threading.Thread(
+            target=lambda: self.macro.start_record((), ()))
+        starter.start()
+        self.assertTrue(entered.wait(1.0))     # start's snapshot stalled
+        self.macro._on_kb_event(_kb('a', 'down', 30))
+        self.assertTrue(_wait_for(
+            lambda: _merged(self.status).get('macro_events') == 1))
+        gate.set()
+        starter.join(2.0)
+        merged = _merged(self.status)
+        self.assertEqual('recording', merged['macro_state'])
+        self.assertEqual(1, merged['macro_events'])
+        self.assertIn('macro_slots', merged)
+        self.macro.stop_record()
+        self.assertEqual('idle', _merged(self.status)['macro_state'])
+
+    def test_tick_carries_the_whole_in_memory_group(self):
+        self.macro.LIVE_COUNT_INTERVAL_S = 0.02
+        self.macro.start_record((), ())
+        self.macro._on_kb_event(_kb('a', 'down', 30))
+        self.assertTrue(_wait_for(lambda: any(
+            'macro_slots' not in s and s.get('macro_events') == 1
+            for s in self.status)))
+        tick = [s for s in self.status
+                if 'macro_slots' not in s and s.get('macro_events') == 1][0]
+        for field in ('macro_state', 'macro_rev', 'macro_dirty',
+                      'macro_loaded', 'macro_pending', 'macro_error'):
+            self.assertIn(field, tick)
+        self.assertEqual('recording', tick['macro_state'])
+        self.macro.stop_record()
+
+    def test_older_slot_group_still_publishes_after_newer_core(self):
+        old = {'macro_status_gen': 5, 'macro_state': 'idle',
+               'macro_slots': [1], 'macro_slot_names': {1: 'x'}}
+        self.macro._publish({'macro_status_gen': 7, 'macro_state': 'recording'})
+        self.macro._publish(old)
+        merged = _merged(self.status)
+        self.assertEqual('recording', merged['macro_state'])
+        self.assertEqual([1], merged['macro_slots'])
+
+
+class PickerLifetimeTests(_HookedRecording):
+    """MR10: an armed picker can't outlive a recording / buffer change."""
+
+    def setUp(self):
+        super().setUp()
+        _write_slot(self.dir, 2, [_ev(0, 'z', 'down')], name='two')
+
+    def test_recording_start_cancels_an_armed_load(self):
+        self.assertTrue(self.macro.begin_load_pending())
+        self.assertEqual('load', self.macro._pending_action)
+        self.macro.start_record((), ())
+        self.assertIsNone(self.macro._pending_action)
+        self.macro._on_kb_event(_kb('a', 'down', 30))
+        self.macro.stop_record()
+        self.macro._handle_slot_choice(2)       # a digit that raced in
+        self.assertEqual([('a', 'down')], self.keys())
+        self.assertTrue(self.macro.snapshot()['macro_dirty'])
+
+    def test_pick_after_buffer_changed_is_refused_in_the_load_command(self):
+        self.assertTrue(self.macro.begin_load_pending())   # clean buffer
+        self.macro.apply_events([_ev(0, 'q', 'down')])     # now unsaved
+        self.macro._handle_slot_choice(2)
+        self.assertEqual([('q', 'down')], self.keys())
+        self.assertIn('changed after Load was armed',
+                      self.macro.snapshot()['macro_error'])
+
+    def test_pick_with_unchanged_buffer_loads(self):
+        self.assertTrue(self.macro.begin_load_pending())
+        self.macro._handle_slot_choice(2)
+        self.assertEqual([('z', 'down')], self.keys())
+        self.assertEqual(2, self.macro.snapshot()['macro_loaded'])
+
+    def test_save_picker_is_cancelled_by_recording_too(self):
+        self.macro.apply_events([_ev(0, 'q', 'down')])
+        self.assertTrue(self.macro.begin_save_pending())
+        self.macro.start_record((), ())
+        self.assertIsNone(self.macro._pending_action)
+        self.macro.stop_record()
+
+
+class QueuedStopChordTests(_HookedRecording):
+    """MR11: every record-hotkey press since the start is removed."""
+
+    def test_two_presses_before_the_first_stop_runs(self):
+        self.macro.start_record((), (), track_chord='ctrl+y')
+        for ev in (_kb('a', 'down', 30), _kb('a', 'up', 30),
+                   _kb('ctrl', 'down', 29), _kb('y', 'down', 21),
+                   _kb('y', 'up', 21), _kb('ctrl', 'up', 29),
+                   _kb('ctrl', 'down', 29), _kb('y', 'down', 21),
+                   _kb('y', 'up', 21), _kb('ctrl', 'up', 29)):
+            self.macro._on_kb_event(ev)
+        self.macro.stop_record(chord='ctrl+y')       # first queued Stop
+        self.assertEqual([('a', 'down'), ('a', 'up')], self.keys())
+
+    def test_ctrl_held_across_two_presses(self):
+        self.macro.start_record((), (), track_chord='ctrl+y')
+        for ev in (_kb('b', 'down', 48), _kb('b', 'up', 48),
+                   _kb('ctrl', 'down', 29), _kb('y', 'down', 21),
+                   _kb('y', 'up', 21), _kb('y', 'down', 21),
+                   _kb('y', 'up', 21), _kb('ctrl', 'up', 29)):
+            self.macro._on_kb_event(ev)
+        self.macro.stop_record(chord='ctrl+y')
+        self.assertEqual([('b', 'down'), ('b', 'up')], self.keys())
+
+
+class HwndSignednessTests(unittest.TestCase):
+    """MR12: a handle with bit 31 set matches whatever ctypes type each
+    call site returns it as."""
+
+    UNSIGNED = 0x80001234
+    SIGNED = 0x80001234 - (1 << 32)
+
+    def setUp(self):
+        # Keep a background refresher (started by other tests'
+        # KeybindManagers) from rewriting the cached HWND mid-test.
+        p = mock.patch.object(ui_core, 'refresh_game_hwnd')
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_gates_compare_signed_and_unsigned(self):
+        with mock.patch.object(ui_core, '_foreground_hwnd',
+                               return_value=self.SIGNED), \
+             mock.patch.object(ui_core, '_game_hwnd', self.UNSIGNED):
+            self.assertTrue(ui_core.is_allowed_game_only())
+            self.assertTrue(ui_core.is_allowed_foreground(self.UNSIGNED))
+            self.assertTrue(MacroController._game_is_foreground())
+        with mock.patch.object(ui_core, '_foreground_hwnd',
+                               return_value=self.SIGNED + 1), \
+             mock.patch.object(ui_core, '_game_hwnd', self.UNSIGNED):
+            self.assertFalse(ui_core.is_allowed_game_only())
+
+    def test_focus_success_implies_foreground_check_passes(self):
+        user32 = _FakeUser32(game=self.UNSIGNED)
+        user32.SetForegroundWindow = lambda h: setattr(
+            user32, 'fg', self.SIGNED) or 1
+        fake = types.SimpleNamespace(windll=types.SimpleNamespace(user32=user32))
+        with mock.patch.object(ui_core, 'ctypes', fake), \
+             mock.patch.object(ui_core, '_game_hwnd', self.UNSIGNED):
+            hwnd, reason = ui_core.focus_game_window_ex(timeout=0.2)
+            self.assertEqual(self.UNSIGNED, hwnd)
+            self.assertEqual('', reason)
+            self.assertTrue(ui_core.is_allowed_game_only())
+
+
+class DiscardFeedbackTests(_TempSlots):
+    """MR13: the in-game arm is audible; only the arm beeps."""
+
+    def test_arm_beeps_once_second_press_does_not(self):
+        self.macro.apply_events([_ev(0, 'a', 'down')])
+        self.assertFalse(self.macro.confirm_discard_hotkey('record', 'Y'))
+        self.beep.assert_called_once()
+        self.assertTrue(self.macro.confirm_discard_hotkey('record', 'Y'))
+        self.beep.assert_called_once()
+        self.assertEqual(4.0, MacroController.DISCARD_CONFIRM_S)
+
+    def test_alert_sound_is_async_and_never_raises(self):
+        import winsound
+        called = threading.Event()
+        caller = threading.current_thread()
+        seen = {}
+
+        def fake_beep(kind):
+            seen['thread'] = threading.current_thread()
+            seen['kind'] = kind
+            called.set()
+            raise RuntimeError('no sound device')
+
+        with mock.patch.object(winsound, 'MessageBeep', side_effect=fake_beep):
+            _ORIGINAL_ALERT()                   # must return at once
+            self.assertTrue(called.wait(1.0))
+        self.assertIsNot(caller, seen['thread'])
+        self.assertEqual(winsound.MB_ICONEXCLAMATION, seen['kind'])
 
 
 # ---- static frontend checks (U19 / M23) ------------------------------------

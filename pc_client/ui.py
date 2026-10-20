@@ -620,6 +620,9 @@ class BridgeApi:
         self._macro = MacroController(controller_provider=self._get_arduino,
                                       on_status=self._enqueue_status)
         self._keybinds = KeybindManager(self._ui_hwnd)
+        # Serializes every keybind install (see _install_keybinds). Lock
+        # order: _keybind_lock, then self._lock -- never the reverse.
+        self._keybind_lock = threading.RLock()
         self._drain_stop = threading.Event()
         self._drain_thread = None
 
@@ -910,6 +913,11 @@ class BridgeApi:
                 and old_state == BotController.STATE_RUNNING):
             opts['mid_song_start'] = True
 
+        # Command generation at request time — captured BEFORE the
+        # running check and before waiting for _engine_lock: any Stop from
+        # here on bumps it and BotController aborts the switch (a Stop
+        # before this point is visible to the checks below instead).
+        req_gen = getattr(self._bot, 'generation', None)
         if not self._bot.is_running():
             return True
         if self._tearing_down:
@@ -930,7 +938,8 @@ class BridgeApi:
                     return not self._tearing_down
                 if self._macro.is_busy():
                     return False
-                ok = self._bot.restart_in_mode(mode, opts)
+                ok = self._bot.restart_in_mode(
+                    mode, opts, expected_generation=req_gen)
         finally:
             with self._lock:
                 self._restart_pending -= 1
@@ -997,26 +1006,28 @@ class BridgeApi:
         hotkey, reason = validate_hotkey(action, js_event_to_hotkey(payload))
         if reason:
             return {'ok': False, 'reason': reason}
-        with self._lock:
-            if self._hotkey_in_use_locked(hotkey, current_action=action):
-                return {'ok': False, 'reason': 'duplicate_hotkey'}
-            previous = self._settings['keybinds'].get(action)
-            self._settings['keybinds'][action] = hotkey
-        self._install_keybinds()
-        if self._keybinds.get_bindings().get(action) != hotkey:
-            # Validated yet still not installed: restore the old binding
-            # instead of persisting one that does nothing.
+        # One _keybind_lock hold covers duplicate check -> install of the
+        # PROPOSED binding -> verify -> commit + save. Settings are only
+        # touched once the binding is verifiably installed, and no other
+        # installer can run in between with an older snapshot (BU11).
+        with self._keybind_lock:
             with self._lock:
-                if self._settings['keybinds'].get(action) == hotkey:
-                    self._settings['keybinds'][action] = previous
-            self._install_keybinds()
-            return {'ok': False, 'reason': 'install_failed'}
-        # The key the user just pressed to capture this binding may still
-        # be in the listener backlog: never let THAT press fire it.
-        self._keybinds.latch_until_release(action)
-        with self._lock:
-            save_settings(self._settings)
-            keybinds = dict(self._settings['keybinds'])
+                if self._hotkey_in_use_locked(hotkey, current_action=action):
+                    return {'ok': False, 'reason': 'duplicate_hotkey'}
+            self._install_keybinds(keybind_overrides={action: hotkey})
+            if self._keybinds.get_bindings().get(action) != hotkey:
+                # Validated yet not installed: put back exactly what the
+                # (unchanged) settings say instead of persisting a binding
+                # that does nothing.
+                self._install_keybinds()
+                return {'ok': False, 'reason': 'install_failed'}
+            # The key the user just pressed to capture this binding may
+            # still be in the listener backlog: never let THAT press fire it.
+            self._keybinds.latch_until_release(action)
+            with self._lock:
+                self._settings['keybinds'][action] = hotkey
+                save_settings(self._settings)
+                keybinds = dict(self._settings['keybinds'])
         # Push the new keybind map immediately rather than waiting for the
         # next drain tick.
         self._enqueue_status({'keybinds': keybinds})
@@ -1105,8 +1116,10 @@ class BridgeApi:
         return dict(self._macro.save_slot(n, name=name,
                                           expected_rev=expected_rev))
 
-    def macro_load_slot(self, n):
-        return dict(self._macro.load_slot(n))
+    def macro_load_slot(self, n, expected_rev=None):
+        """`expected_rev` (optional): the macro_rev the user confirmed
+        discarding; refused with 'stale' if the buffer changed since."""
+        return dict(self._macro.load_slot(n, expected_rev=expected_rev))
 
     def macro_clear_slot(self, n):
         """Delete slot n. Active macros pointing at it are unassigned;
@@ -1254,31 +1267,27 @@ class BridgeApi:
         if reason:
             return {'ok': False, 'reason': reason}
         action = f'macro_active_{idx + 1}'
-        with self._lock:
-            if self._hotkey_in_use_locked(hotkey, current_active_index=idx):
-                return {'ok': False, 'reason': 'duplicate_hotkey'}
-            active = self._active_macros_locked()
-            previous = active[idx].get('hotkey', '')
-            slot = active[idx].get('slot') or 0
-            active[idx]['hotkey'] = hotkey
-            self._settings['macro_active_macros'] = active
-        self._install_keybinds()
-        # Install + verify BEFORE saving, as in rebind. Only an entry with
-        # a slot is installed (see _install_keybinds); if that install
-        # failed, restore the previous hotkey instead of persisting one
-        # that does nothing.
-        if slot and self._keybinds.get_bindings().get(action) != hotkey:
+        # Same transaction as rebind: install the PROPOSED hotkey, verify,
+        # and only then commit + save, all under one _keybind_lock hold.
+        # Only an entry with a slot is installed; `desired` (the snapshot
+        # actually applied) says whether there was anything to verify.
+        with self._keybind_lock:
+            with self._lock:
+                if self._hotkey_in_use_locked(hotkey,
+                                              current_active_index=idx):
+                    return {'ok': False, 'reason': 'duplicate_hotkey'}
+            desired = self._install_keybinds(active_overrides={idx: hotkey})
+            if (action in desired
+                    and self._keybinds.get_bindings().get(action) != hotkey):
+                self._install_keybinds()    # exactly what settings say
+                return {'ok': False, 'reason': 'install_failed'}
+            # As in rebind: the captured press must not fire the binding.
+            self._keybinds.latch_until_release(action)
             with self._lock:
                 active = self._active_macros_locked()
-                if active[idx].get('hotkey') == hotkey:
-                    active[idx]['hotkey'] = previous
-                    self._settings['macro_active_macros'] = active
-            self._install_keybinds()
-            return {'ok': False, 'reason': 'install_failed'}
-        # As in rebind: the captured press must not fire the new binding.
-        self._keybinds.latch_until_release(action)
-        with self._lock:
-            save_settings(self._settings)
+                active[idx]['hotkey'] = hotkey
+                self._settings['macro_active_macros'] = active
+                save_settings(self._settings)
         self._push_active_status()
         return {'ok': True, 'hotkey': hotkey}
 
@@ -1793,13 +1802,33 @@ class BridgeApi:
         self._hwnd_cache = 0
         return self._ui_hwnd()
 
-    def _install_keybinds(self):
+    def _install_keybinds(self, keybind_overrides=None, active_overrides=None):
         # Transactional (KeybindManager.apply): unchanged bindings stay
         # installed, changed ones are installed before the old hook is
         # removed, and only actions that are no longer wanted get cleared.
         # The old clear_all()-then-set() lost Play/Stop entirely when the
         # mouse hook failed to install, even on the rollback reinstall.
-        kb = self._settings['keybinds']
+        #
+        # Serialized by _keybind_lock, and the desired map is built INSIDE
+        # it from the settings as they are at that moment: an installer
+        # that built its snapshot first and applied it later could put an
+        # older binding back over a newer rebind (BU11). rebind /
+        # macro_set_active_hotkey hold the same (reentrant) lock across
+        # their whole install -> verify -> commit, passing the proposed
+        # binding as an override. Returns the desired map it applied.
+        with self._keybind_lock:
+            return self._install_keybinds_locked(keybind_overrides,
+                                                 active_overrides)
+
+    def _install_keybinds_locked(self, keybind_overrides, active_overrides):
+        with self._lock:
+            kb = dict(self._settings['keybinds'])
+            actives = [dict(x) if isinstance(x, dict) else {}
+                       for x in self._settings.get('macro_active_macros', [])]
+        kb.update(keybind_overrides or {})
+        for idx, hk in (active_overrides or {}).items():
+            if 0 <= idx < len(actives):
+                actives[idx]['hotkey'] = hk
         desired = {
             # Bot hotkeys — fire when Genshin or UI is focused.
             ACTION_START_STOP: (kb.get(ACTION_START_STOP),
@@ -1819,12 +1848,11 @@ class BridgeApi:
             ACTION_MACRO_LOAD: (kb.get(ACTION_MACRO_LOAD),
                                 self._hotkey_macro_load, 'game'),
         }
-        for pos, item in enumerate(
-                self._settings.get('macro_active_macros', []), start=1):
+        for pos, item in enumerate(actives, start=1):
             if pos > ACTIVE_MACRO_COUNT:
                 break
-            slot = item.get('slot') if isinstance(item, dict) else 0
-            hotkey = item.get('hotkey') if isinstance(item, dict) else ''
+            slot = item.get('slot') or 0
+            hotkey = item.get('hotkey') or ''
             if slot and hotkey:
                 desired[f'macro_active_{pos}'] = (
                     hotkey,
@@ -1838,6 +1866,7 @@ class BridgeApi:
                 print(f"[ui] bound {act:16} -> {hk!r}")
         except Exception:
             pass
+        return desired
 
     # Hotkey callbacks run on the keyboard package's listener thread.
     # They only mutate threading.Events / BotController state (already

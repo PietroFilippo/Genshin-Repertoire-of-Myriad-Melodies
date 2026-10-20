@@ -71,6 +71,10 @@ class _Harness(unittest.TestCase):
             p = mock.patch.object(ui_core.mouse, attr, **kwargs)
             p.start()
             self.addCleanup(p.stop)
+        # No background audit thread: tests drive _audit_held_modifiers.
+        p = mock.patch.object(KeybindManager, '_start_mod_audit')
+        p.start()
+        self.addCleanup(p.stop)
         self.km = KeybindManager(lambda: 0)
         self.fired = []
 
@@ -439,50 +443,94 @@ class LostModifierRelease(_Harness):
     """HK5: a Ctrl release swallowed by the secure desktop left Ctrl
     'held' forever, so plain F8 kept resolving to 'ctrl+f8'."""
 
+    # Lost releases are reconciled by the 1 s audit (_audit_held_modifiers,
+    # driven by hand here), never while matching a press (BU10).
+
     def setUp(self):
         super().setUp()
         self.bind('start_stop', 'f8')
         self.bind('pause', 'ctrl+f8')
 
-    def test_released_per_windows_is_dropped(self):
+    def audit(self, at):
+        self.clock = at
+        self.km._audit_held_modifiers()
+
+    def test_lost_release_is_dropped_after_confirmation(self):
         self.async_down.return_value = False      # Windows: Ctrl is up
         self.down('ctrl', 100.0)                  # its KEY_UP never came
-        self.down('f8', 400.0)
+        self.audit(200.0)                         # first "up" sample
+        self.audit(203.5)                         # confirmed 3.5 s later
+        self.down('f8', 204.0)                    # stamped after decision
         self.assertEqual(self.settle(), ['start_stop'])
+
+    def test_one_up_sample_is_not_enough(self):
+        self.async_down.return_value = False
+        self.down('ctrl', 100.0)
+        self.audit(200.0)
+        self.audit(201.0)                         # only 1 s of "up"
+        self.down('f8', 201.5)
+        self.assertEqual(self.settle(), ['pause'])
 
     def test_legit_long_hold_is_kept(self):
         self.async_down.return_value = True       # really still held
         self.down('ctrl', 100.0)
+        for at in (200.0, 205.0, 300.0):
+            self.audit(at)
         self.down('f8', 400.0)                    # 5 minutes later
-        self.assertEqual(self.settle(), ['pause'])
-
-    def test_recent_modifier_trusts_the_event_stream(self):
-        """Ctrl went down 0.3 s before F8: its KEY_UP may still be queued
-        behind F8 (delivery lag), so Windows' 'up' is not proof."""
-        self.async_down.return_value = False
-        self.down('ctrl', 100.0)
-        self.down('f8', 100.3)
         self.assertEqual(self.settle(), ['pause'])
 
     def test_unknown_windows_state_keeps_modifier(self):
         self.async_down.return_value = None
         self.down('ctrl', 100.0)
+        self.audit(200.0)
+        self.audit(205.0)
         self.down('f8', 400.0)
         self.assertEqual(self.settle(), ['pause'])
 
-    def test_windows_is_asked_only_on_the_candidate_path(self):
-        self.bind('debug', 'f10')                 # bare-only candidate
-        self.async_down.reset_mock()              # forget the bind-time prime
+    def test_disagreement_must_be_continuous(self):
         self.down('ctrl', 100.0)
-        self.down('q', 400.0)                     # unbound key
-        self.down('f10', 401.0)                   # no modifier decision
-        self.up('q', 401.5)
+        self.async_down.return_value = False
+        self.audit(200.0)
+        self.async_down.return_value = True       # Windows: held again
+        self.audit(201.0)
+        self.async_down.return_value = False
+        self.audit(203.5)                         # new suspect, not confirmed
+        self.down('f8', 204.0)
+        self.assertEqual(self.settle(), ['pause'])
+
+    def test_stream_event_voids_the_decision(self):
+        self.async_down.return_value = False
+        self.down('ctrl', 100.0)
+        self.audit(200.0)
+        self.audit(203.5)                         # drop decided ...
+        self.down('ctrl', 204.0)                  # ... but Ctrl pressed again
+        self.down('f8', 204.2)
+        self.assertEqual(self.settle(), ['pause'])
+
+    def test_decision_never_applies_to_a_press_stamped_before_it(self):
+        """A press already queued when the audit decided (backlog crossing
+        the decision) is still matched on the stream state."""
+        self.async_down.return_value = False
+        self.down('ctrl', 100.0)
+        self.audit(200.0)
+        self.audit(203.5)
+        self.down('f8', t=203.4, now=203.6)       # pressed before decision
+        self.assertEqual(self.settle(), ['pause'])
+
+    def test_press_path_never_asks_windows(self):
+        self.bind('debug', 'f10')
+        self.async_down.reset_mock()              # forget the bind-time prime
+        self.async_down.return_value = False
+        self.down('ctrl', 100.0)
+        self.down('q', 400.0)
+        self.down('f10', 401.0)
+        self.down('f8', 402.0)
+        self.up('f8', 402.1)
+        self.down('f8', 402.5)
         self.async_down.assert_not_called()
-        self.down('f8', 402.0)                    # candidate path
-        calls = self.async_down.call_count
-        self.assertGreater(calls, 0)
-        self.down('f8', 402.03)                   # auto-repeat: no re-check
-        self.assertEqual(self.async_down.call_count, calls)
+
+    def test_audit_thread_starts_with_the_keyboard_hook(self):
+        self.km._start_mod_audit.assert_called_once()
 
 
 class SetKeepsOldBindingOnInstallFailure(_Harness):
@@ -639,11 +687,38 @@ class BackloggedPressUsesEventStreamModifiers(_Harness):
         self.assertEqual(self.settle(), ['pause'])
         self.async_down.assert_not_called()
 
-    def test_stale_modifier_reconciled_on_next_fresh_press(self):
+    def test_short_backlog_reported_case(self):
+        """BU10: hold Ctrl 2 s, press F8, release Ctrl 10 ms later, F8
+        processed 20 ms late (inside the old 50 ms 'fresh' window, where
+        Windows already said Ctrl up). Must be Ctrl+F8."""
+        self.down('ctrl', t=100.0)
+        self.down('f8', t=102.0, now=102.02)
+        self.up('ctrl', t=102.01, now=102.03)     # the queued release
+        self.assertEqual(self.settle(), ['pause'])
+        self.async_down.assert_not_called()
+
+    def test_audit_during_the_backlog_cannot_misfire(self):
+        """Even an audit sample landing inside that 20 ms window only opens
+        a suspect; the queued release clears it long before 3 s."""
+        self.down('ctrl', t=100.0)
+        self.clock = 102.015
+        self.km._audit_held_modifiers()           # Windows: Ctrl up
+        self.down('f8', t=102.0, now=102.02)
+        self.up('ctrl', t=102.01, now=102.03)
+        self.clock = 105.5
+        self.km._audit_held_modifiers()
+        self.assertEqual(self.km._kb_mod_drop, {})
+        self.assertEqual(self.settle(), ['pause'])
+
+    def test_stale_modifier_reconciled_by_the_audit(self):
         self.down('ctrl', t=100.0)
         self.down('f8', t=102.0, now=102.5)       # backlog: Ctrl+F8
         self.up('f8', t=102.6)
-        self.down('f8', t=400.0)                  # fresh: Windows asked
+        self.clock = 110.0
+        self.km._audit_held_modifiers()
+        self.clock = 113.5
+        self.km._audit_held_modifiers()
+        self.down('f8', t=400.0)
         self.assertEqual(self.settle(), ['pause', 'start_stop'])
 
 
@@ -675,12 +750,14 @@ class BridgeRebindValidatesBeforeSaving(unittest.TestCase):
                 (ui_core.mouse, 'hook', {'side_effect': mouse_hook}),
                 (ui_core.mouse, 'unhook', {}),
                 (ui_core, 'is_allowed_foreground', {'return_value': True}),
-                (ui_core, 'is_allowed_game_only', {'return_value': True})):
+                (ui_core, 'is_allowed_game_only', {'return_value': True}),
+                (KeybindManager, '_start_mod_audit', {})):
             p = mock.patch.object(target, attr, **kwargs)
             p.start()
             self.addCleanup(p.stop)
         api = mock.MagicMock()
         api._lock = threading.Lock()
+        api._keybind_lock = threading.RLock()
         api._settings = {
             'keybinds': {'start_stop': 'f8', 'pause': 'f9', 'debug': 'f10',
                          'macro_record': 'y', 'macro_play': 'mouse:x',
@@ -698,9 +775,12 @@ class BridgeRebindValidatesBeforeSaving(unittest.TestCase):
                      '_active_macro_index'):
             setattr(api, name, functools.partial(getattr(bridge, name), api))
         api._capture_token = bridge._capture_token
-        # The REAL _install_keybinds (BU4 is about its transactionality).
+        # The REAL _install_keybinds (BU4 is about its transactionality,
+        # BU11 about its locking).
         api._install_keybinds = functools.partial(
             bridge._install_keybinds, api)
+        api._install_keybinds_locked = functools.partial(
+            bridge._install_keybinds_locked, api)
         api._install_keybinds()
         self.api = api
         self.bridge = bridge
@@ -784,6 +864,76 @@ class BridgeRebindValidatesBeforeSaving(unittest.TestCase):
         self.assertEqual(res, {'ok': True, 'hotkey': 'f6'})
         self.assertNotIn('macro_active_2', self.api._keybinds.get_bindings())
         self.save.assert_called_once()
+
+    # BU11: install serialization.
+
+    def test_stale_installer_cannot_overwrite_a_newer_rebind(self):
+        """An installer that took its snapshot (F8) and paused before
+        applying it used to apply it AFTER a newer rebind (F7) had
+        installed + saved: settings F7, installed F8."""
+        km = self.api._keybinds
+        real_apply = km.apply
+        paused = threading.Event()
+        release = threading.Event()
+
+        def apply(desired):
+            if threading.current_thread().name == 'older-installer':
+                paused.set()
+                release.wait(2.0)        # snapshot built, not yet applied
+            return real_apply(desired)
+        km.apply = apply
+        older = threading.Thread(target=self.api._install_keybinds,
+                                 name='older-installer', daemon=True)
+        older.start()
+        self.assertTrue(paused.wait(2.0))
+        result = {}
+        newer = threading.Thread(
+            target=lambda: result.update(
+                r=self.rebind('start_stop', {'key': 'F7'})),
+            name='rebind', daemon=True)
+        newer.start()
+        newer.join(0.2)
+        self.assertTrue(newer.is_alive(),
+                        'rebind ran while an installer held a stale snapshot')
+        release.set()
+        older.join(2.0)
+        newer.join(2.0)
+        self.assertEqual(result.get('r'), 'f7')
+        self.assertEqual(self.api._settings['keybinds']['start_stop'], 'f7')
+        self.assertEqual(km.get_bindings()['start_stop'], 'f7')
+
+    def test_concurrent_rebinds_and_slot_changes_converge(self):
+        """Rebinds racing an outside settings change + reinstall (the
+        macro slot paths) always end with installed == settings."""
+        api = self.api
+        keys = ['F2', 'F3', 'F4', 'F5', 'F6', 'F7']
+
+        def rebinder(action, offset):
+            for i in range(12):
+                self.rebind(action, {'key': keys[(i + offset) % len(keys)],
+                                     'ctrlKey': action == 'pause'})
+
+        def slot_toggler():
+            for i in range(12):
+                with api._lock:             # as macro_set_active_slot does
+                    active = api._active_macros_locked()
+                    active[0]['slot'] = 0 if i % 2 else 3
+                    api._settings['macro_active_macros'] = active
+                api._install_keybinds()
+        threads = [threading.Thread(target=rebinder, args=('start_stop', 0)),
+                   threading.Thread(target=rebinder, args=('pause', 3)),
+                   threading.Thread(target=slot_toggler)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10.0)
+        api._keybinds._dispatch_q.join()
+        installed = api._keybinds.get_bindings()
+        for action, hk in api._settings['keybinds'].items():
+            self.assertEqual(installed.get(action), normalize_hotkey(hk),
+                             action)
+        slotted = api._settings['macro_active_macros'][0]['slot']
+        self.assertEqual('macro_active_1' in installed, bool(slotted))
 
     def test_capture_bridge_methods_drive_suspension(self):
         self.assertTrue(self.bridge.capture_begin(self.api, 10))

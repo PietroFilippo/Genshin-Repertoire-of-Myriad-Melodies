@@ -1113,6 +1113,89 @@ class StateLockTests(_BotTestBase):
             self.assertEqual(states[-1], 'idle', f'iteration {i}: {states}')
 
 
+class RestartStopBarrierTests(_BotTestBase):
+    """BU9: a Stop that lands between restart_in_mode's stop-in-flight
+    check and its own internal stop must abort the restart (it used to be
+    absorbed into the restart's newer generation → bot restarted after
+    the user's Stop)."""
+
+    def _counting_runner(self, runs, started):
+        def runner(stop_evt, *a, **k):
+            runs.append(1)
+            started.set()
+            stop_evt.wait(5.0)
+            time.sleep(0.05)
+        return runner
+
+    def test_stop_between_check_and_internal_stop_aborts(self):
+        runs, started = [], threading.Event()
+        injected = threading.Event()
+        restart_thread = {}
+        with mock.patch.object(ui_core, 'run_standalone',
+                               self._counting_runner(runs, started)):
+            bot = self.make_bot(lambda: object())
+
+            class BarrierEvent(threading.Event):
+                """The restart thread's stop-in-flight check reads False,
+                then — before restart issues its own stop — an external
+                Stop runs to completion on another thread."""
+                def is_set(self_inner):
+                    value = threading.Event.is_set(self_inner)
+                    if (threading.current_thread() is restart_thread.get('t')
+                            and not injected.is_set()):
+                        injected.set()
+                        s = threading.Thread(target=bot.stop)
+                        s.start()
+                        s.join(2.0)
+                    return value
+
+            bot._stop_evt = BarrierEvent()
+            bot.start('standalone', {})
+            self.assertTrue(started.wait(2.0))
+            result = {}
+            t = threading.Thread(target=lambda: result.setdefault(
+                'ok', bot.restart_in_mode('standalone', {})))
+            restart_thread['t'] = t
+            t.start()
+            t.join(5.0)
+            self.assertTrue(injected.is_set(), 'barrier never hit')
+            self.assertFalse(result['ok'])
+            self.wait_idle(bot)
+        self.assertEqual(len(runs), 1, 'restart started a new run after Stop')
+        self.assertFalse(bot.is_running())
+
+    def test_stale_request_generation_aborts(self):
+        """Bridge path: the request generation is captured before waiting
+        for the engine lock; a Stop after that (old run already gone by the
+        time restart runs) must still win."""
+        runs, started = [], threading.Event()
+        with mock.patch.object(ui_core, 'run_standalone',
+                               self._counting_runner(runs, started)):
+            bot = self.make_bot(lambda: object())
+            bot.start('standalone', {})
+            self.assertTrue(started.wait(2.0))
+            req_gen = bot.generation
+            bot.stop()                        # user's Stop after the request
+            self.wait_idle(bot)
+            self.assertFalse(bot.restart_in_mode(
+                'standalone', {}, expected_generation=req_gen))
+        self.assertEqual(len(runs), 1)
+        self.assertFalse(bot.is_running())
+
+    def test_matching_request_generation_still_restarts(self):
+        runs, started = [], threading.Event()
+        with mock.patch.object(ui_core, 'run_standalone',
+                               self._counting_runner(runs, started)):
+            bot = self.make_bot(lambda: object())
+            bot.start('standalone', {})
+            self.assertTrue(started.wait(2.0))
+            started.clear()
+            self.assertTrue(bot.restart_in_mode(
+                'standalone', {}, expected_generation=bot.generation))
+            self.assertTrue(started.wait(2.0))
+        self.assertEqual(len(runs), 2)
+
+
 @unittest.skipIf(ui is None, 'ui.py not importable headless')
 class ReviewBridgeTests(unittest.TestCase):
     def make_api(self):
