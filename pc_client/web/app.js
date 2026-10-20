@@ -1,17 +1,21 @@
 // Frontend logic. Backend is `BridgeApi` in pc_client/ui.py exposed as
 // `pywebview.api`. Two globals (updateStatus, appendLog) are called from
 // Python via window.evaluate_js on the 50ms drain tick.
+//
+// Layout is Direction A ("Score sheet") from genshin-ui-mocks/design-notes.md;
+// the Python <-> UI field names follow genshin-ui-mocks/ui-data-contract.md.
+// Every new status field degrades gracefully when absent (older Python).
 'use strict';
 
 const STATE = {
-    capturing: null,           // action name while waiting for keypress
-    activeCapturing: null,     // active macro position while binding hotkey
+    capturing: null,           // hotkey action name while waiting for a key
+    activeCapturing: null,     // active-macro position while binding its key
     activeRenderSig: '',
-    lastStatus: null,          // most recent status snapshot
+    slotsRenderSig: '',
+    lastStatus: null,          // most recent merged status snapshot
     initialized: false,
+    tab: 'main',
 };
-
-const LOG_MAX_CHARS = 200_000; // soft cap so long sessions don't blow memory
 
 // --- helpers ---------------------------------------------------------------
 
@@ -36,6 +40,177 @@ function callApi(name, ...args) {
     }
 }
 
+// Write-if-changed setters: the 50 ms status tick must not touch the DOM
+// (and trigger style/layout work) when nothing moved.
+function setText(el, text) {
+    if (!el) return;
+    const t = text == null ? '' : String(text);
+    if (el.textContent !== t) el.textContent = t;
+}
+
+function setTitle(el, text) {
+    if (!el) return;
+    const t = text == null ? '' : String(text);
+    if (el.title !== t) el.title = t;
+}
+
+function setHidden(el, hidden) {
+    if (!el) return;
+    const h = !!hidden;
+    if (el.hidden !== h) el.hidden = h;
+}
+
+function setDisabled(el, disabled) {
+    if (!el) return;
+    const d = !!disabled;
+    if (el.disabled !== d) el.disabled = d;
+}
+
+function setClass(el, cls, on) {
+    if (!el) return;
+    el.classList.toggle(cls, !!on);
+}
+
+function setSwitch(el, on) {
+    if (!el) return;
+    setClass(el, 'on', on);
+    const v = on ? 'true' : 'false';
+    if (el.getAttribute('aria-checked') !== v) el.setAttribute('aria-checked', v);
+}
+
+function plural(n, word) {
+    return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+function activeEl() {
+    return document.activeElement || null;
+}
+
+// --- in-app dialog -----------------------------------------------------------
+
+// One dialog at a time; requests queue behind the open one. Escape cancels,
+// Enter confirms (unless a dialog button has focus — its native click wins),
+// Tab is trapped inside the box, and focus returns to where it was.
+const DIALOG = {
+    open: false,
+    done: null,
+    onEnter: null,
+    cancelValue: null,
+    prevFocus: null,
+    chain: Promise.resolve(),
+};
+
+const _FOCUSABLE = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function focusablesIn(box) {
+    return Array.from(box.querySelectorAll(_FOCUSABLE));
+}
+
+function showDialog(build, cancelValue) {
+    const run = () => new Promise((resolve) => {
+        if (captureArmed()) cancelCapture();
+        const scrim = $('#dialog-scrim');
+        const box = $('#dialog-box');
+        box.innerHTML = '';
+        box.classList.remove('wide');
+        DIALOG.prevFocus = activeEl();
+        let settled = false;
+        const done = (result) => {
+            if (settled) return;
+            settled = true;
+            DIALOG.open = false;
+            DIALOG.done = null;
+            DIALOG.onEnter = null;
+            scrim.hidden = true;
+            box.innerHTML = '';
+            const pf = DIALOG.prevFocus;
+            DIALOG.prevFocus = null;
+            if (pf && typeof pf.focus === 'function') {
+                try { pf.focus(); } catch (e) { /* element may be gone */ }
+            }
+            resolve(result);
+        };
+        DIALOG.open = true;
+        DIALOG.done = done;
+        DIALOG.cancelValue = cancelValue;
+        const spec = build(box, done) || {};
+        DIALOG.onEnter = spec.onEnter || null;
+        scrim.hidden = false;
+        const target = spec.initialFocus || focusablesIn(box)[0];
+        if (target && typeof target.focus === 'function') target.focus();
+    });
+    const p = DIALOG.chain.then(run, run);
+    DIALOG.chain = p.then(() => {}, () => {});
+    return p;
+}
+
+function dlgEl(tag, cls, text) {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    if (text != null) el.textContent = text;
+    return el;
+}
+
+function dlgButton(label, cls, onClick) {
+    const b = dlgEl('button', `btn sm${cls ? ` ${cls}` : ''}`, label);
+    b.type = 'button';
+    b.addEventListener('click', onClick);
+    return b;
+}
+
+// Yes/No question. Resolves true / false.
+function dlgConfirm(title, body, opts = {}) {
+    return showDialog((box, done) => {
+        box.appendChild(dlgEl('h2', '', title)).id = 'dialog-title';
+        if (body) box.appendChild(dlgEl('p', '', body));
+        if (opts.note) box.appendChild(dlgEl('p', 'note', opts.note));
+        const row = dlgEl('div', 'row');
+        const cancel = dlgButton(opts.cancel || 'Cancel', '', () => done(false));
+        const ok = dlgButton(opts.ok || 'OK', opts.danger ? 'stop' : 'go', () => done(true));
+        row.appendChild(cancel);
+        row.appendChild(ok);
+        box.appendChild(row);
+        return { initialFocus: opts.focusCancel ? cancel : ok, onEnter: () => done(true) };
+    }, false);
+}
+
+// Information only. Resolves when dismissed.
+function dlgAlert(title, body) {
+    return showDialog((box, done) => {
+        box.appendChild(dlgEl('h2', '', title)).id = 'dialog-title';
+        if (body) box.appendChild(dlgEl('p', '', body));
+        const row = dlgEl('div', 'row');
+        const ok = dlgButton('OK', 'go', () => done(true));
+        row.appendChild(ok);
+        box.appendChild(row);
+        return { initialFocus: ok, onEnter: () => done(true) };
+    }, true);
+}
+
+// One text field. Resolves the string, or null when cancelled.
+function dlgPrompt(title, body, opts = {}) {
+    return showDialog((box, done) => {
+        box.appendChild(dlgEl('h2', '', title)).id = 'dialog-title';
+        if (body) box.appendChild(dlgEl('p', '', body));
+        const label = dlgEl('label', 'f', opts.label || 'Name');
+        label.htmlFor = 'dialog-text';
+        box.appendChild(label);
+        const input = dlgEl('input', 'text');
+        input.type = 'text';
+        input.id = 'dialog-text';
+        input.value = opts.value || '';
+        input.spellcheck = false;
+        if (opts.placeholder) input.placeholder = opts.placeholder;
+        box.appendChild(input);
+        const row = dlgEl('div', 'row');
+        row.appendChild(dlgButton('Cancel', '', () => done(null)));
+        row.appendChild(dlgButton(opts.ok || 'OK', 'go', () => done(input.value)));
+        box.appendChild(row);
+        setTimeout(() => { try { input.select(); } catch (e) { /* no-op */ } }, 0);
+        return { initialFocus: input, onEnter: () => done(input.value) };
+    }, null);
+}
+
 // --- titlebar buttons ------------------------------------------------------
 
 $('#btn-min').addEventListener('click', () => callApi('minimize'));
@@ -45,49 +220,180 @@ $('#btn-max').addEventListener('click', () => {
     callApi('toggle_maximize').then((res) => {
         if (!res || typeof res.maximized !== 'boolean') return;
         const btn = $('#btn-max');
-        btn.textContent = res.maximized ? '' : '';
+        btn.textContent = res.maximized ? '\uE923' : '\uE922';
         btn.title = res.maximized ? 'Restore' : 'Maximize';
     });
 });
-$('#btn-close').addEventListener('click', () => {
+$('#btn-close').addEventListener('click', async () => {
     // Unsaved macro work (recording, unsaved buffer, editor edits) only
     // lives in memory — ask before throwing it away.
     const loss = macroUnsavedSummary();
-    if (loss && !confirm(
-        `Close Genshin Rhythm Bot?\n\nYou have ${loss} that will be lost.`)) {
-        return;
+    if (loss) {
+        const ok = await dlgConfirm('Close Genshin Rhythm Bot?',
+            `You have ${loss} that will be lost.`,
+            { ok: 'Discard and close', danger: true, focusCancel: true });
+        if (!ok) return;
     }
-    callApi('close');
+    // The user already answered here; Python's `closing` handler must
+    // not ask again. Mark it on the window (readable via evaluate_js)
+    // and pass it as an argument; fall back to the no-argument close()
+    // for a Python side that predates the flag.
+    window.__closeConfirmed = true;
+    callApi('close', true).catch(() => callApi('close'));
 });
 
 // --- tab switching ---------------------------------------------------------
 
+function showTab(name) {
+    STATE.tab = name;
+    $$('.tab').forEach((t) => t.classList.toggle('tab-active', t.dataset.tab === name));
+    $$('.panel').forEach((p) => p.classList.toggle('panel-active', p.dataset.panel === name));
+    if (name === 'logs') logCatchUp();
+}
+
 $$('.tab').forEach((btn) => {
-    btn.addEventListener('click', () => {
-        const target = btn.dataset.tab;
-        $$('.tab').forEach((t) => t.classList.toggle('tab-active', t === btn));
-        $$('.panel').forEach((p) => {
-            p.classList.toggle('panel-active', p.dataset.panel === target);
-        });
-    });
+    btn.addEventListener('click', () => showTab(btn.dataset.tab));
+});
+
+$$('[data-goto]').forEach((btn) => {
+    btn.addEventListener('click', () => showTab(btn.dataset.goto));
+});
+
+// --- health strip ------------------------------------------------------------
+
+function renderHealthAdmin(admin) {
+    const el = $('#hs-admin');
+    const dot = el.querySelector('.dot');
+    const label = el.querySelector('span');
+    if (admin) {
+        setClass(dot, 'bad', false);
+        setClass(dot, 'neutral', false);
+        setClass(el, 'bad', false);
+        setText(label, 'Running as admin');
+        setTitle(el, '');
+    } else {
+        setClass(dot, 'neutral', false);
+        setClass(dot, 'bad', true);
+        setClass(el, 'bad', true);
+        setText(label, 'Not running as admin');
+        setTitle(el, 'The game runs elevated, so Windows blocks this app\'s '
+            + 'hotkeys and Software-input keypresses from reaching it. '
+            + 'Relaunch as administrator.');
+    }
+}
+
+function renderHealthGame(found) {
+    const el = $('#hs-game');
+    const dot = el.querySelector('.dot');
+    const label = el.querySelector('span');
+    if (found === true) {
+        setClass(dot, 'neutral', false);
+        setClass(dot, 'warn', false);
+        setText(label, 'Game window found');
+        setTitle(el, '');
+    } else if (found === false) {
+        setClass(dot, 'neutral', false);
+        setClass(dot, 'warn', true);
+        setText(label, 'Game window not found');
+        setTitle(el, 'Genshin Impact is not running (or its window has a '
+            + 'different title). Start the game before pressing Start.');
+    } else {
+        setClass(dot, 'warn', false);
+        setClass(dot, 'neutral', true);
+        setText(label, 'Looking for the game…');
+        setTitle(el, '');
+    }
+}
+
+// --- input backend selector ------------------------------------------------
+
+const _BACKEND_LABEL = { software: 'Software', arduino: 'Arduino HID' };
+
+function currentBackend() {
+    return (STATE.lastStatus || {}).input_backend
+        || $('#input-backend').value
+        || 'arduino';
+}
+
+$('#input-backend').addEventListener('change', async () => {
+    const sel = $('#input-backend');
+    const desired = sel.value;
+    const current = currentBackend();
+    if (desired === current) return;
+    const trySwitch = (force) => callApi('set_input_backend', desired, !!force);
+    const res = await trySwitch(false);
+    if (res && res.ok === false && res.reason === 'busy') {
+        const ok = await dlgConfirm('Stop the bot or macro?',
+            'The bot or a macro is currently running. Stop them and switch '
+            + `the input method to ${_BACKEND_LABEL[desired] || desired}?`,
+            { ok: 'Stop and switch' });
+        if (!ok) {
+            sel.value = current;          // revert without re-firing change
+            return;
+        }
+        const res2 = await trySwitch(true);
+        if (res2 && res2.ok === false) {
+            sel.value = current;
+            if (res2.reason === 'still_busy') {
+                await dlgAlert('Input method not switched',
+                    'The bot or macro did not stop in time, so the input '
+                    + 'method was not switched. Try again.');
+            }
+        }
+    } else if (res && res.ok === false) {
+        sel.value = current;
+    }
 });
 
 // --- mode + album options --------------------------------------------------
 
+// Main-tab-only UI state (kept out of the shared STATE object).
+const MAIN = {
+    mode: 'standalone',   // mode shown by the segmented control
+    lastSongs: parseInt($('#songs').value, 10) || 12, // last valid Songs value
+    startPending: null,   // {state, lastError, timer} while Start/Stop is in flight
+    suppressError: null,  // last_error string hidden since the last Start click
+    modeRequest: false,   // a mode-switch confirm is open
+    tipDismissed: false,
+    runStartedAt: 0,      // epoch seconds from Python
+    runEndedAt: 0,        // local epoch seconds when the run went idle
+    lanesSig: '',
+    progSig: '',
+    debug: false,
+};
+
+const _MODE_HINT = {
+    standalone: 'Open any song in the game, then press Start. Plays until you stop it.',
+    album: 'Open a country album page in the game, then press Start.',
+};
+
+const _DIFF_ORDER = ['normal', 'hard', 'pro', 'legendary'];
+const _DIFF_LABEL = { normal: 'Normal', hard: 'Hard', pro: 'Pro', legendary: 'Legendary' };
+
 function modeIsAlbum() {
-    return $('input[name="mode"][value="album"]').checked;
+    return MAIN.mode === 'album';
+}
+
+function setModeUi(mode) {
+    MAIN.mode = mode === 'album' ? 'album' : 'standalone';
+    $$('#mode-seg button').forEach((b) => {
+        const on = b.dataset.mode === MAIN.mode;
+        b.classList.toggle('on', on);
+        b.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
+    setText($('#mode-hint'), _MODE_HINT[MAIN.mode]);
+    applyAlbumDisabledState();
+    renderStageText();
 }
 
 function applyAlbumDisabledState() {
     const album = modeIsAlbum();
     const card = $('#album-card');
-    card.classList.toggle('disabled', !album);
+    card.classList.toggle('dim', !album);
+    card.setAttribute('aria-disabled', album ? 'false' : 'true');
     $$('#album-card input, #album-card select, #album-card button').forEach((el) => {
         el.disabled = !album;
     });
-    // Replay-Canorus sits outside the album card but is album-only too.
-    const rc = $('#replay-canorus');
-    if (rc) rc.disabled = !album;
 }
 
 function applyModeUi() {
@@ -95,8 +401,8 @@ function applyModeUi() {
     callApi('set_mode', modeIsAlbum() ? 'album' : 'standalone');
 }
 
-function onModeRadioChange() {
-    const newMode = modeIsAlbum() ? 'album' : 'standalone';
+async function requestMode(newMode) {
+    if (newMode === MAIN.mode || MAIN.modeRequest) return;
     const status = STATE.lastStatus || {};
     const running = status.state === 'running' || status.state === 'paused';
     const oldMode = status.mode;
@@ -105,18 +411,15 @@ function onModeRadioChange() {
     // the user loses song progress. Standalone has no per-song state to
     // protect, and switching INTO album from idle/standalone is cheap.
     if (running && oldMode === 'album' && newMode !== 'album') {
-        const ok = window.confirm(
-            'Switching modes will abort the current album song. Continue?');
-        if (!ok) {
-            // Revert the radio to album without re-triggering this handler.
-            const r = $('input[name="mode"][value="album"]');
-            if (r) r.checked = true;
-            applyAlbumDisabledState();
-            return;
-        }
+        MAIN.modeRequest = true;
+        const ok = await dlgConfirm('Leave Album mode?',
+            'Switching modes will abort the current album song.',
+            { ok: 'Switch to Standalone', danger: true, focusCancel: true });
+        MAIN.modeRequest = false;
+        if (!ok) return;      // the control still shows the old mode
     }
 
-    applyAlbumDisabledState();
+    setModeUi(newMode);
     if (running) {
         callApi('restart_in_mode', newMode);
     } else {
@@ -124,15 +427,9 @@ function onModeRadioChange() {
     }
 }
 
-$$('input[name="mode"]').forEach((r) => {
-    r.addEventListener('change', onModeRadioChange);
+$$('#mode-seg button').forEach((b) => {
+    b.addEventListener('click', () => requestMode(b.dataset.mode));
 });
-
-// Main-tab-only UI state (kept out of the shared STATE object).
-const MAIN = {
-    lastSongs: parseInt($('#songs').value, 10) || 12, // last valid Songs value
-    startPending: null,   // {state, lastError, timer} while Start/Stop is in flight
-};
 
 // Clamp the Songs box to its min/max and write the clamped value back so
 // what the user sees is what Python runs; garbage (empty / text) restores
@@ -145,112 +442,94 @@ function commitSongs() {
     if (Number.isNaN(v)) v = MAIN.lastSongs;
     v = Math.max(min, Math.min(max, v));
     if (el.value !== String(v)) el.value = String(v);
+    renderSongsSub(v);
     if (v !== MAIN.lastSongs) {
         MAIN.lastSongs = v;
         callApi('set_songs', v);
+        renderStageText();
     }
+}
+
+function renderSongsSub(v) {
+    setText($('#songs-sub'), v >= 12
+        ? 'whole album · wheel returns to song 1 when done'
+        : `${v} of 12 · wheel stays at the last-played song`);
 }
 
 $('#songs').addEventListener('change', commitSongs);
 $('#songs').addEventListener('blur', commitSongs);
 
+// Stepper buttons flank the number; each step commits immediately.
+$$('.stepper .step-up, .stepper .step-down').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        const target = $('#songs');
+        if (!target || target.disabled) return;
+        const step = btn.classList.contains('step-up') ? 1 : -1;
+        const v = parseInt(target.value, 10);
+        const base = Number.isNaN(v) ? MAIN.lastSongs : v;
+        target.value = String(base + step);
+        commitSongs();
+    });
+});
+
 function selectedDifficulties() {
-    return Array.from($$('input[name="difficulty"]:checked'))
-        .map((cb) => cb.value);
+    const on = new Set($$('#diff-chips .chip.on').map((c) => c.dataset.diff));
+    return _DIFF_ORDER.filter((d) => on.has(d));
 }
 
-function applyDifficultiesToCheckboxes(value) {
+function applyDifficultiesToChips(value) {
     // Accept either an array of names, the literal string 'all', or a
     // single difficulty name — JS init may receive any of those
     // depending on how the setting was saved.
-    const all = ['normal', 'hard', 'pro', 'legendary'];
     let wanted;
     if (Array.isArray(value)) wanted = value;
-    else if (value === 'all') wanted = all;
-    else if (typeof value === 'string' && all.includes(value)) wanted = [value];
+    else if (value === 'all') wanted = _DIFF_ORDER;
+    else if (typeof value === 'string' && _DIFF_ORDER.includes(value)) wanted = [value];
     else return;
     const wantedSet = new Set(wanted);
-    $$('input[name="difficulty"]').forEach((cb) => {
-        cb.checked = wantedSet.has(cb.value);
+    $$('#diff-chips .chip').forEach((c) => {
+        const on = wantedSet.has(c.dataset.diff);
+        c.classList.toggle('on', on);
+        c.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
 }
 
-$$('input[name="difficulty"]').forEach((cb) => {
-    cb.addEventListener('change', () => {
-        const chosen = selectedDifficulties();
-        if (chosen.length === 0) {
-            // Refuse to leave the user in a no-difficulty state — re-
-            // check the box they just unchecked.
-            cb.checked = true;
-            return;
-        }
-        callApi('set_difficulty', chosen);
+$$('#diff-chips .chip').forEach((chip) => {
+    chip.addEventListener('click', () => {
+        const on = chip.classList.contains('on');
+        // Refuse to leave the user in a no-difficulty state — the last
+        // lit chip simply stays on.
+        if (on && selectedDifficulties().length === 1) return;
+        chip.classList.toggle('on', !on);
+        chip.setAttribute('aria-pressed', on ? 'false' : 'true');
+        callApi('set_difficulty', selectedDifficulties());
+        renderStageText();
     });
 });
 
-$('#replay-canorus').addEventListener('change', () => {
-    callApi('set_replay_canorus', $('#replay-canorus').checked);
+$('#replay-canorus').addEventListener('click', () => {
+    const el = $('#replay-canorus');
+    const next = !el.classList.contains('on');
+    setSwitch(el, next);
+    callApi('set_replay_canorus', next);
 });
 
-// --- input backend selector ------------------------------------------------
+$('#debug').addEventListener('click', () => {
+    // Python owns the value; the status sync mirrors it back. While idle
+    // the switch is the preset the next Start opens the viz window with.
+    const next = !MAIN.debug;
+    MAIN.debug = next;
+    renderDebugSwitch();
+    callApi('set_debug', next);
+});
 
-function currentBackend() {
-    return (STATE.lastStatus || {}).input_backend
-        || $('#input-backend').value
-        || 'arduino';
+function renderDebugSwitch() {
+    const s = STATE.lastStatus || {};
+    const live = s.state === 'running' || s.state === 'paused';
+    setSwitch($('#debug'), MAIN.debug);
+    setText($('#debug-label'), (MAIN.debug && !live)
+        ? 'Debug overlay · on at next start' : 'Debug overlay');
 }
-
-$('#input-backend').addEventListener('change', () => {
-    const desired = $('#input-backend').value;
-    const current = currentBackend();
-    if (desired === current) return;
-    const trySwitch = (force) => callApi('set_input_backend', desired, !!force);
-    trySwitch(false).then((res) => {
-        if (res && res.ok === false && res.reason === 'busy') {
-            const ok = confirm(
-                'Bot or macro is currently running. Stop them and switch '
-                + 'to ' + desired + '?');
-            if (!ok) {
-                // Revert dropdown without re-firing change.
-                $('#input-backend').value = current;
-                return;
-            }
-            trySwitch(true).then((res2) => {
-                if (res2 && res2.ok === false) {
-                    $('#input-backend').value = current;
-                    if (res2.reason === 'still_busy') {
-                        alert('The bot or macro did not stop in time, so the '
-                            + 'input method was not switched. Try again.');
-                    }
-                }
-            });
-        } else if (res && res.ok === false) {
-            $('#input-backend').value = current;
-        }
-    });
-});
-
-$('#debug').addEventListener('change', () => {
-    callApi('set_debug', $('#debug').checked);
-});
-
-// Custom spinbox up/down — the native number input arrow buttons are
-// hidden in CSS so we re-implement via the styled buttons.
-$$('.spinbox-up, .spinbox-down').forEach((btn) => {
-    btn.addEventListener('click', () => {
-        const target = $(`#${btn.dataset.target}`);
-        if (!target || target.disabled) return;
-        const step = btn.classList.contains('spinbox-up') ? 1 : -1;
-        const v = parseInt(target.value, 10) || 0;
-        const min = parseInt(target.min, 10);
-        const max = parseInt(target.max, 10);
-        let next = v + step;
-        if (!Number.isNaN(min)) next = Math.max(min, next);
-        if (!Number.isNaN(max)) next = Math.min(max, next);
-        target.value = next;
-        target.dispatchEvent(new Event('change'));
-    });
-});
 
 // --- start/stop/pause ------------------------------------------------------
 
@@ -284,39 +563,248 @@ function endStartPendingNow() {
     renderStartButtons(STATE.lastStatus || {});
 }
 
-$('#btn-start').addEventListener('click', () => {
+function botIsRunning() {
+    const s = STATE.lastStatus || {};
+    return s.state === 'running' || s.state === 'paused';
+}
+
+function macroIsBusy() {
+    const s = STATE.lastStatus || {};
+    return s.macro_state === 'recording' || s.macro_state === 'playing';
+}
+
+$('#btn-start').addEventListener('click', async () => {
     if (MAIN.startPending) return;
-    // If a macro is busy and the bot is currently idle, this click would
-    // start the bot. Confirm so the user knows the macro will be killed.
-    if (!botIsRunning() && macroIsBusy()) {
-        const action = (STATE.lastStatus || {}).macro_state;
-        const verb = action === 'recording' ? 'recording' : 'macro playback';
-        if (!confirm(`A macro is ${verb}. Stop it and start the bot?`)) return;
-        beginStartPending();
-        callApi('start_stop_force').then((res) => {
+    const s = STATE.lastStatus || {};
+    if (!botIsRunning()) {
+        // A retry must never show the previous failure next to "Playing":
+        // hide the notice now and keep it hidden until last_error moves.
+        MAIN.suppressError = s.last_error || '';
+        renderBotNotice();
+        // If a macro is busy and the bot is currently idle, this click
+        // would start the bot. Confirm so the user knows the macro will
+        // be killed.
+        if (macroIsBusy()) {
+            const verb = s.macro_state === 'recording' ? 'recording' : 'macro playback';
+            const ok = await dlgConfirm('Stop the macro?',
+                `A macro is ${verb}. Stop it and start the bot?`,
+                { ok: 'Stop macro and start' });
+            if (!ok) return;
+            beginStartPending();
+            const res = await callApi('start_stop_force');
             if (res && res.ok === false) {
                 endStartPendingNow();
                 if (res.reason === 'busy') {
-                    alert('The macro did not stop in time, so the bot was '
+                    dlgAlert('Bot not started',
+                        'The macro did not stop in time, so the bot was '
                         + 'not started. Try again.');
                 }
             }
-        });
-        return;
+            return;
+        }
     }
     beginStartPending();
-    callApi('start_stop').then((ok) => {
-        if (ok === false) endStartPendingNow();
-    });
+    const ok = await callApi('start_stop');
+    if (ok === false) endStartPendingNow();
 });
 $('#btn-pause').addEventListener('click', () => callApi('pause'));
+
+// --- stage: state word, notice, tip, progress, lanes, stats ----------------
+
+const _STATE_WORD = {
+    idle: 'Ready', running: 'Playing', paused: 'Paused', stopping: 'Stopping…',
+};
+
+function difficultyPhrase(list) {
+    const names = (Array.isArray(list) ? list : [])
+        .map((d) => _DIFF_LABEL[d] || d);
+    return names.length ? names.join(' + ') : '';
+}
+
+function renderStageText() {
+    const s = STATE.lastStatus || {};
+    const state = s.state || 'idle';
+    const live = state === 'running' || state === 'paused';
+    const prog = s.album_progress;
+    const h1 = $('#st-state');
+    setText(h1, _STATE_WORD[state] || state);
+    const pulse = $('#st-pulse');
+    setClass(pulse, 'live', state === 'running');
+    setClass(pulse, 'paused', state === 'paused');
+    setClass(pulse, 'stopping', state === 'stopping');
+
+    let sub;
+    if (state === 'stopping') {
+        sub = 'Releasing keys and closing the detector…';
+    } else if (live) {
+        const runMode = s.mode || MAIN.mode;
+        if (runMode === 'album') {
+            if (prog && typeof prog === 'object') {
+                const total = parseInt(prog.total, 10) || 0;
+                const index = parseInt(prog.index, 10) || 0;
+                const results = Array.isArray(prog.results) ? prog.results : [];
+                const skipped = results.filter((r) => r === 'skipped').length;
+                const failed = results.filter((r) => r === 'failed').length;
+                if (index > 0) {
+                    sub = `Song ${index} of ${total}`;
+                    if (prog.difficulty) sub += ` · ${_DIFF_LABEL[prog.difficulty] || prog.difficulty}`;
+                } else {
+                    sub = `Starting · ${plural(total, 'song')}`;
+                }
+                if (skipped) sub += ` · ${skipped} skipped at Canorus`;
+                if (failed) sub += ` · ${failed} failed`;
+            } else {
+                sub = s.song ? `Album · song ${s.song}` : 'Album · starting…';
+            }
+        } else {
+            sub = state === 'paused'
+                ? 'Standalone · detector paused'
+                : 'Standalone · detector running';
+        }
+    } else if (modeIsAlbum()) {
+        const diffs = difficultyPhrase(selectedDifficulties());
+        sub = `Album · ${plural(MAIN.lastSongs, 'song')}${diffs ? ` · ${diffs}` : ''}`;
+    } else {
+        sub = 'Standalone · plays the open song until you stop it';
+    }
+    setText($('#st-sub'), sub);
+    renderLaneHint();
+}
+
+// Bot error notice (last_error). Hidden since the last Start click until
+// Python reports a different value.
+function renderBotNotice() {
+    const s = STATE.lastStatus || {};
+    const err = String(s.last_error || '').trim();
+    if (MAIN.suppressError !== null && err !== MAIN.suppressError) {
+        MAIN.suppressError = null;
+    }
+    const show = !!err && MAIN.suppressError === null;
+    setText($('#bot-notice-msg'), err);
+    setHidden($('#bot-notice'), !show);
+    renderPrereqTip();
+}
+
+function renderPrereqTip() {
+    const s = STATE.lastStatus || {};
+    const idle = !(s.state === 'running' || s.state === 'paused' || s.state === 'stopping');
+    const noticeShown = !$('#bot-notice').hidden;
+    setHidden($('#prereq-tip'), MAIN.tipDismissed || noticeShown || !idle);
+}
+
+$('#prereq-tip-close').addEventListener('click', () => {
+    MAIN.tipDismissed = true;
+    renderPrereqTip();
+    callApi('dismiss_prereq_tip');
+});
+
+// Album progress bar: one segment per song position. Segments are only
+// rebuilt when the total changes; classes update when the data moves.
+function renderAlbumProgress(prog, state) {
+    const bar = $('#album-prog');
+    const legend = $('#album-legend');
+    if (!prog || typeof prog !== 'object') {
+        if (MAIN.progSig !== '') {
+            MAIN.progSig = '';
+            bar.innerHTML = '';
+        }
+        setHidden(bar, true);
+        setHidden(legend, true);
+        return;
+    }
+    const total = Math.max(0, Math.min(12, parseInt(prog.total, 10) || 0));
+    const index = parseInt(prog.index, 10) || 0;
+    const results = Array.isArray(prog.results) ? prog.results : [];
+    const live = state === 'running' || state === 'paused';
+    const sig = `${total}|${index}|${results.join(',')}|${live ? 1 : 0}`;
+    if (sig === MAIN.progSig) return;
+    MAIN.progSig = sig;
+    if (bar.children.length !== total) {
+        bar.innerHTML = '';
+        for (let i = 0; i < total; i += 1) bar.appendChild(document.createElement('i'));
+    }
+    const segs = Array.from(bar.children);
+    segs.forEach((seg, i) => {
+        const r = results[i];
+        let cls = '';
+        if (r === 'played') cls = 'done';
+        else if (r === 'skipped') cls = 'skip';
+        else if (r === 'failed') cls = 'fail';
+        else if (live && index === i + 1) cls = 'now';
+        if (seg.className !== cls) seg.className = cls;
+    });
+    setClass(bar, 'stale', !live);
+    setHidden(bar, total === 0);
+    setHidden(legend, total === 0);
+    setClass(legend, 'stale', !live);
+}
+
+function renderLanes(lanes) {
+    const list = Array.isArray(lanes) ? lanes : [];
+    const sig = list.map((v) => (v ? '1' : '0')).join('');
+    if (sig === MAIN.lanesSig) return;
+    MAIN.lanesSig = sig;
+    $$('#lane-row .lane').forEach((lane, i) => {
+        lane.classList.toggle('on', !!list[i]);
+    });
+}
+
+function renderLaneHint() {
+    const s = STATE.lastStatus || {};
+    const live = s.state === 'running' || s.state === 'paused';
+    setHidden($('#lane-hint'), live);
+}
+
+function fmtElapsed(secs) {
+    const t = Math.max(0, Math.floor(secs));
+    const h = Math.floor(t / 3600);
+    const m = Math.floor((t % 3600) / 60);
+    const sec = t % 60;
+    const mm = String(m).padStart(2, '0');
+    const ss = String(sec).padStart(2, '0');
+    return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function renderElapsed() {
+    const el = $('#st-elapsed');
+    if (!MAIN.runStartedAt) {
+        setText(el, '—');
+        return;
+    }
+    const end = MAIN.runEndedAt || Date.now() / 1000;
+    setText(el, fmtElapsed(end - MAIN.runStartedAt));
+}
+
+setInterval(() => {
+    if (MAIN.runStartedAt && !MAIN.runEndedAt) renderElapsed();
+}, 1000);
+
+// Start / Pause buttons from the live state machine (+ the Start/Stop
+// click debounce in MAIN.startPending).
+function renderStartButtons(data) {
+    const running = data.state === 'running' || data.state === 'paused';
+    const stopping = data.state === 'stopping';
+    const startBtn = $('#btn-start');
+    const pauseBtn = $('#btn-pause');
+    if (stopping) {
+        setText(startBtn, 'Stopping…');
+        setDisabled(startBtn, true);
+    } else {
+        setText(startBtn, running ? 'Stop' : 'Start');
+        setDisabled(startBtn, !!MAIN.startPending);
+    }
+    setClass(startBtn, 'go', !running && !stopping);
+    setClass(startBtn, 'stop', running || stopping);
+    setDisabled(pauseBtn, !running || stopping);
+    setText(pauseBtn, data.state === 'paused' ? 'Resume' : 'Pause');
+}
 
 // --- hotkey rebind ---------------------------------------------------------
 
 $$('.hk-row').forEach((row) => {
     const action = row.dataset.action;
-    const btn = row.querySelector('.rebind');
-    btn.addEventListener('click', () => beginCapture(action));
+    const btn = row.querySelector('.key');
+    if (btn) btn.addEventListener('click', () => beginCapture(action));
 });
 
 // While a capture prompt is open Python DROPS every global hotkey press
@@ -331,11 +819,13 @@ $$('.hk-row').forEach((row) => {
 // swallowed, never submitted -- otherwise a slow capture_begin let F8
 // both bind and fire Start/Stop.
 const CAPTURE_TIMEOUT_MS = 14500;
+const CAPTURE_MSG = 'Press a key or mouse button · Esc or click the key to cancel · left click can’t be bound';
+const CAPTURE_PAUSING = 'Pausing hotkeys…';
 let _captureToken = 0;
 let _captureTimer = null;
 let _captureReady = false;
-// Rebind/Bind button whose own left-click just cancelled its capture: the
-// click event that follows that mousedown must not re-arm it.
+// Key cap whose own left-click just cancelled its capture: the click
+// event that follows that mousedown must not re-arm it.
 let _captureCancelBtn = null;
 // Right-click capture ends before the button is released; keep blocking
 // the native context menu that the release would open.
@@ -345,10 +835,39 @@ function captureArmed() {
     return !!(STATE.capturing || STATE.activeCapturing);
 }
 
+// The card subtitle that hosts the capture message (#28): the hotkey
+// card's for a bot/macro hotkey, the Active macros card's for a binding.
+function captureMsgFor(action) {
+    const row = document.querySelector(`.hk-row[data-action="${action}"]`);
+    if (!row) return null;
+    const card = row.closest('.card');
+    return card ? card.querySelector('.card-sub') : null;
+}
+
+function activeCaptureMsg() {
+    const card = $('#active-macros-card');
+    return card ? card.querySelector('.card-sub') : null;
+}
+
 function currentCaptureMsg() {
     if (STATE.capturing) return captureMsgFor(STATE.capturing);
-    if (STATE.activeCapturing) return $('.active-capture-msg');
+    if (STATE.activeCapturing) return activeCaptureMsg();
     return null;
+}
+
+function setCaptureMsg(el, text) {
+    if (!el) return;
+    el.textContent = text;
+    el.classList.add('cap-msg');
+    el.title = text;
+}
+
+function restoreCardSub(el) {
+    if (!el) return;
+    const def = (el.dataset && el.dataset.default) || '';
+    el.textContent = def;
+    el.title = '';
+    el.classList.remove('cap-msg');
 }
 
 // Ask Python to suspend hotkeys for a fresh token; input stays blocked
@@ -368,8 +887,8 @@ function armCaptureGuard(onArmed) {
                 const msg = currentCaptureMsg();
                 cancelCapture();
                 if (msg) {
-                    msg.textContent =
-                        'Could not pause the hotkeys for capture - try again.';
+                    setCaptureMsg(msg,
+                        'Could not pause the hotkeys for capture — try again.');
                 }
                 return;
             }
@@ -396,7 +915,7 @@ function captureButton() {
     if (STATE.capturing) {
         const row = document.querySelector(
             `.hk-row[data-action="${STATE.capturing}"]`);
-        return row ? row.querySelector('.rebind') : null;
+        return row ? row.querySelector('.key') : null;
     }
     if (STATE.activeCapturing) {
         const row = document.querySelector(
@@ -408,8 +927,8 @@ function captureButton() {
 
 function consumeCancelClick(btn) {
     // True when this click is the tail of the left-click that just
-    // cancelled capture on this same button: clicking Rebind/Bind again
-    // while it shows "..." cancels instead of re-arming.
+    // cancelled capture on this same key cap: clicking the cap again
+    // while it reads "press a key…" cancels instead of re-arming.
     const hit = !!btn && _captureCancelBtn === btn;
     _captureCancelBtn = null;
     return hit;
@@ -418,7 +937,7 @@ function consumeCancelClick(btn) {
 const _CAPTURE_REFUSALS = {
     duplicate_hotkey: 'That binding is already in use.',
     left_click_reserved:
-        'Left Click cannot be a hotkey - it is every attack in Genshin.',
+        'Left Click cannot be a hotkey — it is every attack in Genshin.',
     unsupported_key: 'That key cannot be used as a hotkey.',
     rhythm_key: 'A S D J K L are the keys the bot presses itself.',
     install_failed: 'Could not install that hotkey (see Logs).',
@@ -427,7 +946,7 @@ const _CAPTURE_REFUSALS = {
 function showCaptureRefusal(msg, res) {
     if (!msg) return;
     const why = _CAPTURE_REFUSALS[res && res.reason] || 'Could not bind that.';
-    msg.textContent = `${why} Try another key or button (Esc cancels)...`;
+    setCaptureMsg(msg, `${why} Try another key or button (Esc cancels)…`);
 }
 
 function submitCapture(payload) {
@@ -444,11 +963,11 @@ function submitCapture(payload) {
                 endActiveCapture();
                 return;
             }
-            showCaptureRefusal($('.active-capture-msg'), res);
+            showCaptureRefusal(activeCaptureMsg(), res);
             armCaptureGuard();
         }, () => {
             if (token !== _captureToken || STATE.activeCapturing !== pos) return;
-            showCaptureRefusal($('.active-capture-msg'), null);
+            showCaptureRefusal(activeCaptureMsg(), null);
             armCaptureGuard();
         });
         return;
@@ -473,89 +992,109 @@ function submitCapture(payload) {
     }
 }
 
-function captureMsgFor(action) {
-    // Each card has its own capture message line — find it via the row.
-    const row = document.querySelector(`.hk-row[data-action="${action}"]`);
-    if (!row) return null;
-    const card = row.closest('.card');
-    return card ? card.querySelector('.hk-capture-msg') : null;
+function setCapCapturing(btn) {
+    if (!btn) return;
+    btn.classList.add('cap');
+    btn.classList.remove('unset');
+    btn.textContent = 'press a key…';
 }
 
 function beginCapture(action) {
     const row = document.querySelector(`.hk-row[data-action="${action}"]`);
-    const btn = row ? row.querySelector('.rebind') : null;
-    if (consumeCancelClick(btn) || captureArmed() || !btn) return;
+    const btn = row ? row.querySelector('.key') : null;
+    if (consumeCancelClick(btn) || captureArmed() || !btn || DIALOG.open) return;
     STATE.capturing = action;
-    btn.textContent = '...';
+    setCapCapturing(btn);
     const msg = captureMsgFor(action);
-    if (msg) msg.textContent = 'Pausing hotkeys...';
+    if (msg) setCaptureMsg(msg, CAPTURE_PAUSING);
     armCaptureGuard(() => {
-        if (msg) {
-            msg.textContent =
-                `Press a key or mouse button to bind ${labelFor(action)} (Esc or left-click cancels)...`;
-        }
+        if (msg) setCaptureMsg(msg, CAPTURE_MSG);
     });
 }
 
 function endCapture() {
     if (!STATE.capturing) return;
     const action = STATE.capturing;
-    const row = document.querySelector(`.hk-row[data-action="${action}"]`);
-    if (row) row.querySelector('.rebind').textContent = 'Rebind';
-    const msg = captureMsgFor(action);
-    if (msg) msg.textContent = '';
     STATE.capturing = null;
+    const msg = captureMsgFor(action);
+    restoreCardSub(msg);
+    // Put the current binding back on the cap (or an unset cap if Python
+    // never sent one for this action).
+    const kb = (STATE.lastStatus || {}).keybinds || {};
+    if (kb[action]) {
+        renderKeybinds(kb, action);
+    } else {
+        const row = document.querySelector(`.hk-row[data-action="${action}"]`);
+        const btn = row ? row.querySelector('.key') : null;
+        if (btn) {
+            btn.textContent = 'Bind…';
+            btn.classList.remove('cap');
+            btn.classList.add('unset');
+        }
+    }
     if (!captureArmed()) releaseCaptureGuard();
 }
 
 function beginActiveCapture(pos) {
     const row = document.querySelector(`.active-macro-row[data-active="${pos}"]`);
     const btn = row ? row.querySelector('.active-bind') : null;
-    if (consumeCancelClick(btn) || captureArmed()) return;
+    if (consumeCancelClick(btn) || captureArmed() || DIALOG.open) return;
     STATE.activeCapturing = pos;
-    if (btn) btn.textContent = '...';
-    const label = row && row.querySelector('.active-label');
-    const name = (label && label.textContent.trim()) || pos;
-    const msg = $('.active-capture-msg');
-    if (msg) msg.textContent = 'Pausing hotkeys...';
+    setCapCapturing(btn);
+    const msg = activeCaptureMsg();
+    if (msg) setCaptureMsg(msg, CAPTURE_PAUSING);
     // Same guard as the hotkey rows: global hotkeys are suspended (and
     // the prompt times out) while an active-macro key is being picked.
     armCaptureGuard(() => {
-        if (msg) {
-            msg.textContent =
-                `Press a key or mouse button to bind active macro ${name} (Esc or left-click cancels)...`;
-        }
+        if (msg) setCaptureMsg(msg, CAPTURE_MSG);
     });
 }
 
 function endActiveCapture() {
     if (!STATE.activeCapturing) return;
-    const pos = STATE.activeCapturing;
-    const row = document.querySelector(`.active-macro-row[data-active="${pos}"]`);
-    if (row) row.querySelector('.active-bind').textContent = 'Bind';
-    const msg = $('.active-capture-msg');
-    if (msg) msg.textContent = '';
     STATE.activeCapturing = null;
+    restoreCardSub(activeCaptureMsg());
+    STATE.activeRenderSig = '';
+    renderActiveMacroRows(STATE.lastStatus || {});
     if (!captureArmed()) releaseCaptureGuard();
-}
-
-function labelFor(action) {
-    return ({
-        start_stop:   'Start/Stop',
-        pause:        'Pause/Resume',
-        debug:        'Toggle Debug',
-        macro_record: 'Record/Stop',
-        macro_play:   'Play Macro',
-        macro_stop:   'Stop Playback',
-        macro_save:   'Save Slot',
-        macro_load:   'Load Slot',
-    })[action] || action;
 }
 
 const _MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'OS']);
 
 // Capture phase so reserved-key swallow happens before browser default.
 window.addEventListener('keydown', (ev) => {
+    // A modal dialog owns the keyboard: Escape cancels, Enter confirms,
+    // Tab stays inside the box. Nothing leaks to the page behind it.
+    if (DIALOG.open) {
+        const box = $('#dialog-box');
+        if (ev.key === 'Escape') {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (DIALOG.done) DIALOG.done(DIALOG.cancelValue);
+        } else if (ev.key === 'Enter') {
+            const ae = activeEl();
+            const onButton = ae && ae.tagName === 'BUTTON' && box.contains(ae);
+            if (onButton || (ae && ae.tagName === 'TEXTAREA')) return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (DIALOG.onEnter) DIALOG.onEnter();
+        } else if (ev.key === 'Tab') {
+            const items = focusablesIn(box);
+            if (!items.length) { ev.preventDefault(); return; }
+            const ae = activeEl();
+            const idx = items.indexOf(ae);
+            if (ev.shiftKey && (idx <= 0)) {
+                ev.preventDefault();
+                items[items.length - 1].focus();
+            } else if (!ev.shiftKey && (idx === -1 || idx === items.length - 1)) {
+                ev.preventDefault();
+                items[0].focus();
+            }
+        } else if (ev.key === 'F5' || ev.key === 'F11' || ev.key === 'F12') {
+            ev.preventDefault();
+        }
+        return;
+    }
     // Capture mode (either tab): any non-modifier key gets sent to Python.
     if (captureArmed()) {
         ev.preventDefault();
@@ -595,6 +1134,14 @@ window.addEventListener('keydown', (ev) => {
 // doesn't expose them, the user can still rebind via keyboard.
 const _BROWSER_BUTTON_TO_NAME = ['left', 'middle', 'right', 'x', 'x2'];
 window.addEventListener('mousedown', (ev) => {
+    if (DIALOG.open) {
+        // Clicking the dark backdrop (not the box) cancels the dialog.
+        const t = ev.target;
+        if (t && t.id === 'dialog-scrim' && ev.button === 0 && DIALOG.done) {
+            DIALOG.done(DIALOG.cancelValue);
+        }
+        return;
+    }
     if (!captureArmed()) {
         _captureCancelBtn = null;
         return;
@@ -605,11 +1152,11 @@ window.addEventListener('mousedown', (ev) => {
         // people press "somewhere else" to back out of the prompt -- which
         // is exactly how Play ended up on Left Click. Cancel the capture
         // and let the click carry on to whatever it was aimed at. A click
-        // on the capturing button itself just cancels (see
+        // on the capturing key cap itself just cancels (see
         // consumeCancelClick).
         const btn = captureButton();
         const hit = ev.target && ev.target.closest
-            ? ev.target.closest('.rebind, .active-bind') : null;
+            ? ev.target.closest('button.key') : null;
         _captureCancelBtn = btn && hit === btn ? btn : null;
         cancelCapture();
         return;
@@ -635,17 +1182,94 @@ window.addEventListener('contextmenu', (ev) => {
     }
 }, true);
 
+// --- bindings display --------------------------------------------------------
+
+const _MOUSE_DISPLAY = {
+    left: 'Left Click', right: 'Right Click', middle: 'Middle Click',
+    x: 'Mouse 4', x2: 'Mouse 5',
+};
+
+const _KEY_DISPLAY = {
+    esc: 'Esc', escape: 'Esc', enter: 'Enter', space: 'Space', tab: 'Tab',
+    backspace: 'Backspace', delete: 'Delete', insert: 'Insert', home: 'Home',
+    end: 'End', 'page up': 'Page Up', 'page down': 'Page Down', up: 'Up',
+    down: 'Down', left: 'Left', right: 'Right', ctrl: 'Ctrl', alt: 'Alt',
+    shift: 'Shift', windows: 'Win', 'caps lock': 'Caps Lock',
+    'num lock': 'Num Lock', 'scroll lock': 'Scroll Lock',
+    'print screen': 'PrtSc', pause: 'Pause',
+};
+
+function prettyKeyPart(part) {
+    const p = String(part || '').trim();
+    if (!p) return p;
+    const lower = p.toLowerCase();
+    if (_KEY_DISPLAY[lower]) return _KEY_DISPLAY[lower];
+    if (/^f\d{1,2}$/.test(lower)) return lower.toUpperCase();
+    if (lower.length === 1) return lower.toUpperCase();
+    return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
+function displayBinding(binding) {
+    if (!binding) return '<unset>';
+    const m = /^mouse:(.+)$/i.exec(binding);
+    if (m) {
+        const name = m[1].toLowerCase();
+        return _MOUSE_DISPLAY[name] || `Mouse ${m[1]}`;
+    }
+    return String(binding).split('+').map(prettyKeyPart).join('+');
+}
+
+// Key caps of the hotkey rows. A capturing cap keeps its "press a key…"
+// text; `only` limits the refresh to one action (end of its capture).
+function renderKeybinds(kb, only) {
+    Object.entries(kb || {}).forEach(([action, hotkey]) => {
+        if (only && action !== only) return;
+        const row = document.querySelector(`.hk-row[data-action="${action}"]`);
+        if (!row) return;
+        const btn = row.querySelector('.key');
+        if (!btn) return;
+        if (STATE.capturing === action) return;
+        const hk = String(hotkey || '').toLowerCase();
+        const text = hotkey ? displayBinding(hotkey) : 'Bind…';
+        setText(btn, text);
+        setClass(btn, 'cap', false);
+        setClass(btn, 'unset', !hotkey);
+        setClass(btn, 'warnkey', hk === 'mouse:left');
+        // Mouse hotkeys see every click of that button, including clicks a
+        // playing macro replays. A Left Click saved by an older build is
+        // refused at install time (it is every attack), so say so.
+        setTitle(btn, hk === 'mouse:left'
+            ? 'Left Click is not active as a hotkey — click to rebind this.'
+            : (hk.startsWith('mouse:')
+                ? `${text} — mouse hotkeys also fire when a macro replays this button. Click to change.`
+                : (hotkey ? `${text} — click to change` : 'Click to bind')));
+    });
+}
+
 // --- macros panel ----------------------------------------------------------
 
-let macroSlotMode = 'load';   // 'load' | 'save' | 'clear'
+const MACRO = {
+    lastAction: '',        // JS-initiated action, for the notice lead
+    lastActionAt: 0,
+    noticeLead: '',
+    noticeErr: '',
+    hint: { text: '', until: 0, timer: null },
+};
 
-$$('.macro-mode-btn').forEach((btn) => {
-    btn.addEventListener('click', () => {
-        macroSlotMode = btn.dataset.mode;
-        $$('.macro-mode-btn').forEach((b) =>
-            b.classList.toggle('macro-mode-active', b === btn));
-    });
-});
+const _MACRO_LEADS = {
+    record: 'Record didn’t start.',
+    play: 'Play didn’t start.',
+    save: 'Save failed.',
+    load: 'Load failed.',
+    rename: 'Rename failed.',
+    clear: 'Clear failed.',
+    edit: 'Edits weren’t saved.',
+};
+
+function noteMacroAction(name) {
+    MACRO.lastAction = name;
+    MACRO.lastActionAt = Date.now();
+}
 
 function slotNameOf(n) {
     const map = (STATE.lastStatus && STATE.lastStatus.macro_slot_names) || {};
@@ -653,31 +1277,47 @@ function slotNameOf(n) {
     return map[n] || map[String(n)] || '';
 }
 
-// Transient explanation in the Slots card's #macro-pending line, for
-// refusals the UI can explain without a round-trip (empty slot in Load
-// mode, nothing to save, ...). A hotkey slot-picker prompt wins while
-// one is armed. Python-side failures show in the status pill instead
-// (macro_error).
-const macroHint = { text: '', until: 0, timer: null };
+function slotLabel(n) {
+    const name = slotNameOf(n);
+    return name ? `slot ${n} ("${name}")` : `slot ${n}`;
+}
 
+// Transient explanation in the Saved macros card subtitle, for refusals
+// the UI can explain without a round-trip (empty slot on Load, nothing
+// to save, ...). Python-side failures show in the notice (macro_error).
 function showMacroHint(text, ms = 6000) {
-    macroHint.text = text || '';
-    macroHint.until = Date.now() + ms;
-    renderMacroPending((STATE.lastStatus || {}).macro_pending);
-    clearTimeout(macroHint.timer);
-    macroHint.timer = setTimeout(
-        () => renderMacroPending((STATE.lastStatus || {}).macro_pending),
-        ms + 50);
+    MACRO.hint.text = text || '';
+    MACRO.hint.until = Date.now() + ms;
+    renderSlotsSub();
+    clearTimeout(MACRO.hint.timer);
+    MACRO.hint.timer = setTimeout(renderSlotsSub, ms + 50);
+}
+
+function renderSlotsSub() {
+    const s = STATE.lastStatus || {};
+    const el = $('#slots-sub');
+    if (!el) return;
+    const busy = s.macro_state === 'recording' || s.macro_state === 'playing';
+    let text;
+    let live = false;
+    if (MACRO.hint.text && Date.now() < MACRO.hint.until) {
+        text = MACRO.hint.text;
+        live = true;
+    } else if (busy) {
+        text = `unavailable while ${s.macro_state}`;
+    } else {
+        text = (el.dataset && el.dataset.default) || '';
+    }
+    setText(el, text);
+    setTitle(el, live ? text : '');
+    setClass(el, 'hint-msg', live);
 }
 
 // Row letters (A/B/C) of the active macros that play slot `n`.
 function activeUsersOfSlot(n) {
-    const rows = $$('.active-macro-row');
-    return activeMacrosOf().map((item, i) => {
-        if (item.slot !== n) return null;
-        const label = rows[i] && rows[i].querySelector('.active-label');
-        return (label && label.textContent.trim()) || String(i + 1);
-    }).filter(Boolean);
+    return activeMacrosOf().map((item, i) => (
+        item.slot === n ? 'ABC'[i] || String(i + 1) : null
+    )).filter(Boolean);
 }
 
 // What replacing the working macro right now would throw away, as a
@@ -686,7 +1326,7 @@ function macroUnsavedSummary() {
     const s = STATE.lastStatus || {};
     const parts = [];
     const n = s.macro_events || 0;
-    const evs = `${n} event${n === 1 ? '' : 's'}`;
+    const evs = plural(n, 'event');
     if (s.macro_state === 'recording') {
         parts.push(`a recording in progress (${evs})`);
     } else if (s.macro_dirty && n > 0) {
@@ -714,8 +1354,8 @@ function activeMacrosOf(status) {
     const s = status || STATE.lastStatus || {};
     const active = Array.isArray(s.macro_active_macros)
         ? s.macro_active_macros : [];
-    return $$('.active-macro-row').map((_row, i) => {
-        const item = active[i] || {};
+    return [1, 2, 3].map((pos) => {
+        const item = active[pos - 1] || {};
         return {
             slot: parseInt(item.slot, 10) || 0,
             hotkey: item.hotkey || '',
@@ -729,64 +1369,79 @@ function renderActiveMacroRows(status) {
     const occupied = new Set((s.macro_slots || []).map((n) => parseInt(n, 10)));
     const names = s.macro_slot_names || {};
     const playingSlot = parseInt(s.macro_playing_slot, 10) || 0;
+    const playingActive = s.macro_state === 'playing' && s.macro_playing_source === 'active';
     const sig = JSON.stringify({
         active,
         slots: s.macro_slots || [],
         names,
-        playingSlot,
+        playingSlot: playingActive ? playingSlot : 0,
         state: s.macro_state || '',
     });
     if (sig === STATE.activeRenderSig) return;
     STATE.activeRenderSig = sig;
+    const ae = activeEl();
     $$('.active-macro-row').forEach((row) => {
         const pos = parseInt(row.dataset.active, 10);
         const item = active[pos - 1] || { slot: 0, hotkey: '' };
         const select = row.querySelector('.active-slot');
-        const previous = String(item.slot || 0);
-        select.innerHTML = '<option value="0">No slot</option>';
-        (s.macro_slots || []).forEach((slot) => {
-            const opt = document.createElement('option');
-            opt.value = String(slot);
-            const name = names[slot] || names[String(slot)] || '';
-            opt.textContent = name ? `Slot ${slot} - ${name}` : `Slot ${slot}`;
-            select.appendChild(opt);
-        });
-        if (item.slot && !occupied.has(item.slot)) {
-            const opt = document.createElement('option');
-            opt.value = String(item.slot);
-            opt.textContent = `Missing slot ${item.slot}`;
-            select.appendChild(opt);
+        if (select === ae) {
+            // Don't rebuild a dropdown the user has open; retry next tick.
+            STATE.activeRenderSig = '';
+        } else {
+            const previous = String(item.slot || 0);
+            select.innerHTML = '<option value="0">No slot</option>';
+            (s.macro_slots || []).forEach((slot) => {
+                const opt = document.createElement('option');
+                opt.value = String(slot);
+                const name = names[slot] || names[String(slot)] || '';
+                opt.textContent = name ? `Slot ${slot} · ${name}` : `Slot ${slot}`;
+                select.appendChild(opt);
+            });
+            if (item.slot && !occupied.has(item.slot)) {
+                const opt = document.createElement('option');
+                opt.value = String(item.slot);
+                opt.textContent = `Missing slot ${item.slot}`;
+                select.appendChild(opt);
+            }
+            select.value = previous;
         }
-        select.value = previous;
 
-        const binding = row.querySelector('.active-binding');
-        binding.textContent = displayBinding(item.hotkey);
-        // Same caveat renderKeybinds shows: a mouse hotkey sees every
-        // click of that button, including clicks a playing macro replays.
-        binding.title = String(item.hotkey || '').toLowerCase().startsWith('mouse:')
-            ? `${displayBinding(item.hotkey)} - mouse hotkeys also fire when `
-              + 'a macro replays this button.'
-            : (item.hotkey ? displayBinding(item.hotkey) : '');
+        const cap = row.querySelector('.active-bind');
+        if (STATE.activeCapturing !== pos) {
+            const hk = String(item.hotkey || '').toLowerCase();
+            setText(cap, item.hotkey ? displayBinding(item.hotkey) : 'Bind…');
+            setClass(cap, 'cap', false);
+            setClass(cap, 'unset', !item.hotkey);
+            setClass(cap, 'warnkey', hk === 'mouse:left');
+            // Same caveat renderKeybinds shows: a mouse hotkey sees every
+            // click of that button, including clicks a playing macro replays.
+            setTitle(cap, hk.startsWith('mouse:')
+                ? `${displayBinding(item.hotkey)} — mouse hotkeys also fire when `
+                  + 'a macro replays this button. Click to change.'
+                : (item.hotkey ? `${displayBinding(item.hotkey)} — click to change` : 'Click to bind'));
+        }
 
         const slotReady = !!item.slot && occupied.has(item.slot);
         const isRecording = s.macro_state === 'recording';
-        const isPlayingThis = playingSlot && playingSlot === item.slot;
-        row.classList.toggle('active-playing', !!isPlayingThis);
-        row.querySelector('.active-play').disabled = !slotReady || isRecording;
-        row.querySelector('.active-bind').disabled = isRecording;
-        row.querySelector('.active-clear').disabled = !item.slot && !item.hotkey;
+        const isPlayingThis = playingActive && playingSlot && playingSlot === item.slot;
+        setClass(row, 'active-playing', !!isPlayingThis);
+        setClass(row, 'assigned', !!item.slot || !!item.hotkey);
+        setDisabled(row.querySelector('.active-play'), !slotReady || isRecording);
+        setDisabled(cap, isRecording);
+        setDisabled(row.querySelector('.active-clear'), !item.slot && !item.hotkey);
     });
 }
 
 function renderActivePolicy(policy) {
     const normalized = policy === 'interrupt' ? 'interrupt' : 'ignore';
-    $$('.active-policy-btn').forEach((btn) => {
-        btn.classList.toggle('macro-mode-active',
-            btn.dataset.policy === normalized);
+    $$('#policy-seg button').forEach((btn) => {
+        const on = btn.dataset.policy === normalized;
+        btn.classList.toggle('on', on);
+        btn.setAttribute('aria-checked', on ? 'true' : 'false');
     });
 }
 
-$$('.active-policy-btn').forEach((btn) => {
+$$('#policy-seg button').forEach((btn) => {
     btn.addEventListener('click', () => {
         callApi('macro_set_conflict_policy', btn.dataset.policy);
     });
@@ -800,204 +1455,357 @@ $$('.active-macro-row').forEach((row) => {
                 if (res && res.ok === false) {
                     STATE.activeRenderSig = '';
                     renderActiveMacroRows(STATE.lastStatus || {});
+                    if (res.reason === 'duplicate_slot' || res.reason === 'empty_slot') {
+                        showMacroHint(res.message || 'That slot cannot be assigned here.');
+                    }
                 }
             });
     });
     row.querySelector('.active-bind').addEventListener('click', () => {
         beginActiveCapture(pos);
     });
-    row.querySelector('.active-play').addEventListener('click', () => {
-        callApi('macro_play_active', pos, false).then((res) => {
-            if (res && res.ok === false && res.reason === 'bot_running') {
-                if (confirm('The bot is running. Stop it and play this active macro?')) {
-                    callApi('macro_play_active', pos, true);
-                }
+    row.querySelector('.active-play').addEventListener('click', async () => {
+        noteMacroAction('play');
+        const res = await callApi('macro_play_active', pos, false);
+        if (res && res.ok === false && res.reason === 'bot_running') {
+            const ok = await dlgConfirm('Stop the bot?',
+                'The bot is running. Stop it and play this active macro?',
+                { ok: 'Stop bot and play' });
+            if (ok) {
+                noteMacroAction('play');
+                callApi('macro_play_active', pos, true);
             }
-        });
+        }
     });
     row.querySelector('.active-clear').addEventListener('click', () => {
         callApi('macro_clear_active', pos);
     });
 });
 
-$$('.slot').forEach((btn) => {
-    btn.addEventListener('click', () => {
-        const n = parseInt(btn.dataset.slot, 10);
-        if (Number.isNaN(n)) return;
-        const s = STATE.lastStatus || {};
-        const occupied = btn.classList.contains('slot-occupied');
-        const existing = slotNameOf(n);
-        const label = existing ? ` ("${existing}")` : '';
-        if (macroIsBusy()) {
-            // The grid is disabled while busy; covers a click that raced
-            // the status push.
-            showMacroHint(`Stop ${s.macro_state === 'recording'
-                ? 'recording' : 'playback'} before using the slots.`);
+// --- slot grid ---------------------------------------------------------------
+
+function slotIsOccupied(n) {
+    const s = STATE.lastStatus || {};
+    return (s.macro_slots || []).map((x) => parseInt(x, 10)).includes(n);
+}
+
+const _SLOT_ACTS_FILLED =
+    '<button type="button" data-act="load">Load</button>'
+    + '<button type="button" data-act="save">Save</button>'
+    + '<button type="button" data-act="rename">Rename</button>'
+    + '<button type="button" data-act="clear" class="danger">Clear</button>';
+const _SLOT_ACTS_EMPTY =
+    '<button type="button" data-act="save" class="wide">Save here</button>';
+
+function renderMacroSlots(s) {
+    const slots = (s.macro_slots || []).map((n) => parseInt(n, 10));
+    const occupied = new Set(slots);
+    const names = s.macro_slot_names || {};
+    const loaded = parseInt(s.macro_loaded, 10) || 0;
+    const macroState = s.macro_state || 'idle';
+    const active = activeMacrosOf(s);
+    const sig = JSON.stringify({ slots, names, loaded, macroState, active });
+    if (sig === STATE.slotsRenderSig) return;
+    STATE.slotsRenderSig = sig;
+    // Slots can't load / save / rename / clear while recording or
+    // playing — the whole card locks instead of refusing silently.
+    const busy = macroState === 'recording' || macroState === 'playing';
+    const card = $('#slots-card');
+    setClass(card, 'locked', busy);
+    card.setAttribute('aria-disabled', busy ? 'true' : 'false');
+    renderSlotsSub();
+    $$('#slot-grid .slot').forEach((tile) => {
+        const n = parseInt(tile.dataset.slot, 10);
+        const isOcc = occupied.has(n);
+        setClass(tile, 'filled', isOcc);
+        setClass(tile, 'empty', !isOcc);
+        setClass(tile, 'loaded', isOcc && n === loaded);
+        const nameEl = tile.querySelector('.name');
+        const name = isOcc ? (names[n] || names[String(n)] || '') : '';
+        setText(nameEl, isOcc ? (name || 'Saved macro') : 'Empty');
+        // Badges: which active rows play this slot.
+        const letters = active.map((it, i) => (it.slot === n ? 'ABC'[i] : null)).filter(Boolean);
+        const ab = tile.querySelector('.ab');
+        const abHtml = letters.map((l) => `<i>${l}</i>`).join('');
+        if (ab.innerHTML !== abHtml) ab.innerHTML = abHtml;
+        // Hover actions depend on occupancy only.
+        const acts = tile.querySelector('.acts');
+        const occKey = isOcc ? 'filled' : 'empty';
+        if (acts.dataset.occ !== occKey) {
+            acts.dataset.occ = occKey;
+            acts.innerHTML = isOcc ? _SLOT_ACTS_FILLED : _SLOT_ACTS_EMPTY;
+        }
+        // The 12 px name is ellipsized; the tooltip carries the full one.
+        const busyNote = busy ? ` (stop ${macroState} to use the slots)` : '';
+        const extra = letters.length ? ` · active macro ${letters.join(', ')}` : '';
+        setTitle(tile, isOcc
+            ? `Slot ${n}: ${name || '(unnamed)'}${n === loaded ? ' · loaded' : ''}${extra}${busyNote}`
+            : `Slot ${n}: empty${busyNote}`);
+    });
+}
+
+async function slotAction(act, n) {
+    if (Number.isNaN(n)) return;
+    const s = STATE.lastStatus || {};
+    const occupied = slotIsOccupied(n);
+    const existing = slotNameOf(n);
+    const label = existing ? ` ("${existing}")` : '';
+    if (macroIsBusy()) {
+        // The grid is locked while busy; covers a click that raced
+        // the status push.
+        showMacroHint(`Stop ${s.macro_state === 'recording'
+            ? 'recording' : 'playback'} before using the slots.`);
+        return;
+    }
+    if (act === 'load') {
+        if (!occupied) {
+            showMacroHint(`Slot ${n} is empty — use "Save here" to store the current macro there.`);
             return;
         }
-        if (macroSlotMode === 'load') {
-            if (!occupied) {
-                showMacroHint(`Slot ${n} is empty — switch to Save to `
-                    + 'store the current macro there.');
-                return;
-            }
-            const loss = macroUnsavedSummary();
-            if (loss && !confirm(
-                `Load slot ${n}${label}?\n\nThis replaces the current macro, `
-                + `and you have ${loss} that will be lost.`)) {
-                return;
-            }
-            callApi('macro_load_slot', n).then((res) => {
-                if (res && res.ok) discardEditorEdits();
-            });
-        } else if (macroSlotMode === 'save') {
-            if ((s.macro_events || 0) === 0) {
-                showMacroHint('Nothing to save — record or load a macro first.');
-                return;
-            }
-            if (evtState.visible && evtState.jsDirty && !confirm(
-                'The events editor has unsaved edits that are not in the '
-                + 'macro yet (press Save in the editor to apply them).\n\n'
-                + `Save the macro to slot ${n} without those edits?`)) {
-                return;
-            }
-            if (occupied) {
-                const what = existing ? `"${existing}"` : 'a saved macro';
-                const users = activeUsersOfSlot(n);
-                if (!confirm(
-                    `Slot ${n} already contains ${what}. ` +
-                    `Overwrite with the current macro?` +
-                    (users.length ? `\n\nActive macro ${users.join(', ')} `
-                        + 'plays this slot and will play the new macro.' : ''))) {
-                    return;
-                }
-            }
-            // Pin the buffer the user is naming: if it changes while the
-            // prompt is open (in-game record hotkey), Python refuses.
-            const rev = s.macro_rev;
-            const promptMsg = occupied
-                ? `Overwrite slot ${n} — name (leave blank for none):`
-                : `Save to slot ${n} — name (leave blank for none):`;
-            const name = window.prompt(promptMsg, existing);
-            if (name === null) return;   // cancelled at name prompt
-            callApi('macro_save_slot', n, name,
-                    typeof rev === 'number' ? rev : null).then((res) => {
-                if (res && res.ok === false && res.reason === 'stale') {
-                    showMacroHint('The macro changed while you were naming it '
-                        + '— nothing was saved. Try again.');
-                }
-            });
-        } else if (macroSlotMode === 'rename') {
-            if (!occupied) {
-                showMacroHint(`Slot ${n} is empty — nothing to rename.`);
-                return;
-            }
-            const name = window.prompt(`Rename slot ${n}:`, existing);
-            if (name === null) return;
-            callApi('macro_rename_slot', n, name);
-        } else if (macroSlotMode === 'clear') {
-            if (!occupied) {
-                showMacroHint(`Slot ${n} is already empty.`);
-                return;
-            }
-            const users = activeUsersOfSlot(n);
-            const loaded = parseInt(s.macro_loaded, 10) || 0;
-            let msg = `Clear macro slot ${n}${label}? This cannot be undone.`;
-            if (users.length) {
-                msg += `\n\nActive macro ${users.join(', ')} uses this slot `
-                    + 'and will be unassigned (its hotkey stays bound but '
-                    + 'does nothing until you pick another slot).';
-            }
-            if (loaded === n && (s.macro_events || 0) > 0) {
-                msg += '\n\nThe events loaded from it stay in the current '
-                    + 'macro as unsaved.';
-            }
-            if (confirm(msg)) callApi('macro_clear_slot', n);
+        const loss = macroUnsavedSummary();
+        if (loss) {
+            const ok = await dlgConfirm(`Load slot ${n}${label}?`,
+                `This replaces the current macro, and you have ${loss} that will be lost.`,
+                { ok: 'Load and discard', danger: true, focusCancel: true });
+            if (!ok) return;
         }
-    });
+        noteMacroAction('load');
+        const res = await callApi('macro_load_slot', n);
+        if (res && res.ok) discardEditorEdits();
+    } else if (act === 'save') {
+        openSaveDialog(n);
+    } else if (act === 'rename') {
+        if (!occupied) {
+            showMacroHint(`Slot ${n} is empty — nothing to rename.`);
+            return;
+        }
+        const name = await dlgPrompt(`Rename slot ${n}`, '',
+            { label: 'Name', value: existing, ok: 'Rename' });
+        if (name === null) return;
+        noteMacroAction('rename');
+        callApi('macro_rename_slot', n, name);
+    } else if (act === 'clear') {
+        if (!occupied) {
+            showMacroHint(`Slot ${n} is already empty.`);
+            return;
+        }
+        const users = activeUsersOfSlot(n);
+        const loaded = parseInt(s.macro_loaded, 10) || 0;
+        let body = existing
+            ? `"${existing}" will be deleted from disk. This can’t be undone.`
+            : 'The saved macro will be deleted from disk. This can’t be undone.';
+        if (users.length) {
+            body += `\n\nActive macro ${users.join(', ')} uses this slot and will be `
+                + 'unassigned (its hotkey stays bound but does nothing until you '
+                + 'pick another slot).';
+        }
+        if (loaded === n && (s.macro_events || 0) > 0) {
+            body += '\n\nThe events loaded from it stay in the current macro as unsaved.';
+        }
+        const ok = await dlgConfirm(`Clear slot ${n}?`, body,
+            { ok: 'Clear slot', cancel: 'Keep it', danger: true, focusCancel: true });
+        if (!ok) return;
+        noteMacroAction('clear');
+        callApi('macro_clear_slot', n);
+    }
+}
+
+$('#slot-grid').addEventListener('click', (ev) => {
+    const act = ev.target && ev.target.closest ? ev.target.closest('[data-act]') : null;
+    if (!act) return;
+    const tile = act.closest('.slot');
+    if (!tile) return;
+    slotAction(act.dataset.act, parseInt(tile.dataset.slot, 10));
 });
 
-function botIsRunning() {
+// Keyboard: Enter on a focused tile = Load (filled) / Save here (empty).
+$('#slot-grid').addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    const t = ev.target;
+    if (!t || !t.classList || !t.classList.contains('slot')) return;
+    ev.preventDefault();
+    const n = parseInt(t.dataset.slot, 10);
+    slotAction(slotIsOccupied(n) ? 'load' : 'save', n);
+});
+
+// Save-to-slot picker (#25): name + 18 mini slots + overwrite warning.
+// Serves "Save here" on an empty tile, "Save" on a filled tile and the
+// transport's "Save to slot…" button. The buffer revision is pinned when
+// the dialog opens so a macro recorded meanwhile (in-game hotkey) can't
+// be saved under the name the user typed for the old one.
+async function openSaveDialog(preSlot) {
     const s = STATE.lastStatus || {};
-    return s.state === 'running' || s.state === 'paused';
+    if (macroIsBusy()) {
+        showMacroHint(`Stop ${s.macro_state} before saving.`);
+        return;
+    }
+    const events = s.macro_events || 0;
+    if (events === 0) {
+        showMacroHint('Nothing to save — record or load a macro first.');
+        return;
+    }
+    if (evtState.visible && evtState.jsDirty) {
+        const ok = await dlgConfirm('Save without the editor edits?',
+            'The events editor has unsaved edits that are not in the macro '
+            + 'yet (press Save changes in the editor to apply them).\n\n'
+            + 'Save the macro without those edits?',
+            { ok: 'Save without them', focusCancel: true });
+        if (!ok) return;
+    }
+    const rev = s.macro_rev;
+    const loaded = parseInt(s.macro_loaded, 10) || 0;
+    const slots = new Set((s.macro_slots || []).map((n) => parseInt(n, 10)));
+    const names = s.macro_slot_names || {};
+    const nameOf = (n) => names[n] || names[String(n)] || '';
+    const pre = preSlot || loaded || 0;
+    const picked = await showDialog((box, done) => {
+        box.classList.add('wide');
+        box.appendChild(dlgEl('h2', '', 'Save to a slot')).id = 'dialog-title';
+        box.appendChild(dlgEl('p', '',
+            `${plural(events, 'event')} in the working macro. Pick a slot and give it a name.`));
+        const label = dlgEl('label', 'f', 'Name');
+        label.htmlFor = 'dialog-text';
+        box.appendChild(label);
+        const input = dlgEl('input', 'text');
+        input.type = 'text';
+        input.id = 'dialog-text';
+        input.spellcheck = false;
+        input.placeholder = 'leave blank for no name';
+        input.value = pre ? nameOf(pre) : '';
+        box.appendChild(input);
+        let touched = false;
+        input.addEventListener('input', () => { touched = true; });
+        const grid = dlgEl('div', 'mslots');
+        const tiles = [];
+        let current = 0;
+        const msg = dlgEl('span', 'left', 'Pick a slot.');
+        const ok = dlgButton('Save', 'go', () => {
+            if (current) done({ slot: current, name: input.value });
+        });
+        ok.disabled = true;
+        const pick = (n) => {
+            current = n;
+            tiles.forEach((t) => t.classList.toggle('pick', parseInt(t.dataset.slot, 10) === n));
+            const filled = slots.has(n);
+            const nm = nameOf(n);
+            if (!touched) input.value = nm;
+            const users = activeUsersOfSlot(n);
+            let text;
+            if (!filled) {
+                text = `Slot ${n} is empty.`;
+            } else {
+                text = `Slot ${n} · "${nm || 'unnamed'}" will be overwritten.`;
+                if (users.length) {
+                    text += ` Active macro ${users.join(', ')} plays this slot and will play the new macro.`;
+                }
+            }
+            msg.textContent = text;
+            msg.classList.toggle('warn', filled);
+            ok.textContent = filled ? `Overwrite slot ${n}` : `Save to slot ${n}`;
+            ok.disabled = false;
+        };
+        for (let n = 1; n <= 18; n += 1) {
+            const filled = slots.has(n);
+            const t = dlgEl('button', `mslot${filled ? '' : ' empty'}`);
+            t.type = 'button';
+            t.dataset.slot = String(n);
+            t.appendChild(dlgEl('span', 'n', String(n).padStart(2, '0')));
+            t.appendChild(dlgEl('span', 'name', filled ? (nameOf(n) || 'Saved macro') : 'Empty'));
+            t.title = filled ? `Slot ${n}: ${nameOf(n) || '(unnamed)'}` : `Slot ${n}: empty`;
+            t.addEventListener('click', () => pick(n));
+            grid.appendChild(t);
+            tiles.push(t);
+        }
+        box.appendChild(grid);
+        const row = dlgEl('div', 'row');
+        row.appendChild(msg);
+        row.appendChild(dlgButton('Cancel', '', () => done(null)));
+        row.appendChild(ok);
+        box.appendChild(row);
+        if (pre) pick(pre);
+        setTimeout(() => { try { input.select(); } catch (e) { /* no-op */ } }, 0);
+        return {
+            initialFocus: input,
+            onEnter: () => { if (current) done({ slot: current, name: input.value }); },
+        };
+    }, null);
+    if (!picked) return;
+    noteMacroAction('save');
+    const res = await callApi('macro_save_slot', picked.slot, picked.name,
+        typeof rev === 'number' ? rev : null);
+    if (res && res.ok === false && res.reason === 'stale') {
+        showMacroHint('The macro changed while you were naming it — nothing was saved. Try again.');
+    }
 }
 
-function macroIsBusy() {
-    const s = STATE.lastStatus || {};
-    return s.macro_state === 'recording' || s.macro_state === 'playing';
-}
+$('#macro-save-to').addEventListener('click', () => openSaveDialog(0));
 
-$('#macro-record').addEventListener('click', () => {
+// --- transport -------------------------------------------------------------------
+
+$('#macro-record').addEventListener('click', async () => {
     const starting = (STATE.lastStatus || {}).macro_state !== 'recording';
     if (starting) {
         const loss = macroUnsavedSummary();
-        if (loss && !confirm(
-            'Start a new recording?\n\nRecording replaces the current '
-            + `macro, and you have ${loss} that will be lost.`)) {
-            return;
+        if (loss) {
+            const ok = await dlgConfirm('Start a new recording?',
+                `Recording replaces the current macro, and you have ${loss} that will be lost.`,
+                { ok: 'Record', danger: true, focusCancel: true });
+            if (!ok) return;
         }
+        noteMacroAction('record');
     }
     const after = (res) => {
         if (starting && res && res.ok) discardEditorEdits();
     };
-    callApi('macro_toggle_record', false).then((res) => {
-        if (res && res.ok === false && res.reason === 'bot_running') {
-            if (confirm('The bot is running. Stop it and start recording?')) {
-                callApi('macro_toggle_record', true).then(after);
-            }
-            return;
+    const res = await callApi('macro_toggle_record', false);
+    if (res && res.ok === false && res.reason === 'bot_running') {
+        const ok = await dlgConfirm('Stop the bot?',
+            'The bot is running. Stop it and start recording?',
+            { ok: 'Stop bot and record' });
+        if (ok) {
+            noteMacroAction('record');
+            callApi('macro_toggle_record', true).then(after);
         }
-        after(res);
-    });
+        return;
+    }
+    after(res);
 });
 
-$('#macro-play').addEventListener('click', () => {
-    callApi('macro_play', false).then((res) => {
-        if (res && res.ok === false && res.reason === 'bot_running') {
-            if (confirm('The bot is running. Stop it and play the macro?')) {
-                callApi('macro_play', true);
-            }
+$('#macro-play').addEventListener('click', async () => {
+    noteMacroAction('play');
+    const res = await callApi('macro_play', false);
+    if (res && res.ok === false && res.reason === 'bot_running') {
+        const ok = await dlgConfirm('Stop the bot?',
+            'The bot is running. Stop it and play the macro?',
+            { ok: 'Stop bot and play' });
+        if (ok) {
+            noteMacroAction('play');
+            callApi('macro_play', true);
         }
-    });
+    }
 });
 
 $('#macro-stop-play').addEventListener('click', () => callApi('macro_stop'));
 
-function renderMacroSlots(slots, namesMap, loadedSlot, macroState) {
-    const occupied = new Set(slots || []);
-    const names = namesMap || {};
-    const loaded = parseInt(loadedSlot, 10) || 0;
-    // Slots can't load / save / rename / clear while recording or
-    // playing — disable them instead of refusing silently.
-    const busy = macroState === 'recording' || macroState === 'playing';
-    $$('.slot').forEach((btn) => {
-        const n = parseInt(btn.dataset.slot, 10);
-        const isOcc = occupied.has(n);
-        btn.classList.toggle('slot-occupied', isOcc);
-        btn.classList.toggle('slot-loaded', isOcc && n === loaded);
-        btn.disabled = busy;
-        const nameEl = btn.querySelector('.slot-name');
-        if (!nameEl) return;
-        // The 9 px name is ellipsized; the tooltip carries the full one.
-        const busyNote = busy ? ` (stop ${macroState} to use the slots)` : '';
-        if (!isOcc) {
-            nameEl.textContent = 'empty';
-            btn.title = `Slot ${n}: empty${busyNote}`;
-            return;
-        }
-        const name = names[n] || names[String(n)] || '';
-        nameEl.textContent = name || 'saved';
-        btn.title = `Slot ${n}: ${name || '(unnamed)'}`
-            + (n === loaded ? ' · loaded' : '') + busyNote;
-    });
+function renderMacroNotice(s) {
+    const err = String(s.macro_error || '').trim();
+    if (!err) {
+        MACRO.noticeErr = '';
+        setHidden($('#macro-notice'), true);
+        return;
+    }
+    if (err !== MACRO.noticeErr) {
+        MACRO.noticeErr = err;
+        const recent = MACRO.lastAction && (Date.now() - MACRO.lastActionAt) < 15000;
+        MACRO.noticeLead = (recent && _MACRO_LEADS[MACRO.lastAction]) || 'Couldn’t do that.';
+    }
+    setText($('#macro-notice-lead'), MACRO.noticeLead);
+    setText($('#macro-notice-msg'), err);
+    setHidden($('#macro-notice'), false);
 }
 
 function renderMacroState(s) {
     s = s || {};
-    const statusEl = $('#macro-status');
-    const recBtn = $('#macro-record');
-    const playBtn = $('#macro-play');
-    const stopBtn = $('#macro-stop-play');
     const stateLabel = s.macro_state || 'idle';
     const bufferEvents = s.macro_events || 0;
     // While playing, count what is actually playing — an active slot's
@@ -1007,52 +1815,88 @@ function renderMacroState(s) {
         ? playingEvents : bufferEvents;
     const loaded = parseInt(s.macro_loaded, 10) || 0;
     const isDirty = !!s.macro_dirty;
-    let suffix = '';
-    if (stateLabel === 'playing' && s.macro_playing_source === 'active') {
+    const names = s.macro_slot_names || {};
+    const recording = stateLabel === 'recording';
+    const playing = stateLabel === 'playing';
+
+    // Status pill: state + live event count (#16, #26).
+    const pill = $('#macro-pill');
+    setClass(pill, 'rec', recording);
+    setClass(pill, 'play', playing);
+    setHidden($('#macro-pill-dot'), !recording);
+    setText($('#macro-pill-state'),
+        recording ? 'Recording' : (playing ? 'Playing' : 'Idle'));
+    setText($('#macro-pill-events'), plural(events, 'event'));
+
+    // Slot pill: where the working macro came from, or "Not saved yet".
+    const slotPill = $('#macro-slot-pill');
+    const slotText = $('#macro-slot-text');
+    const slotTag = $('#macro-slot-tag');
+    let showSlotPill = false;
+    let unsavedPill = false;
+    let text = '';
+    let tag = '';
+    if (playing && s.macro_playing_source === 'active') {
         const slot = parseInt(s.macro_playing_slot, 10) || 0;
         const name = s.macro_playing_name || '';
-        suffix = name
-            ? ` · active slot ${slot} (${name})`
-            : ` · active slot ${slot}`;
+        text = name ? `Active · slot ${slot} · ${name}` : `Active · slot ${slot}`;
+        showSlotPill = true;
     } else if (loaded > 0) {
-        const names = s.macro_slot_names || {};
         const name = names[loaded] || names[String(loaded)] || '';
-        const tag = isDirty ? '*' : '';
-        suffix = name
-            ? ` · slot ${loaded}${tag} (${name})`
-            : ` · slot ${loaded}${tag}`;
-    } else if (isDirty && bufferEvents > 0) {
-        suffix = ' · unsaved';
+        text = name ? `Slot ${loaded} · ${name}` : `Slot ${loaded}`;
+        tag = isDirty ? 'unsaved' : '';
+        showSlotPill = true;
+    } else if (isDirty && bufferEvents > 0 && !recording) {
+        text = 'Not saved yet';
+        unsavedPill = true;
+        showSlotPill = true;
     }
-    const base =
-        `${stateLabel} · ${events} event${events === 1 ? '' : 's'}${suffix}`;
-    // Last macro failure (game not found, save failed, ...) leads the
-    // pill so the ellipsis can't hide it; cleared by the next success.
-    const err = String(s.macro_error || '').trim();
-    statusEl.textContent = err ? `${err} · ${base}` : base;
-    // CSS truncates long slot names with ellipsis; mirror the full
-    // string on `title` so hover still reveals what got cut.
-    statusEl.title = err ? `${err}\n${base}` : base;
-    statusEl.classList.toggle('macro-status-recording',
-        stateLabel === 'recording' || (!!err && stateLabel === 'idle'));
-    statusEl.classList.toggle('macro-status-playing', stateLabel === 'playing');
-    recBtn.textContent = stateLabel === 'recording' ? 'Stop Recording' : 'Record';
-    recBtn.disabled = stateLabel === 'playing';
-    playBtn.disabled = stateLabel !== 'idle' || bufferEvents === 0;
-    stopBtn.disabled = stateLabel !== 'playing';
+    setText(slotText, text);
+    setTitle(slotPill, text);
+    setText(slotTag, tag);
+    setHidden(slotTag, !tag);
+    setClass(slotPill, 'unsaved', unsavedPill);
+    setHidden(slotPill, !showSlotPill);
+    const canSave = stateLabel === 'idle' && bufferEvents > 0 && isDirty;
+    setHidden($('#macro-save-to'), !canSave);
+    setHidden($('#macro-rec-note'), !recording);
+
+    // Transport buttons.
+    const recBtn = $('#macro-record');
+    setText($('#macro-record-label'), recording ? 'Stop recording' : 'Record');
+    setClass(recBtn, 'rec-on', recording);
+    setClass(recBtn.querySelector('.rec-dot'), 'blink', recording);
+    setDisabled(recBtn, playing);
+    setDisabled($('#macro-play'), stateLabel !== 'idle' || bufferEvents === 0);
+    setDisabled($('#macro-stop-play'), !playing);
+
+    // Locks (#26): saved + active cards while recording or playing.
+    const busy = recording || playing;
+    const activeCard = $('#active-macros-card');
+    setClass(activeCard, 'locked', busy);
+    activeCard.setAttribute('aria-disabled', busy ? 'true' : 'false');
+    const activeSub = activeCard.querySelector('.card-sub');
+    if (activeSub && STATE.activeCapturing === null) {
+        setText(activeSub, busy ? `unavailable while ${stateLabel}`
+            : ((activeSub.dataset && activeSub.dataset.default) || ''));
+    }
+    if (busy && captureArmed()) cancelCapture();
+
+    renderMacroNotice(s);
+    renderEventsCardState();
 }
+
+const _PENDING_TEXT = {
+    save: 'Save (in Genshin): press 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc or leaving the game cancels.',
+    load: 'Load (in Genshin): press 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc or leaving the game cancels.',
+};
 
 function renderMacroPending(pending) {
     const el = $('#macro-pending');
-    if (pending === 'save') {
-        el.textContent = 'Save (in Genshin): 1-9 picks slots 1-9; 0 then 1-9 picks 10-18. Esc or leaving the game cancels.';
-    } else if (pending === 'load') {
-        el.textContent = 'Load (in Genshin): 1-9 picks slots 1-9; 0 then 1-9 picks 10-18. Esc or leaving the game cancels.';
-    } else if (macroHint.text && Date.now() < macroHint.until) {
-        el.textContent = macroHint.text;
-    } else {
-        el.textContent = '';
-    }
+    const live = pending === 'save' || pending === 'load';
+    setText(el, live ? _PENDING_TEXT[pending]
+        : 'Save / Load: press the key, then 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc cancels.');
+    setClass(el, 'live', live);
 }
 
 // --- events editor ---------------------------------------------------------
@@ -1096,28 +1940,25 @@ function renderEventsTable() {
     const tbody = $('#evt-tbody');
     tbody.innerHTML = '';
     evtState.working.forEach((ev, i) => {
-        const t = (typeof ev.time === 'number' ? ev.time : 0).toFixed(3);
+        const t = (typeof ev.time === 'number' ? ev.time : parseFloat(ev.time) || 0).toFixed(3);
         const dev = (ev.device || 'keyboard').toLowerCase();
         const evt = (ev.event_type || 'down').toLowerCase();
         const tr = document.createElement('tr');
+        if (ev.__edited) tr.className = 'edited';
         tr.innerHTML = `
-            <td class="evt-idx">${i + 1}</td>
-            <td><input type="number" step="0.001" min="0" value="${t}" data-field="time"></td>
-            <td>
-                <select data-field="device">
+            <td class="i">${i + 1}</td>
+            <td><input type="number" step="0.001" min="0" value="${t}" data-field="time" aria-label="Time"></td>
+            <td><span class="sel"><select data-field="device" aria-label="Device">
                     <option value="keyboard"${dev === 'keyboard' ? ' selected' : ''}>keyboard</option>
                     <option value="mouse"${dev === 'mouse' ? ' selected' : ''}>mouse</option>
-                </select>
-            </td>
-            <td><input type="text" value="${escapeAttr(ev.key || '')}" data-field="key" spellcheck="false"></td>
-            <td>
-                <select data-field="event_type">
+                </select></span></td>
+            <td><input type="text" value="${escapeAttr(ev.key || '')}" data-field="key" spellcheck="false" aria-label="Key"></td>
+            <td><span class="sel"><select data-field="event_type" aria-label="Event">
                     <option value="down"${evt === 'down' ? ' selected' : ''}>down</option>
                     <option value="up"${evt === 'up' ? ' selected' : ''}>up</option>
                     <option value="double"${evt === 'double' ? ' selected' : ''}>double</option>
-                </select>
-            </td>
-            <td><button type="button" class="evt-del" title="Delete row">&times;</button></td>
+                </select></span></td>
+            <td><button type="button" class="del" title="Delete row">&times;</button></td>
         `;
         tr.querySelectorAll('[data-field]').forEach((el) => {
             el.addEventListener('input', () => {
@@ -1125,12 +1966,14 @@ function renderEventsTable() {
                 let val = el.value;
                 if (field === 'time') val = parseFloat(val) || 0;
                 evtState.working[i][field] = val;
+                evtState.working[i].__edited = true;
+                tr.classList.add('edited');
                 evtState.jsDirty = true;
                 evtState.editRev += 1;
                 updateEvtButtons();
             });
         });
-        tr.querySelector('.evt-del').addEventListener('click', () => {
+        tr.querySelector('.del').addEventListener('click', () => {
             evtState.working.splice(i, 1);
             evtState.jsDirty = true;
             evtState.editRev += 1;
@@ -1139,27 +1982,46 @@ function renderEventsTable() {
         });
         tbody.appendChild(tr);
     });
-    $('#evt-count').textContent = `(${evtState.working.length})`;
+    renderEvtCount();
+}
+
+function renderEvtCount() {
+    const s = STATE.lastStatus || {};
+    const n = evtState.visible ? evtState.working.length : (s.macro_events || 0);
+    setText($('#evt-count'), `${n} in the working macro`);
 }
 
 function updateEvtButtons() {
     const visible = evtState.visible;
     const s = STATE.lastStatus || {};
     const busy = s.macro_state === 'recording' || s.macro_state === 'playing';
-    $('#evt-add').disabled = !visible || evtState.rev < 0 || busy;
+    setDisabled($('#evt-add'), !visible || evtState.rev < 0 || busy);
     const saveBtn = $('#evt-save');
-    saveBtn.disabled = !visible || !evtState.jsDirty || busy || evtState.saving;
-    saveBtn.title = (visible && busy)
-        ? `Stop ${s.macro_state} before saving edits.` : '';
-    $('#evt-discard').disabled = !visible || !evtState.jsDirty || evtState.saving;
+    setDisabled(saveBtn, !visible || !evtState.jsDirty || busy || evtState.saving);
+    setTitle(saveBtn, (visible && busy)
+        ? `Stop ${s.macro_state} before saving edits.` : '');
+    setDisabled($('#evt-discard'), !visible || !evtState.jsDirty || evtState.saving);
     const tag = $('#evt-dirty-tag');
     let text = '';
+    let stale = false;
     if (visible && evtState.jsDirty) {
-        text = editorIsStale()
-            ? 'unsaved edits — the macro changed meanwhile'
-            : 'unsaved edits';
+        stale = editorIsStale();
+        text = stale ? 'unsaved edits — the macro changed meanwhile' : 'unsaved edits';
     }
-    tag.textContent = text;
+    setText(tag, text);
+    setClass(tag, 'stale', stale);
+    setHidden(tag, !text);
+}
+
+// Card body: table when shown, a one-line placeholder while recording.
+function renderEventsCardState() {
+    const s = STATE.lastStatus || {};
+    const recording = s.macro_state === 'recording';
+    setHidden($('#evt-placeholder'), !recording);
+    setHidden($('#evt-list-wrapper'), !evtState.visible || recording);
+    setDisabled($('#evt-toggle'), recording);
+    renderEvtCount();
+    updateEvtButtons();
 }
 
 // `macro_get_events` returns {events, rev, loaded, ...}; tolerate the
@@ -1218,11 +2080,13 @@ function fetchAndShowEvents() {
     });
 }
 
-$('#evt-toggle').addEventListener('click', () => {
+$('#evt-toggle').addEventListener('click', async () => {
     if (evtState.visible) {
-        if (evtState.jsDirty
-            && !confirm('Discard your unsaved event edits?')) {
-            return;
+        if (evtState.jsDirty) {
+            const ok = await dlgConfirm('Discard your edits?',
+                'Your unsaved event edits will be lost.',
+                { ok: 'Discard', danger: true, focusCancel: true });
+            if (!ok) return;
         }
         evtState.visible = false;
         evtState.jsDirty = false;
@@ -1230,13 +2094,12 @@ $('#evt-toggle').addEventListener('click', () => {
         evtState.rev = -1;
         evtState.slot = 0;
         evtState.fetchGen += 1;     // drop any response still in flight
-        $('#evt-list-wrapper').hidden = true;
         $('#evt-toggle').textContent = 'Show';
-        updateEvtButtons();
+        renderEventsCardState();
     } else {
         evtState.visible = true;
-        $('#evt-list-wrapper').hidden = false;
         $('#evt-toggle').textContent = 'Hide';
+        renderEventsCardState();
         fetchAndShowEvents();
     }
 });
@@ -1250,38 +2113,41 @@ $('#evt-add').addEventListener('click', () => {
         device: 'keyboard',
         key: 'a',
         event_type: 'down',
+        __edited: true,
     });
     evtState.jsDirty = true;
     evtState.editRev += 1;
     renderEventsTable();
     updateEvtButtons();
+    const wrap = $('#evt-list-wrapper');
+    if (wrap) wrap.scrollTop = wrap.scrollHeight;
 });
 
-$('#evt-discard').addEventListener('click', () => {
-    if (!confirm('Discard your edits and reload from the buffer?')) return;
+$('#evt-discard').addEventListener('click', async () => {
+    const ok = await dlgConfirm('Discard your edits?',
+        'Your edits are thrown away and the list reloads from the macro.',
+        { ok: 'Discard', danger: true, focusCancel: true });
+    if (!ok) return;
     evtState.jsDirty = false;
     evtState.editRev += 1;          // an in-flight fetch must not be skipped
     fetchAndShowEvents();
 });
 
-function slotLabel(n) {
-    const name = slotNameOf(n);
-    return name ? `slot ${n} ("${name}")` : `slot ${n}`;
-}
-
 // The buffer changed under the editor: never write these edits into
 // whatever is loaded now — offer to throw them away instead.
-function offerEditorReload(res) {
+async function offerEditorReload(res) {
     const s = STATE.lastStatus || {};
     const loaded = (res && typeof res.loaded === 'number')
         ? res.loaded : (parseInt(s.macro_loaded, 10) || 0);
     const was = evtState.slot ? slotLabel(evtState.slot) : 'the previous macro';
     const now = loaded ? slotLabel(loaded) : 'a different macro';
-    if (confirm(
+    const ok = await dlgConfirm('The macro changed',
         `The macro changed since you started editing (now ${now}).\n\n`
         + `Your edits were made to ${was} and were NOT saved, so they `
-        + `can't overwrite ${now}.\n\nDiscard your edits and show the `
-        + 'current macro?')) {
+        + `can’t overwrite ${now}.\n\nDiscard your edits and show the `
+        + 'current macro?',
+        { ok: 'Discard edits', cancel: 'Keep editing', danger: true, focusCancel: true });
+    if (ok) {
         evtState.jsDirty = false;
         evtState.editRev += 1;
         fetchAndShowEvents();
@@ -1291,34 +2157,34 @@ function offerEditorReload(res) {
 
 // Every row of a loaded slot was deleted. An empty macro can't be saved,
 // so offer Clear slot instead (empties the buffer, then deletes the slot).
-function offerClearInstead(slot) {
+async function offerClearInstead(slot) {
     const users = activeUsersOfSlot(slot);
-    let msg = `You removed every event. An empty macro can't be saved to `
-        + `${slotLabel(slot)}.\n\nClear slot ${slot} instead? This cannot `
-        + 'be undone.';
+    let body = `You removed every event. An empty macro can’t be saved to `
+        + `${slotLabel(slot)}.\n\nClear slot ${slot} instead? This cannot be undone.`;
     if (users.length) {
-        msg += `\n\nActive macro ${users.join(', ')} uses this slot and `
-            + 'will be unassigned.';
+        body += `\n\nActive macro ${users.join(', ')} uses this slot and will be unassigned.`;
     }
-    msg += '\n\n(Cancel keeps editing.)';
-    if (!confirm(msg)) return;
+    const ok = await dlgConfirm('Clear the slot instead?', body,
+        { ok: `Clear slot ${slot}`, cancel: 'Keep editing', danger: true, focusCancel: true });
+    if (!ok) return;
     evtState.saving = true;
     updateEvtButtons();
+    noteMacroAction('clear');
     callApi('macro_set_events', [], evtState.rev, slot, false).then((res) => {
         if (!res || res.ok === false) {
             if (res && res.reason === 'stale') {
                 offerEditorReload(res);
             } else {
-                alert('Could not clear the macro: '
-                    + ((res && res.message) || 'see the Logs tab.'));
+                dlgAlert('Could not clear the macro',
+                    (res && res.message) || 'See the Logs tab.');
             }
             return null;
         }
         evtState.rev = res.rev;
         return callApi('macro_clear_slot', slot).then((r2) => {
             if (!r2 || r2.ok === false) {
-                alert(`The macro is now empty, but slot ${slot} could not `
-                    + 'be cleared: '
+                dlgAlert('Slot not cleared',
+                    `The macro is now empty, but slot ${slot} could not be cleared: `
                     + ((r2 && r2.message) || 'see the Logs tab.'));
             }
             evtState.jsDirty = false;
@@ -1358,10 +2224,11 @@ $('#evt-save').addEventListener('click', () => {
     const editRevAtSave = evtState.editRev;
     evtState.saving = true;
     updateEvtButtons();
+    noteMacroAction('edit');
     callApi('macro_set_events', sanitized, evtState.rev, slot, slot > 0)
         .then((res) => {
             if (!res) {
-                alert('Could not apply edits — see the Logs tab.');
+                dlgAlert('Could not apply edits', 'See the Logs tab.');
                 return;
             }
             if (res.ok === false && res.reason === 'stale') {
@@ -1378,14 +2245,15 @@ $('#evt-save').addEventListener('click', () => {
             }
             if (res.ok === false) {
                 // Keep "unsaved edits" so Save can retry; the reason is
-                // also in the status pill (macro_error).
-                alert('Could not save your edits: '
-                    + (res.message || res.reason || 'see the Logs tab.'));
+                // also in the macro notice (macro_error).
+                dlgAlert('Could not save your edits',
+                    res.message || res.reason || 'See the Logs tab.');
                 return;
             }
             const dropped = parseInt(res.dropped, 10) || 0;
             if (dropped > 0) {
-                alert(`${dropped} row${dropped === 1 ? ' was' : 's were'} `
+                dlgAlert('Some rows were dropped',
+                    `${dropped} row${dropped === 1 ? ' was' : 's were'} `
                     + 'dropped (unknown key, mouse button or event type, or a '
                     + 'key combination) — see the Logs tab. The table '
                     + 'now shows what was kept.');
@@ -1413,6 +2281,7 @@ function maybeAutoRefreshEditor() {
     updateEvtButtons();
     if (!evtState.visible || evtState.jsDirty) return;
     const s = STATE.lastStatus || {};
+    if (s.macro_state === 'recording') return;   // the list fills in on stop
     if (typeof s.macro_rev === 'number') {
         if (s.macro_rev === evtState.rev) return;
     } else if ((s.macro_events || 0) === evtState.working.length) {
@@ -1423,158 +2292,294 @@ function maybeAutoRefreshEditor() {
 
 // --- log pane --------------------------------------------------------------
 
-// Auto-scroll only "sticks" while the user is at (or within this many px
-// of) the bottom — scrolling up to read / select pauses it.
+// Each log LINE is one element: time / [tag] / message (contract: the
+// Python QueueWriter stamps `HH:MM:SS ` at the start of every line).
+// Append-only; the oldest lines are dropped in one batch once past
+// LOG_MAX_LINES; the view only follows new output while Follow is on,
+// and Follow turns itself off when the user scrolls up — the detector
+// logs every key DOWN/UP, and force-scrolling made it impossible to
+// scroll up or select text during a song.
+const LOG_MAX_LINES = 4000;
+const LOG_TRIM_TO = 3200;
 const LOG_STICK_PX = 24;
-const LOG_PANE = {
-    chars: 0,       // characters currently in the pane
+const LOG_LINE_RE = /^(\d\d:\d\d:\d\d) (?:\[([^\]]+)\]\s*)?(.*)$/;
+const LOG_TAG_RE = /^\[([^\]]+)\]\s*(.*)$/;
+const LOG_WARN_RE = /\b(failed|error|exception|traceback|refused|not found)\b/i;
+const LOG_KNOWN_TAGS = new Set(['album', 'bot', 'macro', 'serial', 'ui']);
+const LOG = {
+    lines: 0,       // line elements in the pane
     stick: true,    // follow new output (last known, survives tab hides)
+    partial: null,  // trailing line element not yet terminated by '\n'
+    partialText: '',
+    filter: '',
 };
 
 function logPaneAtBottom(pane) {
     return pane.scrollHeight - pane.scrollTop - pane.clientHeight <= LOG_STICK_PX;
 }
 
+function setLogFollow(on) {
+    LOG.stick = !!on;
+    setSwitch($('#log-follow'), LOG.stick);
+}
+
+function logCatchUp() {
+    if (!LOG.stick) return;
+    requestAnimationFrame(() => {
+        const pane = $('#log-pane');
+        pane.scrollTop = pane.scrollHeight;
+    });
+}
+
+function makeLogLine(text) {
+    let time = '';
+    let tag = '';
+    let msg = text;
+    const m = LOG_LINE_RE.exec(text);
+    if (m) {
+        time = m[1];
+        tag = (m[2] || '').toLowerCase();
+        msg = m[3];
+    } else {
+        const t = LOG_TAG_RE.exec(text);
+        if (t) {
+            tag = t[1].toLowerCase();
+            msg = t[2];
+        }
+    }
+    const group = LOG_KNOWN_TAGS.has(tag) ? tag : 'other';
+    const div = document.createElement('div');
+    div.className = LOG_WARN_RE.test(msg) ? 'ln warnline' : 'ln';
+    div.dataset.g = group;
+    const tEl = document.createElement('span');
+    tEl.className = 't';
+    tEl.textContent = time;
+    const gEl = document.createElement('span');
+    gEl.className = tag ? `g ${tag.replace(/[^a-z0-9_-]/g, '')}` : 'g';
+    gEl.textContent = tag ? `[${tag}]` : '';
+    const mEl = document.createElement('span');
+    mEl.className = 'm';
+    mEl.textContent = msg;
+    div.appendChild(tEl);
+    div.appendChild(gEl);
+    div.appendChild(mEl);
+    return div;
+}
+
 $('#btn-clear-log').addEventListener('click', () => {
-    $('#log-pane').textContent = '';
-    LOG_PANE.chars = 0;
-    LOG_PANE.stick = true;
+    const pane = $('#log-pane');
+    pane.textContent = '';
+    LOG.lines = 0;
+    LOG.partial = null;
+    LOG.partialText = '';
+    setLogFollow(true);
     callApi('clear_log');
 });
 
 $('#log-pane').addEventListener('scroll', () => {
     const pane = $('#log-pane');
     if (pane.clientHeight === 0) return;   // hidden tab — keep last value
-    LOG_PANE.stick = logPaneAtBottom(pane);
+    const at = logPaneAtBottom(pane);
+    if (at !== LOG.stick) setLogFollow(at);
 });
 
-// The pane can't scroll while its tab is hidden; catch up on show.
-$$('.tab[data-tab="logs"]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-        if (!LOG_PANE.stick) return;
-        requestAnimationFrame(() => {
-            const pane = $('#log-pane');
-            pane.scrollTop = pane.scrollHeight;
+$('#log-follow').addEventListener('click', () => {
+    const next = !LOG.stick;
+    setLogFollow(next);
+    if (next) {
+        const pane = $('#log-pane');
+        pane.scrollTop = pane.scrollHeight;
+    }
+});
+
+$$('#log-filters .fchip').forEach((chip) => {
+    chip.addEventListener('click', () => {
+        LOG.filter = chip.dataset.f || '';
+        $$('#log-filters .fchip').forEach((c) => {
+            const on = c === chip;
+            c.classList.toggle('on', on);
+            c.setAttribute('aria-pressed', on ? 'true' : 'false');
         });
+        const pane = $('#log-pane');
+        pane.dataset.filter = LOG.filter;
+        logCatchUp();
+    });
+});
+
+function visibleLogText() {
+    const pane = $('#log-pane');
+    const out = [];
+    Array.from(pane.children).forEach((ln) => {
+        if (LOG.filter && ln.dataset.g !== LOG.filter) return;
+        const parts = Array.from(ln.children).map((c) => c.textContent).filter(Boolean);
+        out.push(parts.join(' '));
+    });
+    return out.join('\n');
+}
+
+function copyText(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        return navigator.clipboard.writeText(text).then(() => true, () => copyTextFallback(text));
+    }
+    return Promise.resolve(copyTextFallback(text));
+}
+
+function copyTextFallback(text) {
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-1000px';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand && document.execCommand('copy');
+        ta.remove();
+        return !!ok;
+    } catch (e) {
+        return false;
+    }
+}
+
+$('#btn-copy-log').addEventListener('click', () => {
+    const btn = $('#btn-copy-log');
+    copyText(visibleLogText()).then((ok) => {
+        btn.textContent = ok ? 'Copied' : 'Copy failed';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
     });
 });
 
 // --- globals called from Python -------------------------------------------
 
-// Append-only: each chunk becomes a new text node (no rewrite of the whole
-// 200k-char buffer per chunk), the front is trimmed in one batch once past
-// LOG_MAX_CHARS, and the view only follows new output when it was already
-// at the bottom — the detector logs every key DOWN/UP, and force-scrolling
-// made it impossible to scroll up or select text during a song.
 window.appendLog = function appendLog(text) {
     if (!text) return;
     const pane = $('#log-pane');
-    const stick = pane.clientHeight > 0 ? logPaneAtBottom(pane) : LOG_PANE.stick;
-    pane.appendChild(document.createTextNode(text));
-    LOG_PANE.chars += text.length;
-    if (LOG_PANE.chars > LOG_MAX_CHARS) {
-        const trimTo = Math.floor(LOG_MAX_CHARS * 0.8);
-        while (LOG_PANE.chars > trimTo && pane.firstChild) {
-            const node = pane.firstChild;
-            const len = (node.textContent || '').length;
-            const excess = LOG_PANE.chars - trimTo;
-            if (len <= excess) {
-                pane.removeChild(node);
-                LOG_PANE.chars -= len;
-            } else {
-                node.textContent = node.textContent.slice(excess);
-                LOG_PANE.chars -= excess;
-            }
+    const stick = pane.clientHeight > 0 ? logPaneAtBottom(pane) : LOG.stick;
+    // A chunk may end mid-line; the open line is re-rendered when the
+    // rest arrives so its time / tag columns parse correctly.
+    let buf = LOG.partialText + text;
+    if (LOG.partial) {
+        pane.removeChild(LOG.partial);
+        LOG.partial = null;
+        LOG.lines -= 1;
+    }
+    LOG.partialText = '';
+    const frag = document.createDocumentFragment();
+    let start = 0;
+    let added = 0;
+    for (;;) {
+        const nl = buf.indexOf('\n', start);
+        if (nl < 0) break;
+        const line = buf.slice(start, nl).replace(/\r$/, '');
+        if (line) {
+            frag.appendChild(makeLogLine(line));
+            added += 1;
+        }
+        start = nl + 1;
+    }
+    const rest = buf.slice(start);
+    if (rest) {
+        const el = makeLogLine(rest);
+        el.classList.add('partial');
+        frag.appendChild(el);
+        LOG.partial = el;
+        LOG.partialText = rest;
+        added += 1;
+    }
+    buf = null;
+    pane.appendChild(frag);
+    LOG.lines += added;
+    if (LOG.lines > LOG_MAX_LINES) {
+        let drop = LOG.lines - LOG_TRIM_TO;
+        while (drop > 0 && pane.firstChild && pane.firstChild !== LOG.partial) {
+            pane.removeChild(pane.firstChild);
+            drop -= 1;
+            LOG.lines -= 1;
         }
     }
-    if (stick) pane.scrollTop = pane.scrollHeight;
+    if (stick) {
+        pane.scrollTop = pane.scrollHeight;
+        if (!LOG.stick) setLogFollow(true);
+    }
 };
-
-// Status-card State cell: "<state>" or "<state> — <short error>" (warn
-// colour) with the full message + a Logs pointer in the tooltip.
-const STATE_ERROR_MAX = 28;
-function renderStateCell(state, lastError) {
-    const el = $('#st-state');
-    const err = (lastError || '').trim();
-    if (err) {
-        const short = err.length > STATE_ERROR_MAX
-            ? err.slice(0, STATE_ERROR_MAX - 1) + '…' : err;
-        el.textContent = `${state} — ${short}`;
-        el.title = `${err}\n(see the Logs tab for details)`;
-        el.classList.add('warn');
-    } else {
-        el.textContent = state;
-        el.title = '';
-        el.classList.remove('warn');
-    }
-}
-
-// Start / Pause buttons from the live state machine (+ the Start/Stop
-// click debounce in MAIN.startPending).
-function renderStartButtons(data) {
-    const running = data.state === 'running' || data.state === 'paused';
-    const stopping = data.state === 'stopping';
-    const startBtn = $('#btn-start');
-    const pauseBtn = $('#btn-pause');
-    if (stopping) {
-        startBtn.textContent = 'Stopping…';
-        startBtn.disabled = true;
-    } else {
-        startBtn.textContent = running ? 'Stop' : 'Start';
-        startBtn.disabled = !!MAIN.startPending;
-    }
-    pauseBtn.disabled = !running || stopping;
-    pauseBtn.textContent = data.state === 'paused' ? 'Resume' : 'Pause';
-}
 
 window.updateStatus = function updateStatus(data) {
     if (!data) return;
-    STATE.lastStatus = data;
+    const prev = STATE.lastStatus || {};
+    STATE.lastStatus = Object.assign({}, prev, data);
+    const s = STATE.lastStatus;
 
     // Main-tab bot status. Start/Stop debounce ends as soon as a push
     // shows the state (or last_error) moved.
-    const botState = data.state || 'idle';
+    const botState = s.state || 'idle';
     const botLive = botState === 'running' || botState === 'paused';
     if (MAIN.startPending && (botState !== MAIN.startPending.state
-            || (data.last_error || '') !== MAIN.startPending.lastError)) {
+            || (s.last_error || '') !== MAIN.startPending.lastError)) {
         clearStartPending();
     }
-    if ('state' in data || 'last_error' in data) {
-        renderStateCell(botState, data.last_error);
+
+    if ('run_started_at' in data) {
+        const started = parseFloat(data.run_started_at) || 0;
+        if (started !== MAIN.runStartedAt) {
+            MAIN.runStartedAt = started;
+            MAIN.runEndedAt = 0;
+        }
     }
-    if ('song' in data) $('#st-song').textContent = data.song || '—';
+    const wasLive = prev.state === 'running' || prev.state === 'paused';
+    if (wasLive && !botLive && MAIN.runStartedAt && !MAIN.runEndedAt) {
+        MAIN.runEndedAt = Date.now() / 1000;   // freeze the final elapsed
+    }
+    if (!botLive && !MAIN.runStartedAt) MAIN.runEndedAt = 0;
+
+    if ('state' in data || 'mode' in data || 'song' in data || 'album_progress' in data) {
+        renderStageText();
+        renderStartButtons(s);
+        renderDebugSwitch();
+        renderAlbumProgress(s.album_progress, botState);
+    }
+    if ('state' in data || 'last_error' in data) {
+        renderBotNotice();
+    }
+    if ('prereq_tip_dismissed' in data) {
+        MAIN.tipDismissed = !!data.prereq_tip_dismissed;
+        renderPrereqTip();
+    }
+    if ('song' in data || 'album_progress' in data || 'state' in data) {
+        const prog = s.album_progress;
+        let songText = '—';
+        if (prog && typeof prog === 'object' && (parseInt(prog.total, 10) || 0) > 0) {
+            const idx = parseInt(prog.index, 10) || 0;
+            songText = `${idx} / ${prog.total}`;
+            if (prog.difficulty) songText += ` · ${_DIFF_LABEL[prog.difficulty] || prog.difficulty}`;
+        } else if (s.song) {
+            songText = String(s.song);
+        }
+        setText($('#st-song'), songText);
+    }
     if ('fps' in data) {
         const f = parseFloat(data.fps) || 0;
-        $('#st-fps').textContent = f ? f.toFixed(1) : '—';
+        setText($('#st-fps'), f ? f.toFixed(1) : '—');
+    }
+    renderElapsed();
+    if ('lanes' in data || 'state' in data) {
+        renderLanes(botLive ? s.lanes : null);
     }
     if ('debug' in data) {
-        // While idle `debug` is the preset for the next Start, not a live
-        // viz window — say so instead of a stale "on".
-        $('#st-debug').textContent = !data.debug ? 'off'
-            : (botLive ? 'on' : 'on at next start');
+        // Sync the switch without echoing back to Python. While idle
+        // `debug` is the preset for the next Start, not a live viz window.
+        MAIN.debug = !!data.debug;
+        renderDebugSwitch();
     }
-    if ('admin' in data) {
-        const el = $('#st-admin');
-        if (data.admin) {
-            el.textContent = 'yes';
-            el.title = '';
-            el.classList.add('ok');
-            el.classList.remove('warn');
-        } else {
-            el.textContent = 'NO — input blocked in-game';
-            el.title = 'Not running as administrator. The game runs '
-                + 'elevated, so Windows blocks this app\'s hotkeys and '
-                + 'Software-input keypresses/clicks from reaching it. '
-                + 'Relaunch as administrator.';
-            el.classList.add('warn');
-            el.classList.remove('ok');
-        }
+    if ('admin' in data) renderHealthAdmin(!!data.admin);
+    if ('game_window_found' in data) {
+        renderHealthGame(typeof data.game_window_found === 'boolean'
+            ? data.game_window_found : undefined);
     }
     if ('keybinds' in data) renderKeybinds(data.keybinds);
 
     if ('input_backend' in data) {
         const sel = $('#input-backend');
-        if (sel && sel.value !== data.input_backend) {
+        if (sel && sel.value !== data.input_backend && sel !== activeEl()) {
             sel.value = data.input_backend;
         }
     }
@@ -1583,8 +2588,8 @@ window.updateStatus = function updateStatus(data) {
         || 'macro_loaded' in data || 'macro_slot_names' in data
         || 'macro_dirty' in data || 'macro_playing_slot' in data
         || 'macro_playing_source' in data || 'macro_error' in data
-        || 'macro_playing_events' in data) {
-        renderMacroState(STATE.lastStatus || data);
+        || 'macro_playing_events' in data || 'macro_playing_name' in data) {
+        renderMacroState(s);
     }
     if ('macro_events' in data || 'macro_rev' in data
         || 'macro_state' in data || 'macro_loaded' in data) {
@@ -1595,90 +2600,40 @@ window.updateStatus = function updateStatus(data) {
         maybeAutoRefreshEditor();
     }
     if ('macro_slots' in data || 'macro_slot_names' in data
-        || 'macro_loaded' in data || 'macro_state' in data) {
+        || 'macro_loaded' in data || 'macro_state' in data
+        || 'macro_active_macros' in data) {
         // Slot names + loaded indicator may arrive in a later snapshot
-        // than the slot list itself, so always re-render with the most
-        // recent values from STATE.lastStatus rather than just `data`.
-        const last = STATE.lastStatus || {};
-        renderMacroSlots(
-            data.macro_slots || last.macro_slots || [],
-            data.macro_slot_names || last.macro_slot_names || {},
-            data.macro_loaded || last.macro_loaded || 0,
-            data.macro_state || last.macro_state || 'idle');
+        // than the slot list itself, so always render from the merged
+        // snapshot rather than just `data`.
+        renderMacroSlots(s);
     }
     if ('macro_pending' in data) renderMacroPending(data.macro_pending);
     if ('macro_active_macros' in data || 'macro_conflict_policy' in data
         || 'macro_slots' in data || 'macro_slot_names' in data
-        || 'macro_state' in data || 'macro_playing_slot' in data) {
-        renderActiveMacroRows(STATE.lastStatus || {});
-        renderActivePolicy((STATE.lastStatus || {}).macro_conflict_policy);
-    }
-
-    // Sync debug checkbox without echoing back to Python.
-    if ('debug' in data) {
-        const cb = $('#debug');
-        if (cb.checked !== !!data.debug) {
-            cb.checked = !!data.debug;
-        }
+        || 'macro_state' in data || 'macro_playing_slot' in data
+        || 'macro_playing_source' in data) {
+        renderActiveMacroRows(s);
+        renderActivePolicy(s.macro_conflict_policy);
     }
 
     // Button states from the live state machine.
-    renderStartButtons(data);
+    renderStartButtons(s);
 
-    // The debug checkbox stays enabled while idle: it is the preset the
-    // next Start opens the viz window with (Python owns the value, the
-    // sync above mirrors it).
-
-    // Rebind buttons stay enabled regardless of bot state — user can
+    // Key caps stay enabled regardless of bot state — the user can
     // configure hotkeys without first starting the bot. The hotkeys
     // themselves are still inert when the bot is off (runtime gate in
     // ui.py:_hotkey_pause / _hotkey_debug).
 };
 
-const _MOUSE_DISPLAY = {
-    left: 'Left Click', right: 'Right Click', middle: 'Middle Click',
-    x: 'Mouse 4', x2: 'Mouse 5',
-};
-
-function displayBinding(binding) {
-    if (!binding) return '<unset>';
-    const m = /^mouse:(.+)$/i.exec(binding);
-    if (m) {
-        const name = m[1].toLowerCase();
-        return _MOUSE_DISPLAY[name] || `Mouse ${m[1]}`;
-    }
-    return binding;
-}
-
-function renderKeybinds(kb) {
-    Object.entries(kb || {}).forEach(([action, hotkey]) => {
-        const row = document.querySelector(`.hk-row[data-action="${action}"]`);
-        if (!row) return;
-        const el = row.querySelector('.hk-binding');
-        el.textContent = displayBinding(hotkey);
-        // Mouse hotkeys see every click of that button, including clicks a
-        // playing macro replays. A Left Click saved by an older build is
-        // refused at install time (it is every attack), so say so.
-        const hk = String(hotkey || '').toLowerCase();
-        el.title = hk === 'mouse:left'
-            ? 'Left Click is not active as a hotkey - rebind this.'
-            : (hk.startsWith('mouse:')
-                ? 'Mouse hotkeys also fire when a macro replays this button.'
-                : '');
-    });
-}
-
-// --- init ------------------------------------------------------------------
-
 // --- help-th portal tooltips ----------------------------------------------
 
-// `.help-th` icons sit inside `.evt-list-wrapper` which has
-// `overflow-y: auto` (scrollable event list). Auto-overflow clips the
-// standard `.help::after` pseudo-element tooltip against the wrapper's
-// box on both axes, so when the wrapper is short (few or no events)
-// the tooltip is invisible. Render the tooltip in `document.body`
-// instead, positioned via getBoundingClientRect — it lives outside the
-// overflow context and stays visible regardless of wrapper size.
+// `.help-th` icons sit inside `.evt-wrap` which has `overflow: auto`
+// (scrollable event list). Auto-overflow clips the standard
+// `.help::after` pseudo-element tooltip against the wrapper's box on
+// both axes, so when the wrapper is short (few or no events) the tooltip
+// is invisible. Render the tooltip in `document.body` instead,
+// positioned via getBoundingClientRect — it lives outside the overflow
+// context and stays visible regardless of wrapper size.
 function setupHelpThPortals() {
     document.querySelectorAll('.help-th').forEach((icon) => {
         const text = icon.getAttribute('data-help');
@@ -1689,9 +2644,9 @@ function setupHelpThPortals() {
             if (!tip) return;
             const r = icon.getBoundingClientRect();
             tip.style.top = (r.bottom + 8) + 'px';
-            // Clamp left so the 320px-max tooltip doesn't overflow
+            // Clamp left so the 300px-max tooltip doesn't overflow
             // the right edge of the viewport on narrow windows.
-            const maxLeft = window.innerWidth - 320 - 8;
+            const maxLeft = (window.innerWidth || 720) - 300 - 8;
             tip.style.left = Math.max(8, Math.min(r.left, maxLeft)) + 'px';
         };
 
@@ -1723,25 +2678,25 @@ function setupHelpThPortals() {
 // pywebview API readiness — don't gate on init().
 setupHelpThPortals();
 
+// --- init ------------------------------------------------------------------
 
 function init() {
     if (STATE.initialized) return;
     STATE.initialized = true;
     callApi('get_initial_state').then((s) => {
         if (!s) return;
-        if (s.mode) {
-            const r = document.querySelector(`input[name="mode"][value="${s.mode}"]`);
-            if (r) r.checked = true;
-        }
         if (typeof s.songs === 'number') {
             $('#songs').value = s.songs;
             MAIN.lastSongs = s.songs;
+            renderSongsSub(s.songs);
         }
-        if (s.difficulty !== undefined) applyDifficultiesToCheckboxes(s.difficulty);
-        if (typeof s.replay_canorus === 'boolean') $('#replay-canorus').checked = s.replay_canorus;
-        if (typeof s.debug === 'boolean') $('#debug').checked = s.debug;
+        if (s.difficulty !== undefined) applyDifficultiesToChips(s.difficulty);
+        if (typeof s.replay_canorus === 'boolean') setSwitch($('#replay-canorus'), s.replay_canorus);
+        if (typeof s.debug === 'boolean') MAIN.debug = s.debug;
         if (s.input_backend) $('#input-backend').value = s.input_backend;
         if (s.keybinds) renderKeybinds(s.keybinds);
+        if (typeof s.prereq_tip_dismissed === 'boolean') MAIN.tipDismissed = s.prereq_tip_dismissed;
+        setModeUi(s.mode === 'album' ? 'album' : 'standalone');
         applyModeUi();
         // Initial status payload — fold macro snapshot in so the
         // Macros tab renders correctly without waiting for the first
@@ -1755,6 +2710,7 @@ function init() {
             debug: !!s.debug,
             admin: !!s.admin,
             keybinds: s.keybinds || {},
+            prereq_tip_dismissed: !!s.prereq_tip_dismissed,
             macro_state: macroSnap.macro_state || 'idle',
             macro_events: macroSnap.macro_events || 0,
             macro_slots: macroSnap.macro_slots || [],
@@ -1775,6 +2731,10 @@ function init() {
         });
     });
 }
+
+// Pre-init render so the page is coherent before Python answers.
+renderMacroPending('');
+renderStageText();
 
 window.addEventListener('pywebviewready', init);
 // pywebviewready may have fired before this script ran in some loads.

@@ -6,333 +6,327 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <!-- Custom titlebar. The drag region honors pywebview's drag class. -->
-    <div class="titlebar">
-        <div class="titlebar-drag pywebview-drag-region">
-            <img class="titlebar-icon" src="../assets/icon.ico" alt="">
-            <span class="titlebar-title">Genshin Rhythm Bot</span>
+<div class="app">
+    <!-- Titlebar. The two pywebview-drag-region islands are the only drag
+         surfaces; the tabs and window buttons sit between them as plain
+         (no-drag) elements so a drag can never swallow their clicks. -->
+    <header class="titlebar">
+        <div class="tb-drag pywebview-drag-region">
+            <svg class="tb-mark" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg>
+            <span class="tb-title">Genshin Rhythm Bot</span>
         </div>
+        <nav class="tabs" aria-label="Sections">
+            <button type="button" class="tab tab-active" data-tab="main">Main</button>
+            <button type="button" class="tab" data-tab="macros">Macros</button>
+            <button type="button" class="tab" data-tab="logs">Logs</button>
+        </nav>
+        <div class="tb-fill pywebview-drag-region"></div>
         <div class="titlebar-buttons">
-            <button class="titlebar-btn" id="btn-min" title="Minimize">&#xE921;</button>
-            <button class="titlebar-btn" id="btn-max" title="Maximize">&#xE922;</button>
-            <button class="titlebar-btn titlebar-btn-close" id="btn-close" title="Close">&#xE8BB;</button>
+            <button type="button" class="titlebar-btn" id="btn-min" title="Minimize">&#xE921;</button>
+            <button type="button" class="titlebar-btn" id="btn-max" title="Maximize">&#xE922;</button>
+            <button type="button" class="titlebar-btn titlebar-btn-close" id="btn-close" title="Close">&#xE8BB;</button>
         </div>
+    </header>
+
+    <!-- Health strip: the three things that block a run, on every tab. -->
+    <div class="health">
+        <span class="hs" id="hs-admin"><i class="dot neutral"></i><span>Checking admin rights…</span></span>
+        <span class="hs" id="hs-game"><i class="dot neutral"></i><span>Looking for the game…</span></span>
+        <span class="hs-fill"></span>
+        <span class="hs hs-input">
+            <label for="input-backend">Input</label>
+            <span class="sel"><select id="input-backend" aria-label="Input backend">
+                <option value="software">Software</option>
+                <option value="arduino">Arduino HID</option>
+            </select></span>
+            <span class="help" tabindex="0" aria-label="Input method info"
+                  data-help="Applies to everything that sends input to the game: rhythm bot, album clicks and macro playback. Software uses Win32 SendInput and needs no hardware, but only works while this app runs as administrator. Arduino HID drives a Leonardo over USB and also works for combat input the anti-cheat blocks. Switching while the bot or a macro is running asks you to stop them first.">?</span>
+        </span>
     </div>
 
-    <!-- Tab strip -->
-    <nav class="tabs">
-        <button class="tab tab-active" data-tab="main">Main</button>
-        <button class="tab" data-tab="macros">Macros</button>
-        <button class="tab" data-tab="logs">Logs</button>
-    </nav>
-
     <!-- Main tab -->
-    <section class="panel panel-active" data-panel="main">
-        <fieldset class="card">
-            <legend>Input method</legend>
-            <div class="row row-grid">
-                <label for="input-backend">Send input via</label>
-                <div class="select-wrapper">
-                    <select id="input-backend">
-                        <option value="software">Software (Win32 SendInput)</option>
-                        <option value="arduino">Arduino HID (hardware)</option>
-                    </select>
-                </div>
-                <span class="help" tabindex="0" aria-label="Input method info"
-                      data-help="Applies to everything that injects input into the game — rhythm bot, album auto-clicker, and macro playback. Software (default) uses Win32 SendInput / mouse_event — no hardware, works for the rhythm minigame, album navigation, and menu-driven macros, but only while this app runs as administrator. Arduino drives a Leonardo over USB serial; real HID hardware so it also works for combat input that the anti-cheat blocks for synthetic input. Switching while bot or macro is running prompts to stop them first.">?</span>
+    <main class="panel panel-active" data-panel="main">
+        <div class="mode-row">
+            <div class="seg" id="mode-seg" role="radiogroup" aria-label="Run mode">
+                <button type="button" data-mode="standalone" role="radio" aria-checked="true" class="on">Standalone</button>
+                <button type="button" data-mode="album" role="radio" aria-checked="false">Album</button>
             </div>
-        </fieldset>
+            <span class="sub" id="mode-hint">Open any song in the game, then press Start. Plays until you stop it.</span>
+            <span class="help" tabindex="0" aria-label="Mode info"
+                  data-help="Standalone plays whatever song is open, until you stop it. Album plays one country album page (Mondstadt, Liyue, Inazuma…) end to end: open the album page first, then press Start. Switching Standalone → Album while a song is already playing picks up from the current song; press Stop first to start from song 1. Both need the Hu Tao theme equipped in the minigame; Album also needs the game's text language set to English.">?</span>
+        </div>
 
-        <fieldset class="card">
-            <legend>Run mode</legend>
-            <div class="row">
-                <label class="radio">
-                    <input type="radio" name="mode" value="standalone" checked>
-                    <span class="radio-mark"></span>
-                    <span>Standalone</span>
-                </label>
-                <span class="help" tabindex="0" aria-label="Standalone mode info"
-                      data-help="Runs the rhythm detector indefinitely on whatever song is currently playing. Start it after you've manually opened a song. Requires the Hu Tao theme equipped in the rhythm minigame — the detector reads its bright hit-line, and other themes make it misfire.">?</span>
-                <label class="radio">
-                    <input type="radio" name="mode" value="album">
-                    <span class="radio-mark"></span>
-                    <span>Album</span>
-                </label>
-                <span class="help" tabindex="0" aria-label="Album mode info"
-                      data-help="Auto-plays one country album page (Mondstadt / Liyue / Inazuma / ...) end to end. Open a country album page first, then press Start. Tip: switching Standalone → Album while a song is already playing picks up from the current song instead of going through the menu — press Stop first if you want to start from song 1. See the ? icons next to Songs and Difficulty for how those interact. Requires the Hu Tao theme (like Standalone) and the game's text language set to English — the menu buttons are recognized by their English labels.">?</span>
-            </div>
-        </fieldset>
-
-        <fieldset class="card" id="album-card">
-            <legend>Album options</legend>
-            <div class="row row-grid">
+        <section class="card dim" id="album-card" aria-label="Album options">
+            <div class="field">
                 <label for="songs">Songs</label>
-                <div class="spinbox">
-                    <input type="number" id="songs" min="1" max="12" value="12">
-                    <div class="spinbox-buttons">
-                        <button type="button" class="spinbox-up" data-target="songs">&#x25B2;</button>
-                        <button type="button" class="spinbox-down" data-target="songs">&#x25BC;</button>
+                <div class="val">
+                    <div class="stepper">
+                        <button type="button" class="step-down" aria-label="Fewer songs">&minus;</button>
+                        <input type="number" id="songs" min="1" max="12" value="12" aria-label="Songs">
+                        <button type="button" class="step-up" aria-label="More songs">+</button>
                     </div>
+                    <span class="sub" id="songs-sub">whole album · wheel returns to song 1 when done</span>
                 </div>
                 <span class="help" tabindex="0" aria-label="Songs info"
-                      data-help="How many album song-slots to play before stopping. With one difficulty selected: exactly N songs. With All difficulties: N × 4 plays (each song at every difficulty). At 12 (full album) the song wheel rolls back to song 1 when done; partial runs leave the wheel at the last-played slot.">?</span>
+                      data-help="How many album song-slots to play before stopping. With one difficulty: exactly N songs. With several difficulties: N × that many plays. At 12 the song wheel rolls back to song 1 when done; partial runs leave the wheel at the last-played slot.">?</span>
             </div>
-            <div class="row row-grid">
+            <div class="field">
                 <label>Difficulty</label>
-                <div class="diff-checks">
-                    <label class="checkbox compact">
-                        <input type="checkbox" name="difficulty" value="normal">
-                        <span class="check-mark"></span>
-                        <span>Normal</span>
-                    </label>
-                    <label class="checkbox compact">
-                        <input type="checkbox" name="difficulty" value="hard">
-                        <span class="check-mark"></span>
-                        <span>Hard</span>
-                    </label>
-                    <label class="checkbox compact">
-                        <input type="checkbox" name="difficulty" value="pro">
-                        <span class="check-mark"></span>
-                        <span>Pro</span>
-                    </label>
-                    <label class="checkbox compact">
-                        <input type="checkbox" name="difficulty" value="legendary" checked>
-                        <span class="check-mark"></span>
-                        <span>Legendary</span>
-                    </label>
+                <div class="val chips" id="diff-chips" role="group" aria-label="Difficulties">
+                    <button type="button" class="chip" data-diff="normal" style="--c:var(--anemo)" aria-pressed="false"><i></i>Normal</button>
+                    <button type="button" class="chip" data-diff="hard" style="--c:var(--hydro)" aria-pressed="false"><i></i>Hard</button>
+                    <button type="button" class="chip" data-diff="pro" style="--c:var(--pyro)" aria-pressed="false"><i></i>Pro</button>
+                    <button type="button" class="chip on" data-diff="legendary" style="--c:var(--electro)" aria-pressed="true"><i></i>Legendary</button>
                 </div>
                 <span class="help" tabindex="0" aria-label="Difficulty info"
-                      data-help="Tick any subset of difficulties. With one checked, the album runs that difficulty straight through (classic single-pass). With multiple checked, each song-slot is played once per chosen difficulty before the wheel advances to the next song — e.g. Normal + Hard checked, song 1 Normal → song 1 Hard → song 2 Normal → song 2 Hard → ... At least one must stay checked. Each cycle's canorus skip is per-difficulty.">?</span>
+                      data-help="Pick any set of difficulties. One picked: the album runs straight through at that difficulty. Several picked: each song is played once per difficulty before the wheel moves on (song 1 Normal → song 1 Hard → song 2 Normal …). At least one stays picked. Canorus skipping is checked per difficulty.">?</span>
             </div>
-        </fieldset>
-
-        <div class="row checkbox-row">
-            <label class="checkbox">
-                <input type="checkbox" id="replay-canorus">
-                <span class="check-mark"></span>
-                <span>Replay songs already at Canorus</span>
-            </label>
-            <span class="help" tabindex="0" aria-label="Replay-canorus info"
-                  data-help="Album mode only. When enabled, every song in the album is played even if it's already at Canorus rank. Disabled = skip already-Canorus'd songs to save time.">?</span>
-        </div>
-
-        <div class="row checkbox-row">
-            <label class="checkbox">
-                <input type="checkbox" id="debug">
-                <span class="check-mark"></span>
-                <span>Show debug visualization</span>
-            </label>
-            <span class="help" tabindex="0" aria-label="Debug visualization info"
-                  data-help="Opens an OpenCV preview window showing the rhythm lane, sample dots, blue-channel readouts, FPS, and a live key-press log. Useful for tuning; small CPU cost. Tick it before Start to open the window with the run, or toggle it (or the hotkey) while running; closing the window turns it off.">?</span>
-        </div>
-
-        <div class="bottom-row">
-            <fieldset class="card hotkeys">
-                <legend>Hotkeys</legend>
-                <div class="hk-row" data-action="start_stop">
-                    <span class="hk-label">Start/Stop</span>
-                    <span class="hk-binding">—</span>
-                    <button type="button" class="rebind">Rebind</button>
+            <div class="field">
+                <label for="replay-canorus">Canorus</label>
+                <div class="val switch-row">
+                    <button type="button" class="switch" id="replay-canorus" role="switch" aria-checked="false" aria-label="Replay songs already at Canorus"></button>
+                    <span>Replay songs already at Canorus</span>
                 </div>
-                <div class="hk-row" data-action="pause">
-                    <span class="hk-label">Pause/Resume</span>
-                    <span class="hk-binding">—</span>
-                    <button type="button" class="rebind">Rebind</button>
-                </div>
-                <div class="hk-row" data-action="debug">
-                    <span class="hk-label">Toggle Debug</span>
-                    <span class="hk-binding">—</span>
-                    <button type="button" class="rebind">Rebind</button>
-                </div>
-                <div class="hk-capture-msg"></div>
-            </fieldset>
+                <span class="help" tabindex="0" aria-label="Replay-canorus info"
+                      data-help="On: every song is played even if it already has Canorus rank. Off: songs already at Canorus are skipped to save time.">?</span>
+            </div>
+        </section>
 
-            <fieldset class="card status">
-                <legend>Status</legend>
-                <div class="status-grid">
-                    <div class="status-rows">
-                        <div class="st-row"><span class="st-key">State</span><span class="st-val" id="st-state">idle</span></div>
-                        <div class="st-row"><span class="st-key">Song</span><span class="st-val" id="st-song">—</span></div>
-                        <div class="st-row"><span class="st-key">FPS</span><span class="st-val" id="st-fps">—</span></div>
-                        <div class="st-row"><span class="st-key">Debug</span><span class="st-val" id="st-debug">off</span></div>
-                        <div class="st-row"><span class="st-key">Admin</span><span class="st-val" id="st-admin">…</span></div>
-                    </div>
-                    <div class="status-buttons">
-                        <button type="button" id="btn-start" class="btn-primary">Start</button>
-                        <button type="button" id="btn-pause" class="btn-secondary" disabled>Pause</button>
+        <section class="stage" aria-label="Status">
+            <div class="stage-top">
+                <div class="state">
+                    <i class="pulse" id="st-pulse"></i>
+                    <div class="state-text">
+                        <h1 id="st-state">Ready</h1>
+                        <p id="st-sub">Standalone · plays the open song until you stop it</p>
                     </div>
                 </div>
-            </fieldset>
-        </div>
-    </section>
+                <div class="actions">
+                    <button type="button" class="btn" id="btn-pause" disabled>Pause</button>
+                    <button type="button" class="btn go" id="btn-start">Start</button>
+                </div>
+            </div>
+            <div class="notice" id="bot-notice" role="alert" hidden>
+                <div><b>Couldn’t start.</b> <span id="bot-notice-msg"></span></div>
+                <button type="button" class="link" data-goto="logs">View logs</button>
+            </div>
+            <div class="tip" id="prereq-tip" hidden>
+                <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="#d6bf8f" d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg>
+                <span>Before the first run: <b>equip the Hu Tao theme</b> in the minigame; Album mode also needs English game text.</span>
+                <button type="button" class="x" id="prereq-tip-close" aria-label="Dismiss tip">&times;</button>
+            </div>
+            <div class="prog" id="album-prog" aria-label="Album progress" hidden></div>
+            <div class="legend" id="album-legend" hidden>
+                <span><i class="lg-done"></i>played</span>
+                <span><i class="lg-skip"></i>skipped (Canorus)</span>
+                <span><i class="lg-fail"></i>failed</span>
+                <span><i class="lg-next"></i>up next</span>
+            </div>
+            <div class="lanes" id="lanes" aria-label="Lanes">
+                <span class="lane-hint" id="lane-hint">Lanes light up while the bot holds a key</span>
+                <div class="lane-row" id="lane-row">
+                    <div class="lane" data-k="a"><i class="track"></i><i class="note"></i><svg class="flower" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg><b>A</b></div>
+                    <div class="lane" data-k="s"><i class="track"></i><i class="note"></i><svg class="flower" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg><b>S</b></div>
+                    <div class="lane" data-k="d"><i class="track"></i><i class="note"></i><svg class="flower" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg><b>D</b></div>
+                    <div class="lane" data-k="j"><i class="track"></i><i class="note"></i><svg class="flower" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg><b>J</b></div>
+                    <div class="lane" data-k="k"><i class="track"></i><i class="note"></i><svg class="flower" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg><b>K</b></div>
+                    <div class="lane" data-k="l"><i class="track"></i><i class="note"></i><svg class="flower" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1.5c.7 6.3 4.2 9.8 10.5 10.5-6.3.7-9.8 4.2-10.5 10.5C11.3 16.2 7.8 12.7 1.5 12 7.8 11.3 11.3 7.8 12 1.5z"/></svg><b>L</b></div>
+                    <i class="hitline"></i>
+                </div>
+            </div>
+            <div class="stats">
+                <div class="stat"><b>Song</b><span id="st-song">—</span></div>
+                <div class="stat"><b>Detector FPS</b><span id="st-fps">—</span></div>
+                <div class="stat"><b>Elapsed</b><span id="st-elapsed">—</span></div>
+                <div class="stat sw">
+                    <div class="switch-row">
+                        <button type="button" class="switch" id="debug" role="switch" aria-checked="false" aria-label="Debug overlay"></button>
+                        <span class="sub" id="debug-label">Debug overlay</span>
+                        <span class="help" tabindex="0" aria-label="Debug overlay info"
+                              data-help="Opens an OpenCV preview window showing the rhythm lane, sample dots, blue-channel readouts, FPS and a live key-press log. Useful for tuning; small CPU cost. Turn it on before Start to open the window with the run, or toggle it (or its hotkey) while running; closing the window turns it off.">?</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="card" id="hotkeys-card">
+            <div class="card-h">
+                <span class="card-t">Hotkeys</span>
+                <span class="card-sub" data-default="work while the game or this window is focused · click a key to change it">work while the game or this window is focused · click a key to change it</span>
+            </div>
+            <div class="hk">
+                <div class="hk-row" data-action="start_stop"><span>Start / Stop</span><button type="button" class="key" aria-label="Start / Stop hotkey">—</button></div>
+                <div class="hk-row" data-action="pause"><span>Pause / Resume</span><button type="button" class="key" aria-label="Pause / Resume hotkey">—</button></div>
+                <div class="hk-row" data-action="debug"><span>Debug overlay</span><button type="button" class="key" aria-label="Debug overlay hotkey">—</button></div>
+            </div>
+        </section>
+    </main>
 
     <!-- Macros tab -->
-    <section class="panel" data-panel="macros">
-        <fieldset class="card">
-            <legend>Macro</legend>
-            <div class="row macro-controls-row">
-                <button type="button" id="macro-record" class="btn-primary">Record</button>
-                <button type="button" id="macro-play" class="btn-secondary">Play</button>
-                <button type="button" id="macro-stop-play" class="btn-secondary" disabled>Stop</button>
-                <span class="macro-status" id="macro-status">idle &middot; 0 events</span>
+    <main class="panel" data-panel="macros">
+        <div class="transport">
+            <button type="button" class="btn" id="macro-record"><i class="rec-dot"></i><span id="macro-record-label">Record</span></button>
+            <button type="button" class="btn go" id="macro-play"><i class="tri"></i>Play</button>
+            <button type="button" class="btn" id="macro-stop-play" disabled><i class="sq"></i>Stop</button>
+            <div class="mstatus">
+                <span class="pill" id="macro-pill"><i class="rec-i" id="macro-pill-dot" hidden></i><b id="macro-pill-state">Idle</b><span id="macro-pill-events">0 events</span></span>
+                <span class="pill slotpill" id="macro-slot-pill" hidden><span id="macro-slot-text"></span><span class="tag" id="macro-slot-tag" hidden>unsaved</span></span>
+                <button type="button" class="btn sm outline-gold" id="macro-save-to" hidden>Save to slot…</button>
+                <span class="sub nowrap" id="macro-rec-note" hidden>captures in-game only</span>
                 <span class="help" tabindex="0" aria-label="Macro info"
-                      data-help="Record key presses and mouse-button clicks inside Genshin and play them back through the selected input backend. Cursor movement and the scroll wheel are not recorded. Recording captures presses only while Genshin is focused; alt-tabbing to another app pauses capture (keys you were already holding still record their release). Play from this tab first switches to Genshin and refuses if the game isn't running. Hotkeys for record / play / stop / save / load also fire only inside the game. With the Software backend, replayed keys and clicks can trigger your own macro hotkeys if they share a key or mouse button — bind hotkeys to keys the macro doesn't use. Errors show in the status box until the next successful action.">?</span>
+                      data-help="Record key presses and mouse-button clicks inside Genshin and play them back through the selected input backend. Cursor movement and the scroll wheel are not recorded. Recording only captures while Genshin is focused; alt-tabbing pauses capture (keys you were already holding still record their release). Play from this tab first switches to Genshin and refuses if the game isn't running. The macro hotkeys only fire inside the game. With the Software backend, replayed keys and clicks can trigger your own macro hotkeys if they share a key or button — bind hotkeys to keys the macro doesn't use.">?</span>
             </div>
-        </fieldset>
+        </div>
+        <div class="notice flat" id="macro-notice" role="alert" hidden>
+            <div><b id="macro-notice-lead">Couldn’t do that.</b> <span id="macro-notice-msg"></span></div>
+            <button type="button" class="link" data-goto="logs">View logs</button>
+        </div>
 
-        <fieldset class="card" id="active-macros-card">
-            <legend>Active Macros</legend>
-            <div class="row active-policy-row">
-                <span class="macro-mode-label">During playback:</span>
-                <button type="button" class="active-policy-btn macro-mode-active" data-policy="ignore">Ignore</button>
-                <button type="button" class="active-policy-btn" data-policy="interrupt">Interrupt</button>
-                <span class="help" tabindex="0" aria-label="Active macros info"
-                      data-help="Assign up to three saved slots to their own Genshin-only playback hotkeys. Only one macro plays at a time. Ignore keeps the current playback running when another active hotkey is pressed; Interrupt stops the current playback, releases held inputs, then starts the requested saved slot.">?</span>
+        <section class="card" id="slots-card">
+            <div class="card-h">
+                <span class="card-t">Saved macros</span>
+                <span class="card-sub" id="slots-sub" data-default="hover a slot for Load · Save · Rename · Clear">hover a slot for Load · Save · Rename · Clear</span>
+                <span class="right"><span class="help" tabindex="0" aria-label="Slot info"
+                      data-help="18 slots on disk. Load reads a slot into the working macro (gold ring = where the working macro came from) and asks first if that would discard unsaved work. Save writes the working macro into a slot and asks for a name. Rename changes the name only. Clear deletes the slot and unassigns any active macro using it. A/B/C marks show which slots are assigned to active hotkeys. Keyboard: Tab to a slot, Enter loads it; its actions are reachable with Tab.">?</span></span>
             </div>
-            <div class="active-macro-list">
-                <div class="active-macro-row" data-active="1">
-                    <span class="active-label">A</span>
-                    <div class="select-wrapper active-slot-wrap">
-                        <select class="active-slot">
-                            <option value="0">No slot</option>
-                        </select>
+            <div class="slots" id="slot-grid">
+                <div class="slot" data-slot="1" tabindex="0"><span class="n">01</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="2" tabindex="0"><span class="n">02</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="3" tabindex="0"><span class="n">03</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="4" tabindex="0"><span class="n">04</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="5" tabindex="0"><span class="n">05</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="6" tabindex="0"><span class="n">06</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="7" tabindex="0"><span class="n">07</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="8" tabindex="0"><span class="n">08</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="9" tabindex="0"><span class="n">09</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="10" tabindex="0"><span class="n">10</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="11" tabindex="0"><span class="n">11</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="12" tabindex="0"><span class="n">12</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="13" tabindex="0"><span class="n">13</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="14" tabindex="0"><span class="n">14</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="15" tabindex="0"><span class="n">15</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="16" tabindex="0"><span class="n">16</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="17" tabindex="0"><span class="n">17</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+                <div class="slot" data-slot="18" tabindex="0"><span class="n">18</span><span class="name">Empty</span><span class="ab"></span><span class="acts"></span></div>
+            </div>
+        </section>
+
+        <section class="card" id="active-macros-card">
+            <div class="card-h">
+                <span class="card-t">Active macros</span>
+                <span class="card-sub" data-default="saved slots on their own in-game hotkeys">saved slots on their own in-game hotkeys</span>
+                <span class="right">
+                    <span class="card-sub nowrap">If one is already playing:</span>
+                    <div class="seg small" id="policy-seg" role="radiogroup" aria-label="If a macro is already playing">
+                        <button type="button" class="on" data-policy="ignore" role="radio" aria-checked="true">Ignore</button>
+                        <button type="button" data-policy="interrupt" role="radio" aria-checked="false">Interrupt</button>
                     </div>
-                    <span class="hk-binding active-binding">&lt;unset&gt;</span>
-                    <button type="button" class="active-bind btn-secondary">Bind</button>
-                    <button type="button" class="active-play btn-secondary">Play</button>
-                    <button type="button" class="active-clear btn-secondary">Clear</button>
+                    <span class="help" tabindex="0" aria-label="Active macros info"
+                          data-help="Assign up to three saved slots to their own Genshin-only hotkeys. Only one macro plays at a time. Ignore keeps the current playback running when another active hotkey is pressed; Interrupt stops it, releases held inputs, then starts the requested slot.">?</span>
+                </span>
+            </div>
+            <div class="am-list">
+                <div class="active-macro-row" data-active="1">
+                    <span class="am-letter active-label">A</span>
+                    <span class="sel"><select class="active-slot" aria-label="Saved slot for active macro A"><option value="0">No slot</option></select></span>
+                    <button type="button" class="key active-bind unset" aria-label="Hotkey for active macro A">Bind…</button>
+                    <button type="button" class="btn sm active-play">Play</button>
+                    <button type="button" class="btn sm active-clear">Clear</button>
                 </div>
                 <div class="active-macro-row" data-active="2">
-                    <span class="active-label">B</span>
-                    <div class="select-wrapper active-slot-wrap">
-                        <select class="active-slot">
-                            <option value="0">No slot</option>
-                        </select>
-                    </div>
-                    <span class="hk-binding active-binding">&lt;unset&gt;</span>
-                    <button type="button" class="active-bind btn-secondary">Bind</button>
-                    <button type="button" class="active-play btn-secondary">Play</button>
-                    <button type="button" class="active-clear btn-secondary">Clear</button>
+                    <span class="am-letter active-label">B</span>
+                    <span class="sel"><select class="active-slot" aria-label="Saved slot for active macro B"><option value="0">No slot</option></select></span>
+                    <button type="button" class="key active-bind unset" aria-label="Hotkey for active macro B">Bind…</button>
+                    <button type="button" class="btn sm active-play">Play</button>
+                    <button type="button" class="btn sm active-clear">Clear</button>
                 </div>
                 <div class="active-macro-row" data-active="3">
-                    <span class="active-label">C</span>
-                    <div class="select-wrapper active-slot-wrap">
-                        <select class="active-slot">
-                            <option value="0">No slot</option>
-                        </select>
-                    </div>
-                    <span class="hk-binding active-binding">&lt;unset&gt;</span>
-                    <button type="button" class="active-bind btn-secondary">Bind</button>
-                    <button type="button" class="active-play btn-secondary">Play</button>
-                    <button type="button" class="active-clear btn-secondary">Clear</button>
+                    <span class="am-letter active-label">C</span>
+                    <span class="sel"><select class="active-slot" aria-label="Saved slot for active macro C"><option value="0">No slot</option></select></span>
+                    <button type="button" class="key active-bind unset" aria-label="Hotkey for active macro C">Bind…</button>
+                    <button type="button" class="btn sm active-play">Play</button>
+                    <button type="button" class="btn sm active-clear">Clear</button>
                 </div>
             </div>
-            <div class="hk-capture-msg active-capture-msg"></div>
-        </fieldset>
+        </section>
 
-        <fieldset class="card">
-            <legend>Slots</legend>
-            <div class="row macro-mode-row">
-                <span class="macro-mode-label">On click:</span>
-                <button type="button" class="macro-mode-btn macro-mode-active" data-mode="load">Load</button>
-                <button type="button" class="macro-mode-btn" data-mode="save">Save</button>
-                <button type="button" class="macro-mode-btn" data-mode="rename">Rename</button>
-                <button type="button" class="macro-mode-btn" data-mode="clear">Clear</button>
-                <span class="help" tabindex="0" aria-label="Slot info"
-                      data-help="Pick a click-mode then tap a slot. Load reads slot N into the current macro buffer (the loaded slot gets a yellow ring) and asks first if that would discard unsaved changes. Save prompts for a name and writes the current buffer to slot N. Rename changes a saved slot's name without touching its events. Clear deletes slot N and unassigns any active macro using it. Filled slots glow accent-blue with their name shown (hover for the full name); empty slots are dim and tagged 'empty'. Slots are locked while recording or playing.">?</span>
+        <section class="card" id="macro-hotkeys-card">
+            <div class="card-h">
+                <span class="card-t">Macro hotkeys</span>
+                <span class="card-sub" data-default="only inside the game · click a key to change it">only inside the game · click a key to change it</span>
             </div>
-            <div class="slot-grid">
-                <button type="button" class="slot" data-slot="1"><span class="slot-num">1</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="2"><span class="slot-num">2</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="3"><span class="slot-num">3</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="4"><span class="slot-num">4</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="5"><span class="slot-num">5</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="6"><span class="slot-num">6</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="7"><span class="slot-num">7</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="8"><span class="slot-num">8</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="9"><span class="slot-num">9</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="10"><span class="slot-num">10</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="11"><span class="slot-num">11</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="12"><span class="slot-num">12</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="13"><span class="slot-num">13</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="14"><span class="slot-num">14</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="15"><span class="slot-num">15</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="16"><span class="slot-num">16</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="17"><span class="slot-num">17</span><span class="slot-name">empty</span></button>
-                <button type="button" class="slot" data-slot="18"><span class="slot-num">18</span><span class="slot-name">empty</span></button>
+            <div class="hk">
+                <div class="hk-row" data-action="macro_record"><span>Record / Stop</span><button type="button" class="key" aria-label="Record hotkey">—</button></div>
+                <div class="hk-row" data-action="macro_play"><span>Play</span><button type="button" class="key" aria-label="Play hotkey">—</button></div>
+                <div class="hk-row" data-action="macro_stop"><span>Stop playback</span><button type="button" class="key" aria-label="Stop playback hotkey">—</button></div>
+                <div class="hk-row" data-action="macro_save"><span>Save to slot…</span><button type="button" class="key" aria-label="Save hotkey">—</button></div>
+                <div class="hk-row" data-action="macro_load"><span>Load slot…</span><button type="button" class="key" aria-label="Load hotkey">—</button></div>
             </div>
-            <div class="macro-pending" id="macro-pending"></div>
-        </fieldset>
+            <div class="hint" id="macro-pending">Save / Load: press the key, then 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc cancels.</div>
+        </section>
 
-        <fieldset class="card hotkeys">
-            <legend>Macro Hotkeys</legend>
-            <div class="hk-row" data-action="macro_record">
-                <span class="hk-label">Record / Stop</span>
-                <span class="hk-binding">&mdash;</span>
-                <button type="button" class="rebind">Rebind</button>
+        <section class="card" id="events-card">
+            <div class="card-h">
+                <span class="card-t">Events</span>
+                <span class="card-sub" id="evt-count">0 in the working macro</span>
+                <span class="right">
+                    <span class="tag" id="evt-dirty-tag" hidden>unsaved edits</span>
+                    <button type="button" class="btn sm" id="evt-toggle">Show</button>
+                    <button type="button" class="btn sm" id="evt-add" disabled>+ Add</button>
+                    <button type="button" class="btn sm" id="evt-discard" disabled>Discard</button>
+                    <button type="button" class="btn sm go" id="evt-save" disabled>Save changes</button>
+                    <span class="help" tabindex="0" aria-label="Events info"
+                          data-help="Each row is one key or mouse press/release at a time in seconds from the start. Edit inline. Save changes replaces the working macro and, if a slot is loaded, writes back to that slot; if a different macro was loaded or recorded since you started editing, it refuses instead of overwriting. Rows with an unknown key or button are dropped on save. Discard reverts your edits. Rows are sorted by time on save.">?</span>
+                </span>
             </div>
-            <div class="hk-row" data-action="macro_play">
-                <span class="hk-label">Play</span>
-                <span class="hk-binding">&mdash;</span>
-                <button type="button" class="rebind">Rebind</button>
-            </div>
-            <div class="hk-row" data-action="macro_stop">
-                <span class="hk-label">Stop Playback</span>
-                <span class="hk-binding">&mdash;</span>
-                <button type="button" class="rebind">Rebind</button>
-            </div>
-            <div class="hk-row" data-action="macro_save">
-                <span class="hk-label">Save (1-18)</span>
-                <span class="hk-binding">&mdash;</span>
-                <button type="button" class="rebind">Rebind</button>
-            </div>
-            <div class="hk-row" data-action="macro_load">
-                <span class="hk-label">Load (1-18)</span>
-                <span class="hk-binding">&mdash;</span>
-                <button type="button" class="rebind">Rebind</button>
-            </div>
-            <div class="hk-capture-msg"></div>
-        </fieldset>
-
-        <fieldset class="card" id="events-card">
-            <legend>Events <span class="evt-count" id="evt-count">(0)</span></legend>
-            <div class="row evt-toolbar">
-                <button type="button" id="evt-toggle" class="btn-secondary">Show</button>
-                <button type="button" id="evt-add" class="btn-secondary" disabled>+ Add</button>
-                <button type="button" id="evt-discard" class="btn-secondary" disabled>Discard</button>
-                <button type="button" id="evt-save" class="btn-primary" disabled>Save</button>
-                <span class="evt-dirty-tag" id="evt-dirty-tag"></span>
-                <span class="help" tabindex="0" aria-label="Events info"
-                      data-help="Inspect and edit the events in the current macro buffer. Each row is a single key/mouse press or release at a given time. Edit time / device / key / event_type inline. Save replaces the buffer and (if a slot is currently loaded) writes back to that slot; if a different macro was loaded or recorded since you started editing, Save refuses instead of overwriting it. Rows with an unknown key or button are dropped on Save. Discard reverts your edits to the current buffer. Times are seconds from the start of the macro and are sorted on Save.">?</span>
-            </div>
-            <div class="evt-list-wrapper" id="evt-list-wrapper" hidden>
-                <table class="evt-table">
+            <div class="evt-empty" id="evt-placeholder" hidden>Recording… the list fills in when you stop.</div>
+            <div class="evt-wrap" id="evt-list-wrapper" hidden>
+                <table class="evt">
                     <thead>
                         <tr>
-                            <th>#</th>
-                            <th>Time (s)</th>
-                            <th>Device <span class="help help-th" tabindex="0" aria-label="Device &amp; key info"
-                                  data-help="Device sets what the Key column means. keyboard: use the key name — single letters (a, s, d), modifiers (shift, ctrl, alt), or special keys (space, enter, esc, tab, backspace, delete, up, down, left, right, f1–f12, home, end, page up, page down, insert, caps lock, num lock, scroll lock). mouse: use the button name — left, right, middle, x (Mouse 4 / back), or x2 (Mouse 5 / forward).">?</span></th>
+                            <th class="i">#</th>
+                            <th class="th-time">Time (s)</th>
+                            <th class="th-device">Device <span class="help help-th" tabindex="0" aria-label="Device &amp; key info"
+                                  data-help="Device sets what the Key column means. keyboard: the key name — letters (a, s, d), modifiers (shift, ctrl, alt) or special keys (space, enter, esc, tab, backspace, delete, up, down, left, right, f1–f12, home, end, page up, page down, insert). mouse: the button name — left, right, middle, x (Mouse 4) or x2 (Mouse 5).">?</span></th>
                             <th>Key</th>
-                            <th>Event <span class="help help-th" tabindex="0" aria-label="Event type info"
-                                  data-help="Event type for this row. down: key/button press. up: key/button release. double: mouse double-click — replayed as a single down (the controller has no double-click primitive). Live recordings only produce down/up; double is accepted on hand-edit so you can paste in raw events from elsewhere.">?</span></th>
-                            <th></th>
+                            <th class="th-event">Event <span class="help help-th" tabindex="0" aria-label="Event type info"
+                                  data-help="down: press. up: release. double: mouse double-click, replayed as a single down (the controller has no double-click primitive). Recordings only produce down/up; double is accepted on hand-edit so you can paste in raw events from elsewhere.">?</span></th>
+                            <th class="th-del"></th>
                         </tr>
                     </thead>
                     <tbody id="evt-tbody"></tbody>
                 </table>
             </div>
-        </fieldset>
-    </section>
+        </section>
+    </main>
 
     <!-- Logs tab -->
-    <section class="panel" data-panel="logs">
-        <div class="log-toolbar">
-            <button type="button" id="btn-clear-log">Clear</button>
+    <main class="panel" data-panel="logs">
+        <div class="logbar">
+            <div class="fchips" id="log-filters" role="group" aria-label="Filter by source">
+                <button type="button" class="fchip on" data-f="" aria-pressed="true">All</button>
+                <button type="button" class="fchip" data-f="album" style="--c:var(--gold)" aria-pressed="false"><i></i>album</button>
+                <button type="button" class="fchip" data-f="bot" style="--c:var(--anemo)" aria-pressed="false"><i></i>bot</button>
+                <button type="button" class="fchip" data-f="macro" style="--c:var(--hydro)" aria-pressed="false"><i></i>macro</button>
+                <button type="button" class="fchip" data-f="serial" style="--c:var(--pyro)" aria-pressed="false"><i></i>serial</button>
+                <button type="button" class="fchip" data-f="ui" style="--c:var(--ink-2)" aria-pressed="false"><i></i>ui</button>
+                <button type="button" class="fchip" data-f="other" style="--c:var(--electro)" aria-pressed="false"><i></i>other</button>
+            </div>
+            <div class="right">
+                <span class="switch-row"><button type="button" class="switch on" id="log-follow" role="switch" aria-checked="true" aria-label="Follow new lines"></button><span class="sub">Follow</span></span>
+                <button type="button" class="btn sm" id="btn-copy-log">Copy</button>
+                <button type="button" class="btn sm" id="btn-clear-log">Clear</button>
+            </div>
         </div>
-        <pre class="log-pane" id="log-pane"></pre>
-    </section>
+        <div class="log" id="log-pane" aria-label="Log output" data-filter=""></div>
+    </main>
 
-    <script src="app.js"></script>
+    <!-- In-app dialog (one instance, content built per use by app.js) -->
+    <div class="scrim" id="dialog-scrim" hidden>
+        <div class="dlg" id="dialog-box" role="dialog" aria-modal="true" aria-labelledby="dialog-title"></div>
+    </div>
+</div>
+
+<script src="app.js"></script>
 </body>
 </html>
