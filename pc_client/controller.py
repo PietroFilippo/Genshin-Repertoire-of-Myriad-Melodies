@@ -54,16 +54,38 @@ def _auto_detect_port():
         print("No serial ports found at all.")
     return None
 
-# Arduino Keyboard.h modifiers
+# Arduino Keyboard.h modifiers + non-printing keys. Names are the
+# `keyboard` package's canonical names (what the recorder stores and
+# what MacroEngine.replace_events canonicalizes editor input to).
+# Keyboard.press() treats 128-135 as modifier bits and any code >= 136
+# as raw HID usage (code - 136), so e.g. KEY_F1 0xC2 -> usage 0x3A (F1).
+# The firmware forwards K:<code> and timed E:<code> unchanged to
+# Keyboard.press, so the realtime path and the scheduled-macro compiler
+# share this one table via _key_code(). Names missing here are logged
+# and skipped by key_down/key_up (and force the host scheduler for the
+# timed path) rather than sent as a wrong key.
 KEY_MAP = {
     'ctrl': 128, 'left ctrl': 128, 'right ctrl': 128,
     'shift': 129, 'left shift': 129, 'right shift': 129,
     'alt': 130, 'left alt': 130, 'right alt': 130,
+    'windows': 131, 'left windows': 131,                  # KEY_LEFT_GUI
+    'right windows': 135,                                 # KEY_RIGHT_GUI
     'up': 218, 'down': 217, 'left': 216, 'right': 215,
     'backspace': 178, 'tab': 179, 'enter': 176, 'esc': 177,
-    'space': 32
+    'space': 32,
+    'insert': 0xD1, 'home': 0xD2, 'page up': 0xD3,
+    'delete': 0xD4, 'end': 0xD5, 'page down': 0xD6,
+    'caps lock': 0xC1,
+    'print screen': 0xCE, 'scroll lock': 0xCF, 'pause': 0xD0,
+    'num lock': 0xDB, 'menu': 0xED,
+    # KEY_F1..KEY_F12 = 0xC2..0xCD; KEY_F13..KEY_F24 = 0xF0..0xFB.
+    **{f'f{n}': 0xC2 + n - 1 for n in range(1, 13)},
+    **{f'f{n}': 0xF0 + n - 13 for n in range(13, 25)},
 }
 
+# Arduino Mouse.h only reports three buttons (MOUSE_LEFT/RIGHT/MIDDLE).
+# Side buttons (`x` / `x2`) can't be represented: they are logged and
+# skipped, never remapped to a left click.
 MOUSE_MAP = {
     'left': 1, 'right': 2, 'middle': 4
 }
@@ -89,9 +111,14 @@ _MAVUIKA_CA_HIT_MS = 555
 
 
 def _key_code(key):
+    """Keyboard.h code for `key`, or 0 when the Arduino can't type it.
+    Single characters go through Keyboard.press's US-ASCII map, so only
+    7-bit ASCII is accepted — a code >= 136 would be read as a raw HID
+    usage (e.g. 'ç' = 231 -> keypad 7), i.e. silently the wrong key."""
     k = str(key or '').lower()
     if len(k) == 1:
-        return ord(k)
+        code = ord(k)
+        return code if 0 < code < 128 else 0
     return KEY_MAP.get(k, 0)
 
 
@@ -138,6 +165,9 @@ def _compile_timed_macro_events(events):
             op = (_TIMED_KEY_DOWN if event_type == 'down'
                   else _TIMED_KEY_UP)
         elif device == 'mouse':
+            # x / x2 have no MOUSE_MAP entry -> rejected here, so the
+            # host scheduler runs the macro and mouse_down/up log + skip
+            # them instead of the board pressing some other button.
             code = MOUSE_MAP.get(key, 0)
             if not code or event_type not in ('down', 'up', 'double'):
                 raise ValueError(f"event {index} is not firmware-compatible")
@@ -378,18 +408,62 @@ def _log_cdc_cycle_diagnostics(events, event_late_us=None):
             )
 
 
+class ArduinoConnectionError(RuntimeError):
+    """The Arduino link could not be established. `str(exc)` is a
+    user-facing message (no board found / port couldn't be opened /
+    connection cancelled) suitable for showing as-is in the UI."""
+
+
+# Consecutive write timeouts tolerated before the link is declared dead.
+# A single timeout can be transient (the sketch briefly not draining its
+# CDC buffer); several in a row with no successful write in between mean
+# the board has hung or vanished, and each costs a 0.5 s stall.
+_MAX_CONSECUTIVE_WRITE_TIMEOUTS = 3
+
+
+def _open_failure_message(port, exc):
+    reason = str(exc) or exc.__class__.__name__
+    # pyserial already prefixes "could not open port 'COM7': " — drop it
+    # so the message doesn't name the port twice.
+    prefix = f"could not open port {port!r}: "
+    if reason.startswith(prefix):
+        reason = reason[len(prefix):]
+    message = f"Couldn't open {port}: {reason}"
+    if isinstance(exc, PermissionError) or 'denied' in reason.lower():
+        message += (" (is the Arduino IDE serial monitor or another app "
+                    "using the port?)")
+    return message
+
+
 class ArduinoHIDController:
-    def __init__(self):
+    # Link-health state. Class-level defaults (all immutable) so test
+    # doubles built with `__new__` behave like a freshly opened link.
+    # `_link_failed` latches True on the first hard serial error and
+    # never resets: a Windows COM handle doesn't come back after the
+    # board is unplugged, even if it re-enumerates on the same port.
+    _link_failed = False
+    _write_timeouts = 0
+    _health_lock = threading.Lock()   # only taken on the failure path
+
+    def __init__(self, cancel_evt=None):
+        """Open the serial link to the Leonardo.
+
+        Raises `ArduinoConnectionError` (user-facing message) when no
+        board is found, the port can't be opened, or `cancel_evt` (an
+        optional `threading.Event`) is set before / during the 2 s
+        post-open settle wait — in which case the port is closed again
+        before raising. Never calls sys.exit: UI worker threads catch
+        the exception and surface the message."""
         # Resolve port: explicit config value wins; None/empty triggers
-        # auto-detection. Auto-detect failure exits — no port = no bot.
+        # auto-detection. Auto-detect failure raises — no port = no bot.
         if SERIAL_PORT:
             self.port = SERIAL_PORT
         else:
             detected = _auto_detect_port()
             if not detected:
-                print("ERROR: SERIAL_PORT is None and auto-detection failed. "
-                      "Plug in the Arduino or set SERIAL_PORT in config.py.")
-                sys.exit(1)
+                raise ArduinoConnectionError(
+                    "No Arduino found — plug in the Leonardo or switch "
+                    "Input to Software")
             self.port = detected
         self.baud = BAUD_RATE
         self.ser = None
@@ -406,35 +480,118 @@ class ArduinoHIDController:
         self._timed_macro_protocol_version = 0
         self._timed_macro_max_events = 0
         self._loaded_timed_signature = None
+        self._unsupported_warned = set()
 
+        if cancel_evt is not None and cancel_evt.is_set():
+            raise ArduinoConnectionError("Arduino connection cancelled")
+        print(f"Connecting to Arduino on {self.port} at {self.baud} baud")
         try:
-            print(f"Connecting to Arduino on {self.port} at {self.baud} baud")
             # Explicit write_timeout so a stalled write fails fast instead of
             # blocking other commands behind it for unbounded time.
             self.ser = serial.Serial(self.port, self.baud,
                                      timeout=1, write_timeout=0.5)
-            time.sleep(2) # Allow arduino leonardo time to reset and initialize serial
-            print("Connected successfully")
         except Exception as e:
-            print(f"Error connecting to Arduino on {self.port}: {e}")
-            print("Please check your connection and the COM port in config.py")
-            sys.exit(1)
+            raise ArduinoConnectionError(
+                _open_failure_message(self.port, e)) from e
+        # Allow arduino leonardo time to reset and initialize serial.
+        # Cancellable when the caller passes an event (UI Stop during the
+        # first connection) — a bare sleep pinned Stop for the full 2 s.
+        if cancel_evt is not None:
+            cancelled = cancel_evt.wait(2.0)
+        else:
+            time.sleep(2)
+            cancelled = False
+        if cancelled:
+            self._close_port_quietly()
+            raise ArduinoConnectionError("Arduino connection cancelled")
+        print("Connected successfully")
+
+    # ---- link health ----
+
+    @property
+    def healthy(self):
+        """True while the serial link is usable: the port opened, is
+        still open, and no read/write has hit a hard serial error.
+
+        Latches False (see `_link_failed`) after the first hard
+        SerialException / OSError on a read or write, after
+        `_MAX_CONSECUTIVE_WRITE_TIMEOUTS` write timeouts in a row, or
+        once `close()` has run. The owner should then close() this
+        instance and build a new one. Reading the property also does a
+        cheap non-blocking probe (`in_waiting` -> ClearCommError) so a
+        board unplugged while idle is noticed before the next run
+        starts; the probe is skipped if a writer currently holds the
+        lock (that writer will notice the failure itself)."""
+        if self._link_failed:
+            return False
+        ser = getattr(self, 'ser', None)
+        try:
+            if ser is None or not ser.is_open:
+                return False
+        except Exception:
+            return False
+        lock = getattr(self, '_write_lock', None)
+        if lock is not None and lock.acquire(blocking=False):
+            failure = None
+            try:
+                ser.in_waiting
+            except (serial.SerialException, OSError) as exc:
+                failure = exc
+            finally:
+                lock.release()
+            if failure is not None:
+                self._mark_link_failed('port check', failure)
+        return not self._link_failed
+
+    def _mark_link_failed(self, context, exc):
+        """Latch the link as dead and log it ONCE. Every later write is
+        skipped (see `_write_line`) instead of re-failing — and re-logging
+        — through the dead handle on every keystroke."""
+        with self._health_lock:
+            if self._link_failed:
+                return
+            self._link_failed = True
+        print(f"[serial] {context} failed: {exc}")
+        print("[serial] Arduino disconnected — stop and press Start again "
+              "to reconnect")
+
+    def _close_port_quietly(self):
+        ser = getattr(self, 'ser', None)
+        if ser is None:
+            return
+        try:
+            ser.close()
+        except Exception as e:
+            print(f"[serial] close failed: {e}")
 
     def _write_line(self, cmd):
         """Write one protocol line. Returns write duration in seconds or
         None on failure. Serial write completion is useful transport
         telemetry, but scheduled playback never treats it as the event's
         execution time — the Leonardo owns that clock."""
+        if self._link_failed:
+            return None
         if self.ser and self.ser.is_open:
             cmd_str = f"{cmd}\n"
             try:
                 started = time.perf_counter()
                 with self._write_lock:
                     self.ser.write(cmd_str.encode('utf-8'))
+                self._write_timeouts = 0
                 return time.perf_counter() - started
-            except (serial.SerialTimeoutException, serial.SerialException, OSError) as e:
+            except serial.SerialTimeoutException as e:
                 # Don't let a transient write failure crash a worker thread.
+                # A run of them (no success in between) means the board is
+                # gone or hung — latch the link dead instead of stalling
+                # 0.5 s per write forever.
+                self._write_timeouts += 1
                 print(f"[serial] write failed for {cmd!r}: {e}")
+                if self._write_timeouts >= _MAX_CONSECUTIVE_WRITE_TIMEOUTS:
+                    self._mark_link_failed(
+                        f"{self._write_timeouts} consecutive writes", e)
+            except (serial.SerialException, OSError) as e:
+                # Hard failure (unplugged, handle invalid): never transient.
+                self._mark_link_failed(f"write {cmd!r}", e)
         return None
 
     def _send_command(self, cmd):
@@ -443,14 +600,14 @@ class ArduinoHIDController:
 
     def _read_response_lines(self):
         """Read complete firmware response lines without blocking."""
-        if not self.ser or not self.ser.is_open:
+        if self._link_failed or not self.ser or not self.ser.is_open:
             return []
         try:
             with self._write_lock:
                 waiting = self.ser.in_waiting
                 chunk = self.ser.read(waiting) if waiting else b''
         except (serial.SerialException, OSError) as exc:
-            print(f"[serial] read failed: {exc}")
+            self._mark_link_failed('read', exc)
             return []
         if chunk:
             self._rx_buffer.extend(chunk)
@@ -595,6 +752,15 @@ class ArduinoHIDController:
 
             signature = (len(packed), crc)
             if signature != self._loaded_timed_signature:
+                # Forget the old buffer BEFORE the first replacement byte
+                # goes out. A replacement that fails after L: (or whose
+                # R: ack is lost to a timeout/stop) may leave the board
+                # holding nothing, a partial load, or even the NEW buffer
+                # committed. Keeping the old signature would let the next
+                # request for the old macro skip its upload and START
+                # whatever the board holds. The signature is only set
+                # again once the commit R:<count>:<crc> ack is verified.
+                self._loaded_timed_signature = None
                 if not self._upload_timed_macro(packed, crc, stop_evt):
                     return False
                 self._loaded_timed_signature = signature
@@ -661,27 +827,51 @@ class ArduinoHIDController:
     def _get_key_code(self, key):
         return _key_code(key)
 
+    def _warn_unsupported(self, kind, name):
+        """Log an input the board can't produce, once per name per
+        connection, so a macro that repeats it doesn't flood the log."""
+        warned = self.__dict__.setdefault('_unsupported_warned', set())
+        tag = (kind, str(name))          # str(): never raise on odd input
+        if tag in warned:
+            return
+        warned.add(tag)
+        print(f"[serial] {kind} {name!r} isn't supported by the Arduino "
+              "backend")
+
     def key_down(self, key):
         """Press a key down"""
         code = self._get_key_code(key)
         if code:
             self._send_command(f"K:{code}:DOWN")
+        else:
+            self._warn_unsupported('key', key)
 
     def key_up(self, key):
         """Release a key"""
         code = self._get_key_code(key)
         if code:
             self._send_command(f"K:{code}:UP")
-            
+        else:
+            self._warn_unsupported('key', key)
+
     def mouse_down(self, button):
-        """Press a mouse button"""
-        code = MOUSE_MAP.get(button.lower(), 1)
-        self._send_command(f"M:{code}:DOWN")
+        """Press a mouse button. Unsupported buttons (x / x2) are logged
+        and skipped — never remapped to a left click."""
+        name = str(button or '').lower()
+        code = MOUSE_MAP.get(name, 0)
+        if code:
+            self._send_command(f"M:{code}:DOWN")
+        else:
+            self._warn_unsupported('mouse button', name)
 
     def mouse_up(self, button):
-        """Release a mouse button"""
-        code = MOUSE_MAP.get(button.lower(), 1)
-        self._send_command(f"M:{code}:UP")
+        """Release a mouse button (unsupported buttons: see mouse_down)."""
+        name = str(button or '').lower()
+        code = MOUSE_MAP.get(name, 0)
+        if code:
+            self._send_command(f"M:{code}:UP")
+        else:
+            self._warn_unsupported('mouse button', name)
 
     def mouse_move(self, dx, dy):
         """Move the mouse pointer by (dx, dy) pixels via HID. Genshin's
@@ -724,18 +914,23 @@ class ArduinoHIDController:
 
     def close(self):
         if self.ser and self.ser.is_open:
-            # Send UP to all standard rhythm keys just in case
+            # Send UP to all standard rhythm keys just in case. Skipped
+            # internally (no write, no log spam) if the link already died.
             for k in ['a', 's', 'd', 'j', 'k', 'l']:
                 self.key_up(k)
             # Release mouse just in case
             self.mouse_up('left')
             self.mouse_up('right')
-            self.ser.close()
+            self._close_port_quietly()
             print("Serial connection closed")
 
 if __name__ == "__main__":
     # Test script if run directly
-    ctrl = ArduinoHIDController()
+    try:
+        ctrl = ArduinoHIDController()
+    except ArduinoConnectionError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
     print("Testing keys. You should see keys being pressed in 3 seconds")
     time.sleep(3)
     

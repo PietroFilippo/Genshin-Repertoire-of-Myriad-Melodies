@@ -13,7 +13,9 @@ The engine owns:
   via a `threading.Event` and share the safety sweep (release inputs
   this playback left held, plus rhythm keys + L/R mouse on exit).
 - On-disk slot format `{name, events}` with bare-list legacy
-  back-compat on read.
+  back-compat on read. Every slot write goes through
+  `atomic_write_json` (temp file + fsync + `os.replace`) so a failed
+  save can never leave a truncated / 0-byte slot behind.
 - `loaded_slot` / `dirty` bookkeeping so callers (UI) can show the
   "slot N loaded" indicator and the unsaved-changes marker.
 
@@ -32,7 +34,10 @@ The engine does NOT own:
   engine and tracks state however it likes.
 """
 import json
+import os
+import tempfile
 import time
+from pathlib import Path
 
 try:
     from system_setup import boost_timer, restore_timer
@@ -42,6 +47,128 @@ except Exception:                                   # pragma: no cover
 
     def restore_timer():
         pass
+
+
+# ---- atomic JSON persistence ----
+#
+# `os.replace` on Windows fails with PermissionError while any other
+# handle has the destination open without FILE_SHARE_DELETE -- Python's
+# own `open()` never passes that flag, so a concurrent reader (the UI
+# drain reading slot names, an AV scanner) can make a single attempt
+# fail. Retry briefly; total worst case ~0.2 s before giving up.
+_REPLACE_ATTEMPTS = 10
+_REPLACE_RETRY_S = 0.02
+
+
+def _unlink_quietly(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _replace_with_retry(src, dst):
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_RETRY_S)
+
+
+def atomic_write_json(path, obj, **json_kwargs):
+    """Write `obj` as JSON to `path` so readers only ever see the old
+    file or the complete new one -- never a truncated / 0-byte file.
+
+    Order matters:
+    1. Serialize first (`json.dumps(obj, **json_kwargs)`), so a
+       TypeError / ValueError from a bad object never touches disk.
+    2. Write a uniquely-named temp file in the destination's own
+       directory (same volume => the rename below is atomic on NTFS),
+       then flush + `os.fsync`.
+    3. `os.replace` the temp file onto `path` (retried briefly on
+       Windows sharing violations, see `_replace_with_retry`).
+
+    Creates the parent directory if it is missing. On any failure the
+    temp file is removed and the exception re-raised; the destination
+    keeps its previous contents. Returns None on success.
+    """
+    path = Path(path)
+    text = json.dumps(obj, **json_kwargs)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent))
+    try:
+        fh = os.fdopen(fd, 'w', encoding='utf-8')
+    except BaseException:
+        os.close(fd)
+        _unlink_quietly(tmp_name)
+        raise
+    try:
+        with fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _replace_with_retry(tmp_name, path)
+    except BaseException:
+        _unlink_quietly(tmp_name)
+        raise
+
+
+# ---- event validation (UI event-editor path) ----
+
+# Buttons the `mouse` package (software backend + recorder) can press.
+# The Arduino backend supports a subset (left/right/middle) and logs +
+# skips the rest at playback time.
+_MOUSE_BUTTONS = frozenset({'left', 'right', 'middle', 'x', 'x2'})
+
+
+def _keyboard_package():
+    """The `keyboard` package, or None when it can't be imported (e.g.
+    a headless test box). Imported lazily so this module stays cheap
+    to import and validation degrades to "accept as typed"."""
+    try:
+        import keyboard
+    except Exception:
+        return None
+    return keyboard
+
+
+def _canonical_key_name(key):
+    """Resolve an editor-typed key name the same way the recorder and
+    the software backend do. Returns `(canonical_name, None)` when the
+    name is a single key the `keyboard` package can press, or
+    `(None, reason)` when it can't.
+
+    Why this matters: `keyboard.press('not_a_real_key')` raises AFTER
+    setting the package-global replay flag, which silences every
+    keyboard hotkey (including macro Stop) until restart. Canonicalizing
+    (e.g. 'escape' -> 'esc', 'page_up' -> 'page up') also keeps the
+    Arduino backend's key map, which only knows canonical names, in
+    agreement with the software backend.
+
+    If the `keyboard` package is unavailable or its name tables blow up
+    for an unrelated reason, the name passes through unvalidated -- the
+    backends already log + skip unknown keys, so dropping user data on
+    a validator failure would be the worse outcome."""
+    kb = _keyboard_package()
+    if kb is None:
+        return key, None
+    try:
+        canonical = str(kb.normalize_name(key)).lower()
+        kb.key_to_scan_codes(canonical)
+        # parse_hotkey is exactly what keyboard.press/release run, so a
+        # name that passes here can't raise inside them.
+        steps = kb.parse_hotkey(canonical)
+    except ValueError:
+        return None, 'unknown key'
+    except Exception:
+        return key, None
+    if len(steps) != 1 or len(steps[0]) != 1:
+        return None, 'key combination (use one event per key)'
+    return canonical, None
 
 # Playback timing notes -- measured on this repo, do not "simplify" back:
 #
@@ -182,10 +309,13 @@ class MacroEngine:
     def replace_events(self, events):
         """Replace the buffer with a JS-edited list. Validates each
         entry — bad fields drop the event with a log line so a
-        hand-edited slot can't crash playback. Sorts by `time` so
-        out-of-order edits don't jumble playback ordering. Returns
-        the cleaned list, or None if the top-level payload wasn't
-        a list. Marks the buffer dirty."""
+        hand-edited slot can't crash playback. Keyboard key names must
+        resolve to a single key in the `keyboard` package and are
+        stored in its canonical form (see `_canonical_key_name`);
+        mouse buttons must be one of left/right/middle/x/x2. Sorts by
+        `time` so out-of-order edits don't jumble playback ordering.
+        Returns the cleaned list, or None if the top-level payload
+        wasn't a list. Marks the buffer dirty."""
         if not isinstance(events, list):
             return None
         cleaned = []
@@ -207,6 +337,16 @@ class MacroEngine:
             key = str(ev.get('key') or '').strip().lower()
             if not key:
                 print(f"[macro] dropped event {i}: empty key")
+                continue
+            if device == 'keyboard':
+                canonical, reason = _canonical_key_name(key)
+                if canonical is None:
+                    print(f"[macro] dropped event {i}: {reason} {key!r}")
+                    continue
+                key = canonical
+            elif key not in _MOUSE_BUTTONS:
+                print(f"[macro] dropped event {i}: unknown mouse button "
+                      f"{key!r} (use left/right/middle/x/x2)")
                 continue
             etype = (ev.get('event_type') or '').lower()
             if etype not in ('down', 'up', 'double'):
@@ -328,11 +468,34 @@ class MacroEngine:
         parent directories as needed. Caller is responsible for
         associating the path with a slot tag (via `mark_saved`) if
         it cares about loaded-slot tracking — engine doesn't infer
-        slot numbers from paths."""
-        payload = {'name': name or '', 'events': self._events}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open('w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=2)
+        slot numbers from paths.
+
+        Failure contract (unchanged API, now safe on disk): returns
+        None on success and RAISES on failure — OSError from the
+        filesystem, TypeError / ValueError if an event isn't
+        JSON-serializable. The write is atomic (`write_slot`), so on
+        failure the previous slot file is left intact; callers must
+        not `mark_saved` after an exception."""
+        self.write_slot(path, self._events, name)
+
+    @staticmethod
+    def write_slot(path, events, name=''):
+        """Atomically write `{name, events}` to `path` (see
+        `atomic_write_json`). Single home for every slot write so
+        save / rename / any future path can't reintroduce a
+        truncate-then-write. Raises on failure; the destination keeps
+        its previous contents."""
+        payload = {'name': name or '', 'events': events}
+        atomic_write_json(Path(path), payload, indent=2)
+
+    @classmethod
+    def rename_slot(cls, path, name):
+        """Rewrite slot `path` with a new `name`, keeping its events
+        (a legacy bare-list file is upgraded to `{name, events}`).
+        Raises like `read()` (missing / malformed file) and
+        `write_slot()` (write failure — old file intact)."""
+        events, _old_name = cls.read(Path(path))
+        cls.write_slot(path, events, name)
 
     @staticmethod
     def read(path):

@@ -39,9 +39,10 @@ import mouse
 
 # Names that the `keyboard` package accepts as-is. Includes the
 # subset we actually pass through from macro recordings + album
-# clicks — the `keyboard` package is permissive for unknown names
-# (`keyboard.press('foo')` silently no-ops) so this is mostly
-# documentation.
+# clicks. This is documentation only — the `keyboard` package is NOT
+# permissive for unknown names: `keyboard.press('foo')` raises
+# ValueError (and leaves its replay flag stuck; see
+# `_clear_keyboard_replay_flag`).
 _KB_NAMES = frozenset({
     'esc', 'enter', 'tab', 'backspace', 'delete', 'space',
     'up', 'down', 'left', 'right',
@@ -49,6 +50,29 @@ _KB_NAMES = frozenset({
     'home', 'end', 'page up', 'page down', 'insert',
     'caps lock', 'num lock', 'scroll lock',
 })
+
+
+def _clear_keyboard_replay_flag():
+    """Undo the `keyboard` package's stuck replay flag after a failed
+    press/release.
+
+    `keyboard.press/release` -> `keyboard.send()` sets the package-global
+    `keyboard._listener.is_replaying = True` BEFORE it parses the key
+    name, and only resets it on the success path. An unknown name
+    (e.g. a typo from the macro event editor) raises ValueError out of
+    `parse_hotkey` with the flag still True. While it is True,
+    `_KeyboardListener.direct_callback` passes every real keystroke
+    straight through without updating pressed-key state or running
+    hotkey callbacks — every keyboard hotkey in the app (macro Stop
+    included) goes dead until restart. `send()` would have set it back
+    to False itself had it completed, so resetting here restores
+    exactly the state it would have left."""
+    listener = getattr(keyboard, '_listener', None)
+    if listener is not None and getattr(listener, 'is_replaying', False):
+        try:
+            listener.is_replaying = False
+        except Exception:                           # pragma: no cover
+            pass
 
 
 class SoftwareInputController:
@@ -89,6 +113,15 @@ class SoftwareInputController:
         except Exception as e:                      # pragma: no cover
             print(f"[sw-input] keyboard warmup skipped: {e}")
 
+    # ---- health ----
+
+    @property
+    def healthy(self):
+        """Always True — there is no link to lose. Present for parity
+        with `ArduinoHIDController.healthy` so the UI can check any
+        cached backend uniformly."""
+        return True
+
     # ---- keyboard ----
 
     @staticmethod
@@ -99,12 +132,14 @@ class SoftwareInputController:
         try:
             keyboard.press(self._norm_key(key))
         except Exception as e:
+            _clear_keyboard_replay_flag()
             print(f"[sw-input] key_down {key!r} failed: {e}")
 
     def key_up(self, key):
         try:
             keyboard.release(self._norm_key(key))
         except Exception as e:
+            _clear_keyboard_replay_flag()
             print(f"[sw-input] key_up {key!r} failed: {e}")
 
     # ---- mouse buttons ----
