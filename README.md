@@ -22,7 +22,7 @@ The bot only presses keys while Genshin is the focused window. If you alt-tab aw
 2. Run `Genshin Rhythm Bot\Genshin Rhythm Bot.exe` and accept the UAC prompt.
 3. In the game, open the rhythm minigame and equip the Hu Tao theme.
 
-Settings and saved macros are stored in `%APPDATA%\GenshinRhythmBot`: `ui_settings.json` holds hotkeys, input method and Main-tab options, and `macros\` holds the saved macros. Because they live there, they carry over when you upgrade: extract the new zip and run it.
+Settings and saved macros are stored in `%APPDATA%\GenshinRhythmBot`: `ui_settings.json` holds hotkeys, input method, Main-tab options, theme and window size, and `macros\` holds the saved macros. Because they live there, they carry over when you upgrade: extract the new zip and run it.
 
 ## Input method: Software or Arduino
 
@@ -113,6 +113,12 @@ Shows timestamped output from the bot, Album mode, macros and the Arduino. You c
 ### Debug overlay
 
 Turn on **Debug overlay** (or press `F10`) to get a preview window while the bot runs. It shows the hit line, the sample dots, a blue-channel reading per lane, FPS and a live key log. It stays on top without taking focus from the game, so the bot keeps playing. Close it with its **X**, the switch or `F10`. Closing it only turns debug off; the run continues.
+
+### Themes and window size
+
+- **Themes:** **Score sheet** (the default), **Light**, **Dark** or **Match Windows** (follows Windows' light/dark mode). Pick one with the **Theme** dropdown in the strip at the top. Your choice is remembered.
+- **Resizing:** drag any edge or corner of the window (minimum 640 × 600). Double-click the title bar to maximize or restore; maximized keeps the taskbar visible. Size, position and the maximized state are remembered. If the saved position is off-screen, for example after unplugging a monitor, the window opens centred at its default size.
+- Wider windows use the extra space: Album options sit in one row and the Macros tab gets two columns with a full-height events editor.
 
 ## How detection works
 
