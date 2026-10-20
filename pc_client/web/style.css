@@ -277,6 +277,28 @@ button:disabled { cursor: not-allowed; }
 .card-sub.cap-msg { color: var(--gold); }
 .card-sub.hint-msg { color: var(--gold); }
 
+/* Transient messages (capture prompt, slot hints) carry instructions, so
+   they wrap to a second line instead of being cut; the static subtitles
+   do the same only when the window is narrow. */
+.card-sub.cap-msg,
+.card-sub.hint-msg {
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    line-height: 1.3;
+}
+
+@media (max-width: 680px) {
+    .card-h .card-sub:not(.nowrap) {
+        white-space: normal;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        line-height: 1.3;
+    }
+}
+
 .card-h .right {
     margin-left: auto;
     display: flex;
@@ -739,7 +761,9 @@ button:disabled { cursor: not-allowed; }
 
 .tip b { color: var(--ink); font-weight: 600; }
 .tip svg { flex-shrink: 0; }
-.tip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The sentence wraps (two lines at 640 px) rather than losing its second
+   half to an ellipsis — it's the one prerequisite a first run depends on. */
+.tip > span { min-width: 0; line-height: 1.35; }
 
 .tip .x {
     margin-left: auto;
@@ -886,9 +910,13 @@ button:disabled { cursor: not-allowed; }
     transition: background .08s, color .08s;
 }
 
-.lane.on .note { height: 58px; opacity: 1; }
-.lane.on .flower path { fill: var(--gold-2); stroke: var(--gold-2); filter: drop-shadow(0 0 5px rgba(240, 217, 164, .8)); }
-.lane.on b { color: var(--gold-ink); background: var(--gold); border-color: var(--gold); }
+/* A held lane lights up at once (a press is instantaneous) and fades out
+   over the 80 ms transition on release — so a frame caught right after
+   the class flips already shows the full flower, note bar and gold cap
+   instead of a half-faded in-between state. */
+.lane.on .note { height: 58px; opacity: 1; transition-duration: 0s; }
+.lane.on .flower path { fill: var(--gold-2); stroke: var(--gold-2); filter: drop-shadow(0 0 5px rgba(240, 217, 164, .8)); transition-duration: 0s; }
+.lane.on b { color: var(--gold-ink); background: var(--gold); border-color: var(--gold); transition-duration: 0s; }
 
 /* --- hotkey rows + key caps ------------------------------------------------- */
 
@@ -915,6 +943,12 @@ button:disabled { cursor: not-allowed; }
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+/* Narrow window: a label next to a wide cap ("Mouse 5", "press a key…")
+   wraps onto a second line instead of reading "Stop playb…". */
+@media (max-width: 680px) {
+    .hk-row > span { white-space: normal; line-height: 1.25; }
 }
 
 .key {
@@ -1174,8 +1208,10 @@ button.key:disabled { color: var(--ink-3); }
 .active-macro-row .sel select { height: 28px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
 .active-macro-row .key { display: block; height: 28px; line-height: 22px; max-width: none; }
 
-.hint { font-size: 12px; color: var(--ink-2); margin-top: 8px; }
+.hint { font-size: 12px; color: var(--ink-2); margin-top: 8px; line-height: 1.35; }
 .hint.live { color: var(--gold); }
+/* Second-press guard armed in game: the sentence is a deadline. */
+.hint.confirm { color: var(--gold); font-weight: 600; }
 
 /* --- macros: events editor ------------------------------------------------------- */
 
@@ -1187,6 +1223,9 @@ button.key:disabled { color: var(--ink-3); }
     background: var(--bg);
     padding: 8px 6px 4px;
 }
+
+/* rows locked while a Save / Clear-instead is in flight */
+.evt-wrap.busy { opacity: .7; }
 
 .evt {
     width: 100%;

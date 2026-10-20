@@ -226,8 +226,10 @@ $('#btn-max').addEventListener('click', () => {
 });
 $('#btn-close').addEventListener('click', async () => {
     // Unsaved macro work (recording, unsaved buffer, editor edits) only
-    // lives in memory — ask before throwing it away.
-    const loss = macroUnsavedSummary();
+    // lives in memory — ask before throwing it away. The rule must match
+    // Python's allow_close() (`recording or dirty`), otherwise a case the
+    // page skips is asked again natively after close().
+    const loss = macroUnsavedSummary(true);
     if (loss) {
         const ok = await dlgConfirm('Close Genshin Rhythm Bot?',
             `You have ${loss} that will be lost.`,
@@ -351,7 +353,8 @@ $('#input-backend').addEventListener('change', async () => {
 const MAIN = {
     mode: 'standalone',   // mode shown by the segmented control
     lastSongs: parseInt($('#songs').value, 10) || 12, // last valid Songs value
-    startPending: null,   // {state, lastError, timer} while Start/Stop is in flight
+    startPending: null,   // {state, lastError, minUntil, timer} while Start/Stop is in flight
+    clickGuardUntil: 0,   // Start/Stop clicks are ignored until this time
     suppressError: null,  // last_error string hidden since the last Start click
     modeRequest: false,   // a mode-switch confirm is open
     tipDismissed: false,
@@ -533,10 +536,17 @@ function renderDebugSwitch() {
 
 // --- start/stop/pause ------------------------------------------------------
 
-// Start/Stop debounce: after a click the button stays disabled until a
-// status push shows the state (or last_error) changed, with a 1.5 s
-// safety re-enable — so a double-click can't Start and then immediately
-// Stop the run.
+// Start/Stop debounce, two layers (BU7):
+//  - a fixed click guard: for START_CLICK_GUARD_MS after a click the
+//    button ignores clicks and stays disabled, whatever the status says.
+//    The first `running` push used to arrive within ~50 ms and re-enable
+//    the button in time for the second half of a double-click to Stop.
+//  - the pending guard: beyond that, the button stays disabled until a
+//    status push shows the state (or last_error) changed, with a
+//    START_PENDING_MAX_MS safety re-enable in case no push ever comes.
+const START_CLICK_GUARD_MS = 600;
+const START_PENDING_MAX_MS = 1500;
+
 function clearStartPending() {
     if (MAIN.startPending && MAIN.startPending.timer) {
         clearTimeout(MAIN.startPending.timer);
@@ -550,17 +560,39 @@ function beginStartPending() {
     MAIN.startPending = {
         state: s.state || 'idle',
         lastError: s.last_error || '',
-        timer: setTimeout(() => {
-            MAIN.startPending = null;
-            renderStartButtons(STATE.lastStatus || {});
-        }, 1500),
+        minUntil: Date.now() + START_CLICK_GUARD_MS,
+        settling: false,
+        timer: setTimeout(endStartPendingNow, START_PENDING_MAX_MS),
     };
     $('#btn-start').disabled = true;
+}
+
+// A status push showed the state moved: release the button now if the
+// click guard has elapsed, otherwise when it does.
+function settleStartPending() {
+    const p = MAIN.startPending;
+    if (!p || p.settling) return;
+    const wait = p.minUntil - Date.now();
+    if (wait <= 0) {
+        endStartPendingNow();
+        return;
+    }
+    p.settling = true;
+    clearTimeout(p.timer);
+    p.timer = setTimeout(endStartPendingNow, wait);
 }
 
 function endStartPendingNow() {
     clearStartPending();
     renderStartButtons(STATE.lastStatus || {});
+}
+
+// True (and arms the guard) when a Start/Stop click may go through.
+function acceptStartClick() {
+    const now = Date.now();
+    if (MAIN.startPending || now < MAIN.clickGuardUntil) return false;
+    MAIN.clickGuardUntil = now + START_CLICK_GUARD_MS;
+    return true;
 }
 
 function botIsRunning() {
@@ -574,7 +606,7 @@ function macroIsBusy() {
 }
 
 $('#btn-start').addEventListener('click', async () => {
-    if (MAIN.startPending) return;
+    if (!acceptStartClick()) return;
     const s = STATE.lastStatus || {};
     if (!botIsRunning()) {
         // A retry must never show the previous failure next to "Playing":
@@ -1253,8 +1285,51 @@ const MACRO = {
     lastActionAt: 0,
     noticeLead: '',
     noticeErr: '',
+    localErr: null,        // {lead, msg, until} shown from a bridge refusal
+    localErrTimer: null,
     hint: { text: '', until: 0, timer: null },
 };
+
+const LOCAL_ERR_MS = 10000;
+
+// Fallback wording per refusal reason, for a Python side that returns
+// the reason without a `message` (the message wins when present).
+const _MACRO_REFUSAL_TEXT = {
+    game_not_found: 'Genshin isn’t running — start the game, then try again.',
+    focus_failed: 'Couldn’t bring Genshin to the front — click into the game '
+        + 'and use the macro hotkey instead.',
+    not_foreground: 'Genshin isn’t the active window — playback was not started.',
+    bot_stop_timeout: 'The bot didn’t stop in time — macro not started. Try again.',
+    no_backend: 'The input backend is unavailable — see the Logs tab.',
+    busy: 'Another macro command is still running — try again.',
+    empty_buffer: 'Nothing to play — record or load a macro first.',
+    empty_slot: 'That slot is empty.',
+};
+
+// Show a bridge refusal in the macro notice right away instead of
+// waiting for the status tick (and for refusals Python does not publish
+// as macro_error). Returns true when something was shown. `bot_running`
+// is handled by the caller's confirm; `closing` needs no notice.
+function explainMacroRefusal(action, res) {
+    if (!res || res.ok !== false) return false;
+    const reason = String(res.reason || '');
+    if (reason === 'bot_running' || reason === 'closing' || reason === 'stale') return false;
+    const msg = String(res.message || '').trim()
+        || _MACRO_REFUSAL_TEXT[reason]
+        || (reason ? `Refused (${reason}) — see the Logs tab.` : 'See the Logs tab.');
+    showMacroError(_MACRO_LEADS[action] || 'Couldn’t do that.', msg);
+    return true;
+}
+
+function showMacroError(lead, msg) {
+    MACRO.localErr = { lead, msg, until: Date.now() + LOCAL_ERR_MS };
+    clearTimeout(MACRO.localErrTimer);
+    MACRO.localErrTimer = setTimeout(() => {
+        MACRO.localErr = null;
+        renderMacroNotice(STATE.lastStatus || {});
+    }, LOCAL_ERR_MS + 50);
+    renderMacroNotice(STATE.lastStatus || {});
+}
 
 const _MACRO_LEADS = {
     record: 'Record didn’t start.',
@@ -1322,18 +1397,21 @@ function activeUsersOfSlot(n) {
 
 // What replacing the working macro right now would throw away, as a
 // phrase ('' = nothing). Shared by the Load / Record / Close confirms.
-function macroUnsavedSummary() {
+// Load / Record count a dirty buffer only when it has events (an empty
+// one has nothing to lose); `forClose` follows Python's close rule,
+// `macro_state === 'recording' || macro_dirty`, exactly.
+function macroUnsavedSummary(forClose) {
     const s = STATE.lastStatus || {};
     const parts = [];
     const n = s.macro_events || 0;
     const evs = plural(n, 'event');
     if (s.macro_state === 'recording') {
         parts.push(`a recording in progress (${evs})`);
-    } else if (s.macro_dirty && n > 0) {
+    } else if (s.macro_dirty && (n > 0 || forClose)) {
         const loaded = parseInt(s.macro_loaded, 10) || 0;
-        parts.push(loaded
-            ? `unsaved changes to slot ${loaded} (${evs})`
-            : `an unsaved macro (${evs})`);
+        if (loaded) parts.push(`unsaved changes to slot ${loaded} (${evs})`);
+        else if (n > 0) parts.push(`an unsaved macro (${evs})`);
+        else parts.push('unsaved macro changes');
     }
     if (evtState.visible && evtState.jsDirty) {
         parts.push('unsaved edits in the events editor');
@@ -1473,9 +1551,11 @@ $$('.active-macro-row').forEach((row) => {
                 { ok: 'Stop bot and play' });
             if (ok) {
                 noteMacroAction('play');
-                callApi('macro_play_active', pos, true);
+                explainMacroRefusal('play', await callApi('macro_play_active', pos, true));
             }
+            return;
         }
+        explainMacroRefusal('play', res);
     });
     row.querySelector('.active-clear').addEventListener('click', () => {
         callApi('macro_clear_active', pos);
@@ -1572,6 +1652,7 @@ async function slotAction(act, n) {
         noteMacroAction('load');
         const res = await callApi('macro_load_slot', n);
         if (res && res.ok) discardEditorEdits();
+        else explainMacroRefusal('load', res);
     } else if (act === 'save') {
         openSaveDialog(n);
     } else if (act === 'rename') {
@@ -1606,8 +1687,25 @@ async function slotAction(act, n) {
             { ok: 'Clear slot', cancel: 'Keep it', danger: true, focusCancel: true });
         if (!ok) return;
         noteMacroAction('clear');
-        callApi('macro_clear_slot', n);
+        const res = await callApi('macro_clear_slot', n);
+        if (res && res.ok) noteUnassigned(n, res);
+        else explainMacroRefusal('clear', res);
     }
+}
+
+// `macro_clear_slot` reports the active-macro letters it unassigned.
+function unassignedPhrase(res) {
+    const letters = (res && Array.isArray(res.unassigned) ? res.unassigned : [])
+        .map((l) => String(l)).filter(Boolean);
+    if (!letters.length) return '';
+    const one = letters.length === 1;
+    return `Active macro ${letters.join(', ')} ${one ? 'is' : 'are'} now `
+        + `unassigned — pick another slot for ${one ? 'it' : 'them'}.`;
+}
+
+function noteUnassigned(n, res) {
+    const phrase = unassignedPhrase(res);
+    if (phrase) showMacroHint(`Slot ${n} cleared. ${phrase}`, 9000);
 }
 
 $('#slot-grid').addEventListener('click', (ev) => {
@@ -1731,10 +1829,26 @@ async function openSaveDialog(preSlot) {
     }, null);
     if (!picked) return;
     noteMacroAction('save');
-    const res = await callApi('macro_save_slot', picked.slot, picked.name,
-        typeof rev === 'number' ? rev : null);
+    const pinned = typeof rev === 'number' ? rev : null;
+    const res = await callApi('macro_save_slot', picked.slot, picked.name, pinned);
     if (res && res.ok === false && res.reason === 'stale') {
         showMacroHint('The macro changed while you were naming it — nothing was saved. Try again.');
+        return;
+    }
+    if (!res || res.ok === false) {
+        explainMacroRefusal('save', res);
+        return;
+    }
+    // Saving to a new slot changes the buffer's identity (rev + loaded
+    // slot) without touching its events. An editor that fetched this
+    // same revision can simply follow: its local edits still apply, and
+    // Save writes them back to the slot the macro now lives in. Any
+    // other state re-fetches through the normal rev check.
+    if (evtState.visible && evtState.jsDirty && pinned !== null
+            && evtState.rev === pinned && typeof res.rev === 'number') {
+        evtState.rev = res.rev;
+        evtState.slot = parseInt(res.slot, 10) || picked.slot;
+        updateEvtButtons();
     }
 }
 
@@ -1756,6 +1870,7 @@ $('#macro-record').addEventListener('click', async () => {
     }
     const after = (res) => {
         if (starting && res && res.ok) discardEditorEdits();
+        if (starting) explainMacroRefusal('record', res);
     };
     const res = await callApi('macro_toggle_record', false);
     if (res && res.ok === false && res.reason === 'bot_running') {
@@ -1780,18 +1895,32 @@ $('#macro-play').addEventListener('click', async () => {
             { ok: 'Stop bot and play' });
         if (ok) {
             noteMacroAction('play');
-            callApi('macro_play', true);
+            explainMacroRefusal('play', await callApi('macro_play', true));
         }
+        return;
     }
+    // game_not_found / focus_failed / not_foreground / bot_stop_timeout /
+    // no_backend ... each come with a `message`.
+    explainMacroRefusal('play', res);
 });
 
 $('#macro-stop-play').addEventListener('click', () => callApi('macro_stop'));
 
 function renderMacroNotice(s) {
     const err = String(s.macro_error || '').trim();
-    if (!err) {
+    const local = (MACRO.localErr && Date.now() < MACRO.localErr.until)
+        ? MACRO.localErr : null;
+    if (!err && !local) {
         MACRO.noticeErr = '';
         setHidden($('#macro-notice'), true);
+        return;
+    }
+    if (!err) {
+        // Python has not (or not yet) published this one: show what the
+        // bridge call returned until the status catches up.
+        setText($('#macro-notice-lead'), local.lead);
+        setText($('#macro-notice-msg'), local.msg);
+        setHidden($('#macro-notice'), false);
         return;
     }
     if (err !== MACRO.noticeErr) {
@@ -1886,17 +2015,33 @@ function renderMacroState(s) {
     renderEventsCardState();
 }
 
+// Fallback wording for a Python side without `macro_pending_hint`.
 const _PENDING_TEXT = {
     save: 'Save (in Genshin): press 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc or leaving the game cancels.',
     load: 'Load (in Genshin): press 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc or leaving the game cancels.',
+    confirm_record: 'Unsaved macro — press the Record hotkey again within 3 s to discard it and record.',
+    confirm_load: 'Unsaved macro — press the Load hotkey again within 3 s to discard it and load a slot.',
 };
+const _PENDING_IDLE_TEXT = 'Save / Load: press the key, then 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc cancels.';
 
-function renderMacroPending(pending) {
+// `macro_pending`: '' | 'save' | 'load' (slot picker armed) |
+// 'confirm_record' | 'confirm_load' (in-game Record / Load over unsaved
+// work needs a second press within 3 s). `macro_pending_hint` is the
+// ready-made sentence for whichever is armed and is shown verbatim.
+function renderMacroPending(s) {
+    s = s || {};
     const el = $('#macro-pending');
-    const live = pending === 'save' || pending === 'load';
-    setText(el, live ? _PENDING_TEXT[pending]
-        : 'Save / Load: press the key, then 1–9 for slots 1–9, or 0 then 1–9 for slots 10–18. Esc cancels.');
+    const pending = String(s.macro_pending || '');
+    const hint = String(s.macro_pending_hint || '').trim();
+    const confirm = pending.indexOf('confirm_') === 0;
+    const live = !!pending;
+    let text;
+    if (live && hint) text = hint;
+    else if (live) text = _PENDING_TEXT[pending] || 'Press the hotkey again to confirm.';
+    else text = _PENDING_IDLE_TEXT;
+    setText(el, text);
     setClass(el, 'live', live);
+    setClass(el, 'confirm', confirm);
 }
 
 // --- events editor ---------------------------------------------------------
@@ -1916,8 +2061,37 @@ const evtState = {
     fetchGen: 0,         // bumped per fetch / hide — stale responses dropped
     fetching: false,     // one fetch in flight at a time
     refetch: false,      // another fetch was requested meanwhile
-    saving: false,
+    saving: false,       // Save / Clear-instead in flight
+    locked: false,       // row inputs disabled (mirrors `saving`)
 };
+
+// While a Save or "Clear slot instead" is in flight the rows and Add are
+// disabled (MR8): an edit made meanwhile used to be wiped when the
+// completion cleared `jsDirty` and re-fetched. The edit-generation check
+// at completion stays as a second line of defence.
+function setEditorLocked(locked) {
+    const on = !!locked;
+    if (evtState.locked === on) return;
+    evtState.locked = on;
+    const tbody = $('#evt-tbody');
+    if (!tbody) return;
+    tbody.querySelectorAll('input, select, button').forEach((el) => {
+        el.disabled = on;
+    });
+    setClass($('#evt-list-wrapper'), 'busy', on);
+}
+
+function beginEditorSave() {
+    evtState.saving = true;
+    setEditorLocked(true);
+    updateEvtButtons();
+}
+
+function endEditorSave() {
+    evtState.saving = false;
+    setEditorLocked(false);
+    updateEvtButtons();
+}
 
 // True when the buffer moved on since `working` was fetched.
 function editorIsStale() {
@@ -1982,6 +2156,11 @@ function renderEventsTable() {
         });
         tbody.appendChild(tr);
     });
+    if (evtState.locked) {
+        tbody.querySelectorAll('input, select, button').forEach((el) => {
+            el.disabled = true;
+        });
+    }
     renderEvtCount();
 }
 
@@ -1995,7 +2174,7 @@ function updateEvtButtons() {
     const visible = evtState.visible;
     const s = STATE.lastStatus || {};
     const busy = s.macro_state === 'recording' || s.macro_state === 'playing';
-    setDisabled($('#evt-add'), !visible || evtState.rev < 0 || busy);
+    setDisabled($('#evt-add'), !visible || evtState.rev < 0 || busy || evtState.saving);
     const saveBtn = $('#evt-save');
     setDisabled(saveBtn, !visible || !evtState.jsDirty || busy || evtState.saving);
     setTitle(saveBtn, (visible && busy)
@@ -2167,8 +2346,9 @@ async function offerClearInstead(slot) {
     const ok = await dlgConfirm('Clear the slot instead?', body,
         { ok: `Clear slot ${slot}`, cancel: 'Keep editing', danger: true, focusCancel: true });
     if (!ok) return;
-    evtState.saving = true;
-    updateEvtButtons();
+    if (evtState.saving || !evtState.visible) return;   // raced another Save
+    const editRevAtClear = evtState.editRev;
+    beginEditorSave();
     noteMacroAction('clear');
     callApi('macro_set_events', [], evtState.rev, slot, false).then((res) => {
         if (!res || res.ok === false) {
@@ -2180,23 +2360,30 @@ async function offerClearInstead(slot) {
             }
             return null;
         }
-        evtState.rev = res.rev;
+        if (typeof res.rev === 'number') evtState.rev = res.rev;
         return callApi('macro_clear_slot', slot).then((r2) => {
             if (!r2 || r2.ok === false) {
                 dlgAlert('Slot not cleared',
                     `The macro is now empty, but slot ${slot} could not be cleared: `
                     + ((r2 && r2.message) || 'see the Logs tab.'));
+            } else {
+                noteUnassigned(slot, r2);
             }
-            evtState.jsDirty = false;
-            evtState.editRev += 1;
-            fetchAndShowEvents();
+            if (evtState.editRev === editRevAtClear) {
+                evtState.jsDirty = false;
+                evtState.editRev += 1;
+                fetchAndShowEvents();
+            } else {
+                // Edits arrived while this ran (the rows are locked, so
+                // only a race can get here): keep them as unsaved edits
+                // to the now-unassigned buffer rather than wiping them.
+                evtState.slot = 0;
+                updateEvtButtons();
+            }
         });
     }).catch((e) => {
         console.error('[evt] clear failed', e);
-    }).finally(() => {
-        evtState.saving = false;
-        updateEvtButtons();
-    });
+    }).finally(endEditorSave);
 }
 
 $('#evt-save').addEventListener('click', () => {
@@ -2222,9 +2409,11 @@ $('#evt-save').addEventListener('click', () => {
         return;
     }
     const editRevAtSave = evtState.editRev;
-    evtState.saving = true;
-    updateEvtButtons();
+    beginEditorSave();
     noteMacroAction('edit');
+    // expected_slot is ALWAYS sent — 0 included, so an editor opened on an
+    // unassigned buffer can't write persist=false over a slot loaded
+    // meanwhile (null would disable Python's slot check).
     callApi('macro_set_events', sanitized, evtState.rev, slot, slot > 0)
         .then((res) => {
             if (!res) {
@@ -2268,10 +2457,7 @@ $('#evt-save').addEventListener('click', () => {
         .catch((e) => {
             console.error('[evt] save failed', e);
         })
-        .finally(() => {
-            evtState.saving = false;
-            updateEvtButtons();
-        });
+        .finally(endEditorSave);
 });
 
 // Called on every status push. Re-fetches when the buffer revision
@@ -2515,7 +2701,7 @@ window.updateStatus = function updateStatus(data) {
     const botLive = botState === 'running' || botState === 'paused';
     if (MAIN.startPending && (botState !== MAIN.startPending.state
             || (s.last_error || '') !== MAIN.startPending.lastError)) {
-        clearStartPending();
+        settleStartPending();
     }
 
     if ('run_started_at' in data) {
@@ -2607,7 +2793,7 @@ window.updateStatus = function updateStatus(data) {
         // snapshot rather than just `data`.
         renderMacroSlots(s);
     }
-    if ('macro_pending' in data) renderMacroPending(data.macro_pending);
+    if ('macro_pending' in data || 'macro_pending_hint' in data) renderMacroPending(s);
     if ('macro_active_macros' in data || 'macro_conflict_policy' in data
         || 'macro_slots' in data || 'macro_slot_names' in data
         || 'macro_state' in data || 'macro_playing_slot' in data
@@ -2718,6 +2904,7 @@ function init() {
             macro_loaded: macroSnap.macro_loaded || 0,
             macro_dirty: !!macroSnap.macro_dirty,
             macro_pending: macroSnap.macro_pending || '',
+            macro_pending_hint: macroSnap.macro_pending_hint || '',
             macro_playing_slot: macroSnap.macro_playing_slot || 0,
             macro_playing_name: macroSnap.macro_playing_name || '',
             macro_playing_source: macroSnap.macro_playing_source || '',
@@ -2733,7 +2920,7 @@ function init() {
 }
 
 // Pre-init render so the page is coherent before Python answers.
-renderMacroPending('');
+renderMacroPending({});
 renderStageText();
 
 window.addEventListener('pywebviewready', init);
