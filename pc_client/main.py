@@ -22,6 +22,11 @@ from standalone_runner import run_visualization
 from system_setup import boost_timer, restore_timer, set_dpi_aware
 from ui_core import make_input_backend
 
+try:
+    from controller import ArduinoConnectionError
+except ImportError:
+    ArduinoConnectionError = RuntimeError
+
 
 def main():
     print("Initializing program")
@@ -37,9 +42,14 @@ def main():
     # detection is lost.
     timer_boosted = boost_timer()
 
+    def _fail_exit():
+        if timer_boosted:
+            restore_timer()
+        sys.exit(1)
+
     detected = auto_detect()
     if detected is None:
-        sys.exit(1)
+        _fail_exit()
     capture_region, column_centers, hit_line_y = detected
 
     # Re-fetch hwnd for the detector's GDI calls. find_game_window is cheap
@@ -47,14 +57,24 @@ def main():
     hwnd = find_game_window()
     if not hwnd:
         print("ERROR: lost game window after auto-detect.")
-        sys.exit(1)
+        _fail_exit()
     print()
 
     # Honor INPUT_BACKEND_DEFAULT so the CLI doesn't silently pin to
     # Arduino when the user has switched the default to software in
     # config.py. UI users get their per-session choice from
     # ui_settings.json; the CLI deliberately doesn't read that file.
-    controller = make_input_backend(INPUT_BACKEND_DEFAULT)
+    try:
+        controller = make_input_backend(INPUT_BACKEND_DEFAULT)
+    except (ArduinoConnectionError, SystemExit) as e:
+        # ArduinoConnectionError's text is user-facing; SystemExit covers
+        # older adapters that sys.exit on a missing board.
+        print(f"ERROR: {e}")
+        _fail_exit()
+    if controller is None:
+        print("ERROR: no input backend available.")
+        _fail_exit()
+    print("Note: keys are only sent while Genshin is the focused window.")
     detector = NoteDetector(hwnd, column_centers, hit_line_y, controller)
 
     print(f"Starting per-key detection threads "

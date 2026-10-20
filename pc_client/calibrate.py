@@ -23,7 +23,11 @@ def main():
     print()
 
     # Auto-detect game window
-    capture_region, column_centers, hit_line_y = auto_detect()
+    detected = auto_detect()
+    if detected is None:
+        # auto_detect already printed why (window not found / closed).
+        sys.exit(1)
+    capture_region, column_centers, hit_line_y = detected
     print()
 
     print("Capturing frame in 3 seconds... switch to the game.")

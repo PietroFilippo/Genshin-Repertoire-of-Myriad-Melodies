@@ -27,6 +27,18 @@
 # pixel (sustained DOWN). Consecutive holds create dark->bright->dark (DOWN->UP->DOWN).
 # Over 400 lines of complex shape-detection logic, lockouts, and timers were 
 # removed in favor of this simple, robust binary sensor.
+#
+# Foreground gate: HID/SendInput keystrokes go to whatever window has
+# keyboard focus, and GetPixel happily reads a game that's visible on a
+# second monitor while another app is focused — so without a gate the bot
+# types "asdjkl" into that other app. One extra thread polls
+# GetForegroundWindow every FOCUS_POLL_S and flips a plain bool; the six
+# per-key 5 ms loops only read that bool (no extra Win32 calls on the hot
+# path). While the game isn't foreground, held keys are released and no
+# KEY_DOWN is issued. Note the debug-viz OpenCV window belongs to OUR
+# process, so clicking it takes focus away from the game and pauses input
+# too — click back into Genshin to resume. That's intended: keystrokes
+# would land in the viz window, not the game, anyway.
 
 import ctypes
 import ctypes.wintypes
@@ -45,17 +57,52 @@ _user32.ReleaseDC.restype = ctypes.c_int
 _gdi32.GetPixel.argtypes = [ctypes.wintypes.HDC, ctypes.c_int, ctypes.c_int]
 _gdi32.GetPixel.restype = ctypes.wintypes.DWORD
 
+# Foreground-gate poll interval. Worst-case "keys still flowing into the
+# other app" window after an alt-tab is this plus one KEY_POLL_DELAY_S.
+FOCUS_POLL_S = 0.05
+
 
 def _blue(colorref):
     # COLORREF layout: 0x00BBGGRR
     return (colorref >> 16) & 0xFF
 
 
+# GetForegroundWindow / GetWindowThreadProcessId are deliberately left at
+# ctypes' default prototypes: `ctypes.windll.user32` is process-global, and
+# ui_core's hotkey gate compares GetForegroundWindow's default c_int result
+# against a cached HWND. Changing restype here would change it there too.
+
+def _hwnd_key(hwnd):
+    # HWNDs are 32-bit significant on Win64. Normalise so a c_int-typed
+    # GetForegroundWindow and an HWND-typed FindWindowW (ui.py binds that
+    # restype) compare equal even if the handle's high bit is set.
+    return int(hwnd or 0) & 0xFFFFFFFF
+
+
+def _foreground_hwnd():
+    return _user32.GetForegroundWindow() or 0
+
+
+def _window_pid(hwnd):
+    """Owning process id of `hwnd`, 0 on failure. Doesn't message the
+    window, so it can't block on a busy game."""
+    if not hwnd:
+        return 0
+    pid = ctypes.wintypes.DWORD(0)
+    try:
+        _user32.GetWindowThreadProcessId(ctypes.wintypes.HWND(hwnd),
+                                         ctypes.byref(pid))
+    except Exception:
+        return 0
+    return pid.value
+
+
 class NoteDetector:
     def __init__(self, hwnd, column_centers, hit_line_y, controller):
         """
         Args:
-            hwnd: HWND of the game window (used for GetDC).
+            hwnd: HWND of the game window (used for GetDC and for the
+                foreground gate — input pauses while it isn't focused).
             column_centers: list of 6 X-coords in client-area coordinates.
             hit_line_y: Y-coord of hit line in client-area coordinates.
             controller: ArduinoHIDController instance — key_down/key_up
@@ -74,9 +121,25 @@ class NoteDetector:
         self._threads = []
         # Per-key state - read by debug visualization in main thread.
         self.pressed = {key: False for key in KEYS}
+        # Foreground gate — written only by the focus thread, read (plain
+        # attribute load, no lock, no Win32) by the six key loops.
+        self._game_focused = False
+        self._game_pid = 0
 
     def start(self):
         self._stop.clear()
+        # Resolve the initial focus state synchronously so the key loops
+        # never see a stale default before the focus thread's first tick.
+        self._game_pid = _window_pid(self.hwnd)
+        focused = self._is_game_foreground()
+        self._game_focused = bool(focused)
+        if not self._game_focused:
+            print("[detector] game not focused — input paused until "
+                  "Genshin is the foreground window")
+        ft = threading.Thread(target=self._focus_loop, daemon=True,
+                              name="detect-focus")
+        ft.start()
+        self._threads.append(ft)
         for i, key in enumerate(KEYS):
             cx = self.column_centers[i]
             t = threading.Thread(
@@ -102,6 +165,40 @@ class NoteDetector:
                 self.controller.key_up(key)
                 self.pressed[key] = False
 
+    # --- foreground gate ----------------------------------------------------
+
+    def _is_game_foreground(self):
+        """True if Genshin (or another window owned by the game process,
+        e.g. an in-game overlay) is foreground, False if some other app
+        is, None if there is no foreground window right now (transient,
+        mid alt-tab)."""
+        fg = _foreground_hwnd()
+        if not fg:
+            return None
+        if _hwnd_key(fg) == _hwnd_key(self.hwnd):
+            return True
+        if self._game_pid and _window_pid(fg) == self._game_pid:
+            return True
+        return False
+
+    def _focus_loop(self):
+        while not self._stop.wait(FOCUS_POLL_S):
+            try:
+                focused = self._is_game_foreground()
+            except Exception:
+                continue
+            if focused is None:
+                # No foreground window (alt-tab in flight) — keep the last
+                # state rather than flapping a held note on a transient.
+                continue
+            if focused == self._game_focused:
+                continue
+            self._game_focused = focused
+            if focused:
+                print("[detector] game regained focus — resuming input")
+            else:
+                print("[detector] game lost focus — pausing input")
+
     def _all_dark(self, hdc, cx):
         for dy in self.y_offsets:
             if _blue(_gdi32.GetPixel(hdc, cx, self.hit_line_y + dy)) >= self.threshold:
@@ -122,13 +219,17 @@ class NoteDetector:
         while not self._stop.is_set():
             time.sleep(delay)
 
+            # Foreground gate: never press while another app has focus.
+            if not self._game_focused:
+                continue
+
             hdc = _user32.GetDC(hwnd)
             try:
                 present = self._all_dark(hdc, cx)
             finally:
                 _user32.ReleaseDC(hwnd, hdc)
 
-            if not present:
+            if not present or not self._game_focused:
                 continue
 
             self.controller.key_down(key)
@@ -137,6 +238,10 @@ class NoteDetector:
 
             while not self._stop.is_set():
                 time.sleep(delay)
+                # Focus lost mid-hold — release now (key_up below) so the
+                # held key doesn't leak into whatever app took focus.
+                if not self._game_focused:
+                    break
                 hdc = _user32.GetDC(hwnd)
                 try:
                     released = self._any_bright(hdc, cx)

@@ -23,8 +23,14 @@ handles are thread-local (otherwise `_thread._local has no attribute
 'srcdc'`). Other methods are caller-synchronized — `_write_lock` on
 the controller serializes simultaneous click bursts from worker
 threads.
+
+Geometry: region + scales live in one tuple swapped atomically by
+`update_geometry()`, so the end-of-song watcher thread never reads a
+new `scale_x` paired with an old `region` while the album thread is
+tracking a windowed game that was moved or resized.
 """
 import ctypes
+import ctypes.wintypes
 import threading
 import time
 from pathlib import Path
@@ -76,9 +82,7 @@ class ScreenWatcher:
             raise ValueError("ScreenWatcher requires a stop_evt — "
                              "use threading.Event() if there's no "
                              "external one to thread through")
-        self.region = region
-        self.scale_x = scale_x
-        self.scale_y = scale_y
+        self._geom = (dict(region), scale_x, scale_y)
         self.controller = controller
         self.stop_evt = stop_evt
         self.templates = templates
@@ -86,6 +90,28 @@ class ScreenWatcher:
         # mss handles are thread-local in mss>=6 — each thread that
         # calls grab() needs its own mss.mss().
         self._sct_local = threading.local()
+
+    # --- geometry -----------------------------------------------------------
+
+    @property
+    def region(self):
+        return self._geom[0]
+
+    @property
+    def scale_x(self):
+        return self._geom[1]
+
+    @property
+    def scale_y(self):
+        return self._geom[2]
+
+    def update_geometry(self, region, scale_x, scale_y):
+        """Swap in a new capture region + scales (game window moved or
+        resized). Single tuple assignment, so concurrent readers see
+        either the old geometry or the new one, never a mix. Templates
+        are caller-owned: on a resolution change the caller rescales its
+        `templates` dict in place."""
+        self._geom = (dict(region), scale_x, scale_y)
 
     # --- capture + coord helpers -------------------------------------------
 
@@ -96,20 +122,22 @@ class ScreenWatcher:
         if sct is None:
             sct = mss.mss()
             self._sct_local.sct = sct
-        shot = sct.grab(self.region)
+        shot = sct.grab(self._geom[0])
         return np.ascontiguousarray(np.array(shot)[:, :, :3])
 
     def ref_to_screen(self, x, y):
         """Convert 1080p reference (x, y) to absolute screen coords
         (suitable for `controller.move_to`)."""
-        return (int(x * self.scale_x) + self.region['left'],
-                int(y * self.scale_y) + self.region['top'])
+        region, sx, sy = self._geom
+        return (int(x * sx) + region['left'],
+                int(y * sy) + region['top'])
 
     def ref_rect_to_local(self, ref_x, ref_y, ref_w, ref_h):
         """Convert a 1080p reference rectangle to capture-region-
         local coords (suitable as a ROI for `match()`)."""
-        return (int(ref_x * self.scale_x), int(ref_y * self.scale_y),
-                int(ref_w * self.scale_x), int(ref_h * self.scale_y))
+        _, sx, sy = self._geom
+        return (int(ref_x * sx), int(ref_y * sy),
+                int(ref_w * sx), int(ref_h * sy))
 
     # --- template matching --------------------------------------------------
 
@@ -149,33 +177,46 @@ class ScreenWatcher:
     def click_screen(self, sx, sy):
         """Move cursor to absolute screen coords (sx, sy), then click.
         Cancellable: bails after `move_to` if stop_evt is set so the
-        Arduino backend's iterative convergence can abort cleanly."""
+        Arduino backend's iterative convergence can abort cleanly.
+
+        Returns True if the click was issued, False if it wasn't — stop
+        fired, or `move_to` didn't converge (clicking wherever the
+        cursor happened to stop could hit the wrong UI element). Callers
+        treat False like a missed click; check `stop_evt.is_set()` to
+        tell the two apart (same escape hatch as `move_to`)."""
         converged = self.controller.move_to(int(sx), int(sy),
                                             stop_evt=self.stop_evt)
         if self.stop_evt.is_set():
-            return
+            return False
         pt = ctypes.wintypes.POINT()
         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        if not converged:
+            print(f"    click SKIPPED target=({int(sx)},{int(sy)}), "
+                  f"final=({pt.x},{pt.y}) — cursor didn't reach the target")
+            return False
         print(f"    click target=({int(sx)},{int(sy)}), "
               f"final=({pt.x},{pt.y}), converged={converged}")
         # If stop fires after mouse_down we still issue mouse_up so
         # the Arduino doesn't end the run with the button held.
         if self.stop_wait(CLICK_HOVER_S):
-            return
+            return False
         self.controller.mouse_down('left')
         self.stop_wait(CLICK_HOLD_S)
         self.controller.mouse_up('left')
         self.stop_wait(CLICK_SETTLE_S)
+        return True
 
     def click_ref(self, ref_x, ref_y):
-        """Click at a 1080p reference position."""
-        self.click_screen(*self.ref_to_screen(ref_x, ref_y))
+        """Click at a 1080p reference position. Returns `click_screen`'s
+        result."""
+        return self.click_screen(*self.ref_to_screen(ref_x, ref_y))
 
     def click_local(self, lx, ly):
         """Click at a capture-region-local position (e.g. the (cx, cy)
-        a `match()` call returned)."""
-        self.click_screen(lx + self.region['left'],
-                          ly + self.region['top'])
+        a `match()` call returned). Returns `click_screen`'s result."""
+        region = self._geom[0]
+        return self.click_screen(lx + region['left'],
+                                 ly + region['top'])
 
     # --- waits --------------------------------------------------------------
 

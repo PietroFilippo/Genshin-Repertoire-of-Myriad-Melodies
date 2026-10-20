@@ -9,6 +9,7 @@ directly; only the UI calls `run_standalone`.
 CLI's `main.py` doesn't go through `run_standalone` — it builds its
 own detector + DEBUG_MODE-branch loop. See `pc_client/main.py`.
 """
+import inspect
 import time
 import ctypes
 from collections import deque
@@ -21,7 +22,52 @@ from config import (KEYS, PIXEL_THRESHOLD, KEY_POLL_DELAY_S,
                     Y_SAMPLE_OFFSETS)
 from detector import NoteDetector
 from controller import ArduinoHIDController
-from game_window import find_game_window, auto_detect
+from game_window import (MSG_WINDOW_NOT_FOUND, find_game_window, auto_detect,
+                         get_game_geometry, scaled_layout)
+
+try:
+    from controller import ArduinoConnectionError
+except ImportError:
+    ArduinoConnectionError = RuntimeError
+
+
+MSG_ARDUINO_UNAVAILABLE = ("Arduino not connected — plug it in or switch the "
+                           "input backend to Software, then press Start.")
+
+# `run_visualization` exit reasons. The caller keeps the reason instead of
+# re-reading the events afterwards: a quick Pause→Resume can clear
+# pause_evt while the detector is still being torn down, and re-reading
+# then looks like "neither stop nor pause" (that used to end the run).
+VIZ_EXIT_STOP = 'stop'
+VIZ_EXIT_PAUSE = 'pause'
+VIZ_EXIT_QUIT = 'quit'
+
+
+def make_fallback_arduino(cancel_evt=None):
+    """Legacy fallback for callers that didn't inject an InputBackend.
+
+    Returns `(controller, None)` on success, or `(None, message)` if the
+    board couldn't be reached — `message` is user-facing (the adapter's
+    own `ArduinoConnectionError` text when it has one). Catches
+    SystemExit too: older adapters `sys.exit(1)` on a missing board,
+    which would otherwise bypass every `except Exception` up the stack."""
+    try:
+        if _accepts_kwarg(ArduinoHIDController, 'cancel_evt'):
+            return ArduinoHIDController(cancel_evt=cancel_evt), None
+        return ArduinoHIDController(), None
+    except ArduinoConnectionError as e:
+        message = str(e) or MSG_ARDUINO_UNAVAILABLE
+    except SystemExit:
+        message = MSG_ARDUINO_UNAVAILABLE
+    print(f"ERROR: {message}")
+    return None, message
+
+
+def _accepts_kwarg(fn, name):
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def run_visualization(capture_region, column_centers, hit_line_y, detector,
@@ -38,12 +84,17 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             set again, the window is re-created and rendering resumes.
             If None, viz is always-on.
         fps_callback: optional callable(fps_float). Called once per rendered
-            frame so the UI can mirror viz FPS in its status panel.
+            frame so the UI can mirror viz FPS in its status panel, and
+            with 0.0 whenever the window closes (debug off, pause, exit)
+            so the panel doesn't keep a frozen FPS reading.
         pin_console: when True, re-pins the console window topmost each
             frame (legacy CLI behavior). UI mode passes False to skip this.
         pause_evt: when set, exit cleanly so the caller can take down the
             detector and idle. Treated as a soft stop — caller decides
             whether to resume (re-enter this function) or quit.
+
+    Returns why the loop exited: VIZ_EXIT_STOP (stop_evt), VIZ_EXIT_PAUSE
+    (pause_evt) or VIZ_EXIT_QUIT ('q' / window closed with no debug_evt).
     """
     window_open = False
 
@@ -105,16 +156,26 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
             cv2.destroyWindow("Vision Context")
         except cv2.error:
             pass
+        # Window gone → no more frames → zero the UI's FPS readout instead
+        # of leaving the last rendered value frozen on the Status card.
+        if fps_callback is not None:
+            try:
+                fps_callback(0.0)
+            except Exception:
+                pass
 
+    exit_reason = VIZ_EXIT_STOP
     last_time = time.time()
     with mss.mss() as sct:
         while True:
             if stop_evt is not None and stop_evt.is_set():
+                exit_reason = VIZ_EXIT_STOP
                 break
             if pause_evt is not None and pause_evt.is_set():
                 if window_open:
                     close_window()
                     window_open = False
+                exit_reason = VIZ_EXIT_PAUSE
                 break
 
             # Debug toggle: when off, drop the window and idle until on.
@@ -125,6 +186,7 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
                 # Idle without rendering — no frame grab, no overlay work.
                 if stop_evt is not None:
                     if stop_evt.wait(0.1):
+                        exit_reason = VIZ_EXIT_STOP
                         break
                 else:
                     time.sleep(0.1)
@@ -250,10 +312,28 @@ def run_visualization(capture_region, column_centers, hit_line_y, detector,
                     # CLI / no debug toggle — only way out is 'q'.
                     if stop_evt is not None:
                         stop_evt.set()
+                    exit_reason = VIZ_EXIT_QUIT
                     break
 
     if window_open:
         close_window()
+    return exit_reason
+
+
+def _refresh_standalone_geometry(hwnd, stop_evt, status_cb):
+    """Re-read the game geometry after a pause (windowed Genshin may have
+    been moved or resized meanwhile). Blocks — stop-aware — while the
+    game is minimized. Returns (hwnd, capture_region, column_centers,
+    hit_line_y), or None if stop fired or the game window is gone."""
+    # The user may have restarted the game during the pause — prefer a
+    # fresh handle. FindWindowW doesn't message the target, so it's cheap.
+    hwnd = find_game_window() or hwnd
+    geom = get_game_geometry(hwnd, stop_evt=stop_evt, status_cb=status_cb)
+    if geom is None:
+        return None
+    capture_region, scale_x, scale_y = geom
+    column_centers, hit_line_y = scaled_layout(scale_x, scale_y)
+    return hwnd, capture_region, column_centers, hit_line_y
 
 
 def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
@@ -263,35 +343,56 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
 
     If pause_evt is provided and gets set, the detector is stopped
     (releasing all keys) and the function idles until pause_evt is
-    cleared. On resume a fresh detector is spun up.
+    cleared. On resume the game geometry is re-read (the window may have
+    moved / resized) and a fresh detector is spun up.
 
     `controller` lets the UI inject a long-lived InputBackend
     shared across bot runs + the macro tool (only one process can hold
     the COM port). When None, a fresh `ArduinoHIDController` is created
     here and closed on exit — legacy fallback for callers that don't
     pass one. The CLI path picks its backend explicitly via
-    `make_input_backend(...)` and passes it in."""
-    detected = auto_detect(stop_evt=stop_evt)
+    `make_input_backend(...)` and passes it in.
+
+    User-actionable failures (game window missing / closed / minimized,
+    Arduino unavailable) are reported as `status_cb({'last_error': ...})`
+    in addition to the log line."""
+    def _error(message):
+        if status_cb:
+            try:
+                status_cb({'last_error': message})
+            except Exception:
+                pass
+
+    def _stopped():
+        return bool(stop_evt and stop_evt.is_set())
+
+    detected = auto_detect(stop_evt=stop_evt, status_cb=status_cb)
     if detected is None:
-        # Either game window unavailable, or stop fired during the
-        # IsIconic-wait — bail without spinning up serial / detector.
+        # Either game window unavailable (auto_detect already reported
+        # last_error), or stop fired during the IsIconic-wait — bail
+        # without spinning up serial / detector.
         return
     capture_region, column_centers, hit_line_y = detected
     hwnd = find_game_window()
     if not hwnd:
         print("ERROR: lost game window after auto-detect.")
+        _error(MSG_WINDOW_NOT_FOUND)
         return
 
     own_controller = controller is None
     if own_controller:
-        controller = ArduinoHIDController()
+        controller, failure = make_fallback_arduino(cancel_evt=stop_evt)
+        if controller is None:
+            if not _stopped():
+                _error(failure)
+            return
 
     fps_cb = None
     if status_cb:
         fps_cb = lambda f: status_cb({'fps': f})
 
     try:
-        while not (stop_evt and stop_evt.is_set()):
+        while not _stopped():
             detector = NoteDetector(hwnd, column_centers, hit_line_y,
                                     controller)
             if status_cb:
@@ -301,33 +402,56 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
                   f"strip {Y_SAMPLE_OFFSETS})")
             detector.start()
 
+            reason = VIZ_EXIT_STOP
             try:
                 # Viz loop self-gates on debug_evt and idles cheap when off.
-                run_visualization(capture_region, column_centers, hit_line_y,
-                                  detector, stop_evt=stop_evt,
-                                  debug_evt=debug_evt, fps_callback=fps_cb,
-                                  pin_console=False, pause_evt=pause_evt)
+                reason = run_visualization(
+                    capture_region, column_centers, hit_line_y,
+                    detector, stop_evt=stop_evt,
+                    debug_evt=debug_evt, fps_callback=fps_cb,
+                    pin_console=False, pause_evt=pause_evt)
             finally:
                 print("Stopping detector")
                 detector.stop()
 
             # If we exited because of stop (not pause), we're done.
-            if stop_evt and stop_evt.is_set():
-                break
-            if pause_evt is None or not pause_evt.is_set():
+            if _stopped() or reason != VIZ_EXIT_PAUSE:
                 break
 
             # --- paused: idle until resume or stop ---
-            if status_cb:
-                status_cb({'state': 'paused'})
-            print("[standalone] paused — detector stopped, waiting for resume")
-            while pause_evt.is_set():
-                if stop_evt and stop_evt.is_set():
+            # pause_evt may already be clear again (quick Pause→Resume
+            # while detector.stop() was joining) — then skip straight to
+            # the resume path instead of treating it as "run over".
+            if pause_evt.is_set():
+                if status_cb:
+                    status_cb({'state': 'paused'})
+                print("[standalone] paused — detector stopped, "
+                      "waiting for resume")
+                while pause_evt.is_set():
+                    if stop_evt is not None:
+                        if stop_evt.wait(0.1):
+                            break
+                    else:
+                        time.sleep(0.1)
+                if _stopped():
                     break
-                time.sleep(0.1)
-            if stop_evt and stop_evt.is_set():
-                break
             print("[standalone] resumed")
+
+            # Windowed Genshin may have been moved / resized while paused.
+            refreshed = _refresh_standalone_geometry(hwnd, stop_evt,
+                                                     status_cb)
+            if refreshed is None:
+                # Stop fired while waiting for a minimized game, or the
+                # game window is gone (get_game_geometry reported it).
+                break
+            new_hwnd, new_region, new_cols, new_hit = refreshed
+            if (new_region != capture_region or new_cols != column_centers
+                    or new_hit != hit_line_y or new_hwnd != hwnd):
+                print(f"[standalone] game window moved/resized — now "
+                      f"{new_region['width']}x{new_region['height']} @ "
+                      f"({new_region['left']},{new_region['top']})")
+            hwnd, capture_region = new_hwnd, new_region
+            column_centers, hit_line_y = new_cols, new_hit
             # Loop back to spin up a fresh detector.
     finally:
         if own_controller:
