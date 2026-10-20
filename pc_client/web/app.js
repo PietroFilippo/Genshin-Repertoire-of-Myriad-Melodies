@@ -2338,9 +2338,11 @@ function renderEvtCount() {
 // runs on its own Python thread, so updates carry an increasing `seq`
 // and Python drops any older than the last it applied; the value is
 // also re-asserted every few seconds (status pushes + the 1 s ticker)
-// so a lost update heals. Not sent until the bridge exists, so a reload
-// re-sends it.
+// so a lost update heals. Updates carry this page's own random token, so
+// ordering is per page and a reload never depends on init or clocks.
 const EDITOR_DIRTY_REASSERT_MS = 3000;
+const EDITOR_PAGE_TOKEN = Math.random().toString(36).slice(2, 10)
+    + Date.now().toString(36);
 let _editorDirtySent = null;
 let _editorDirtySentAt = 0;
 let _editorDirtySeq = 0;
@@ -2350,21 +2352,11 @@ function syncEditorDirty() {
     if (!api()) return;
     const now = Date.now();
     if (dirty === _editorDirtySent && now - _editorDirtySentAt < EDITOR_DIRTY_REASSERT_MS) return;
-    const gen = STATE.pageGen;
-    if (gen === undefined) return;   // init() hasn't answered yet; re-asserted later
     _editorDirtySent = dirty;
     _editorDirtySentAt = now;
-    if (gen > 0) {
-        // Python issued this page's generation, so a plain per-page
-        // counter is enough: calls the previous page left in flight carry
-        // an older generation and are dropped regardless of clocks.
-        _editorDirtySeq += 1;
-        callApi('macro_set_editor_dirty', dirty, _editorDirtySeq, gen).catch(() => {});
-    } else {
-        // Older Python without page_gen: clock-seeded fallback.
-        _editorDirtySeq = Math.max(_editorDirtySeq + 1, now);
-        callApi('macro_set_editor_dirty', dirty, _editorDirtySeq).catch(() => {});
-    }
+    _editorDirtySeq += 1;
+    callApi('macro_set_editor_dirty', dirty, _editorDirtySeq, EDITOR_PAGE_TOKEN)
+        .catch(() => { _editorDirtySent = null; });   // retry on the next sync
 }
 
 function updateEvtButtons() {
@@ -3085,9 +3077,6 @@ function init() {
     STATE.initialized = true;
     callApi('get_initial_state').then((s) => {
         if (!s) return;
-        STATE.pageGen = (typeof s.page_gen === 'number') ? s.page_gen : 0;
-        _editorDirtySent = null;   // force the next sync to (re)send
-        syncEditorDirty();
         if (typeof s.songs === 'number') {
             $('#songs').value = s.songs;
             MAIN.lastSongs = s.songs;

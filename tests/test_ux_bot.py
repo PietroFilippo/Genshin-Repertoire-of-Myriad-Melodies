@@ -1079,27 +1079,33 @@ class DirectionABridgeTests(unittest.TestCase):
                       True)
         self.assertFalse(api._editor_dirty)
 
-    def test_editor_dirty_page_generation_beats_clocks(self):
-        """G5 (round 2): a reloaded page whose clock stepped backwards must
-        still outrank calls the previous page left in flight — the page
-        generation comes from Python, not from Date.now()."""
+    def test_editor_dirty_pages_are_independent_and_fail_safe(self):
+        """G5/N2/N3: each page load mirrors its editor state under its own
+        token with its own counter, so page loads never interfere and no
+        init handshake is needed; any page still reporting edits keeps the
+        native close guard asking (fail safe: an extra prompt, never lost
+        edits). get_initial_state has no side effects on the mirror."""
         api = self.make_api()
         api._settings['keybinds'] = {}
         api._macro = self._macro_with()
         api._macro.snapshot = lambda: {}
         api._ask_discard_unsaved_macro = mock.Mock(return_value=False)
-        gen1 = api.get_initial_state()['page_gen']
-        self.assertIs(api.macro_set_editor_dirty(False, 1, gen1), True)
-        gen2 = api.get_initial_state()['page_gen']     # page reloaded
-        self.assertGreater(gen2, gen1)
-        self.assertFalse(api._editor_dirty)            # fresh page, no edits
-        self.assertIs(api.macro_set_editor_dirty(True, 1, gen2), True)
-        # Old page's late 'false' (higher seq, older generation) is dropped.
-        self.assertIs(api.macro_set_editor_dirty(False, 99, gen1), False)
-        self.assertFalse(api.allow_close())            # still asks
-        self.assertIs(api.macro_set_editor_dirty(True, 1, gen2), False)  # dup
-        self.assertIs(api.macro_set_editor_dirty(False, 2, gen2), True)
+        self.assertIs(api.macro_set_editor_dirty(True, 1, 'pageA'), True)
+        api.get_initial_state()                        # no side effects
+        api.get_initial_state()
+        self.assertFalse(api.allow_close())            # pageA still dirty
+        # Per-page ordering: a late older update from pageA is dropped.
+        self.assertIs(api.macro_set_editor_dirty(False, 3, 'pageA'), True)
+        self.assertIs(api.macro_set_editor_dirty(True, 2, 'pageA'), False)
         self.assertTrue(api.allow_close())
+        # A reloaded page counts from 1 again without being shadowed.
+        self.assertIs(api.macro_set_editor_dirty(True, 1, 'pageB'), True)
+        self.assertFalse(api.allow_close())
+        self.assertIs(api.macro_set_editor_dirty(False, 2, 'pageB'), True)
+        self.assertTrue(api.allow_close())
+        # Token-less (legacy) updates keep their old semantics.
+        self.assertIs(api.macro_set_editor_dirty(True), True)
+        self.assertFalse(api.allow_close())
 
     def test_close_confirmed_skips_prompt_for_editor_edits(self):
         api = self.make_api()

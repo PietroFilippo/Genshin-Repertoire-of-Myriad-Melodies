@@ -550,11 +550,13 @@ class BridgeApi:
         # Highest update sequence applied to _editor_dirty; every bridge
         # call runs on its own thread, so updates can arrive reordered.
         self._editor_dirty_seq = 0
-        # Bumped by every get_initial_state (one per page load) and handed
-        # to the page; dirty updates carry it so calls a previous page left
-        # in flight can never override the current page — no reliance on
-        # the page's clock.
-        self._editor_page_gen = 0
+        # Per-page mirrors {page token: (seq, dirty)}: each page load picks
+        # its own random token and numbers its updates, so ordering is only
+        # ever compared within one page and page loads never interfere
+        # (no init handshake, no clocks). The close guard counts a page
+        # as unsaved while ANY tracked page last reported dirty — fail
+        # safe: at worst one extra prompt, never lost edits.
+        self._editor_pages = {}
         # Set first thing in detach(): every start path, the backend
         # switch and _get_arduino refuse from then on.
         self._tearing_down = False
@@ -786,13 +788,8 @@ class BridgeApi:
         with self._status_lock:
             last_error = self._status.get('last_error', '')
         with self._lock:
-            # A (re)loaded page starts with no editor edits.
-            self._editor_page_gen = getattr(self, '_editor_page_gen', 0) + 1
-            self._editor_dirty = False
-            self._editor_dirty_seq = 0
             return {
                 **self._opts,
-                'page_gen': self._editor_page_gen,
                 'last_error': last_error,
                 'prereq_tip_dismissed': bool(
                     self._settings.get('prereq_tip_dismissed', False)),
@@ -1225,7 +1222,7 @@ class BridgeApi:
             events, expected_rev=expected_rev, expected_slot=expected_slot,
             persist=bool(persist)))
 
-    def macro_set_editor_dirty(self, dirty, seq=None, page_gen=None):
+    def macro_set_editor_dirty(self, dirty, seq=None, page=None):
         """The events editor gained / lost local edits that are not in
         the macro buffer yet (JS mirrors its flag on every flip, cleared
         on save, discard and hide, and re-asserts it every few seconds).
@@ -1239,27 +1236,27 @@ class BridgeApi:
         one is dropped (returns False). Without `seq` (older page) the
         update always applies.
 
-        `page_gen` (from get_initial_state): updates from an older page
-        load are dropped outright, and `seq` is then a plain per-page
-        counter compared only within the current page."""
+        `page` (a random token the page picks at load): `seq` is then a
+        per-page counter, compared only against that page's own updates."""
         with self._lock:
             if seq is not None:
                 try:
                     seq = int(seq)
                 except (TypeError, ValueError):
                     seq = None
-            if page_gen is not None:
-                try:
-                    page_gen = int(page_gen)
-                except (TypeError, ValueError):
-                    page_gen = None
-            if page_gen is not None:
-                current_gen = getattr(self, '_editor_page_gen', 0)
-                if page_gen < current_gen:
+            if page is not None:
+                page = str(page)[:64]
+                pages = getattr(self, '_editor_pages', None)
+                if pages is None:
+                    pages = self._editor_pages = {}
+                prev = pages.get(page)
+                if seq is not None and prev is not None and seq <= prev[0]:
                     return False
-                if page_gen > current_gen:
-                    self._editor_page_gen = page_gen
-                    self._editor_dirty_seq = 0
+                pages.pop(page, None)          # re-insert as most recent
+                pages[page] = (seq if seq is not None else 0, bool(dirty))
+                while len(pages) > 8:          # bounded; reloads are rare
+                    pages.pop(next(iter(pages)))
+                return True
             if seq is not None:
                 if seq <= getattr(self, '_editor_dirty_seq', 0):
                     return False
@@ -1640,8 +1637,15 @@ class BridgeApi:
         """Recording in progress, the macro buffer is dirty (unsaved
         changes), or the events editor holds unsaved edits — the same
         rule the page's in-app close confirm uses."""
-        return (self._macro_buffer_unsaved()
-                or bool(getattr(self, '_editor_dirty', False)))
+        return self._macro_buffer_unsaved() or self._editor_has_edits()
+
+    def _editor_has_edits(self):
+        """Any events-editor page (or a legacy token-less update) last
+        reported unsaved local edits."""
+        if getattr(self, '_editor_dirty', False):
+            return True
+        pages = getattr(self, '_editor_pages', None) or {}
+        return any(dirty for _seq, dirty in list(pages.values()))
 
     def _macro_buffer_unsaved(self):
         """Recording in progress, or the macro buffer is dirty."""
@@ -1676,7 +1680,7 @@ class BridgeApi:
         elif buffer_unsaved:
             details.append('The current macro has unsaved changes — save '
                            'it to a slot first to keep it.')
-        if getattr(self, '_editor_dirty', False):
+        if self._editor_has_edits():
             details.append('The events editor has edits that were not '
                            'saved — press Save changes in the editor to '
                            'keep them.')
