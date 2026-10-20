@@ -35,7 +35,7 @@ from config import (ALBUM_BEGIN_PERFORMANCE_XY, ALBUM_DIFFICULTY_COORDS,
                     PIXEL_THRESHOLD, Y_SAMPLE_OFFSETS)
 from detector import NoteDetector
 from game_window import scaled_layout
-from screen_watcher import REFUSED_NOT_IN_FRONT
+from screen_watcher import REFUSED_CURSOR_MOVED, REFUSED_NOT_IN_FRONT
 from standalone_runner import run_visualization
 
 
@@ -93,6 +93,13 @@ MSG_CLICK_FAILED = ("The mouse couldn't reach the {what} button — keep the "
 # mouse-down (alt-tab during the hover) — see ScreenWatcher.target_check_fn.
 MSG_GAME_NOT_IN_FRONT = ("Genshin wasn't in front — keep the game focused "
                          "during Album mode, then press Start.")
+# A click refused because the cursor left the target during the hover (the
+# user moved the mouse) — see ScreenWatcher.cursor_pos_fn.
+MSG_CURSOR_MOVED = ("The mouse was moved during an Album click — leave the "
+                    "mouse alone in Album mode, then press Start.")
+# ScreenWatcher.last_refusal -> the specific `last_error` for it.
+REFUSAL_MESSAGES = {REFUSED_NOT_IN_FRONT: MSG_GAME_NOT_IN_FRONT,
+                    REFUSED_CURSOR_MOVED: MSG_CURSOR_MOVED}
 MSG_NO_RHYTHM = ("Rhythm minigame not detected — open a country album page, "
                  "then press Start.")
 MSG_UNKNOWN_SCREEN = ("Couldn't recognise the game screen after resuming — "
@@ -356,15 +363,16 @@ class SongPlayer:
 
     def _click_failed(self, what, dump_tag):
         """A click the watcher refused to issue (stop, the cursor never
-        reached the target, or another window was in front of the game
-        at the target). Treated like a missed click."""
+        reached the target or was moved off it, or another window was in
+        front of the game at the target). Treated like a missed click."""
         if self.stop_evt.is_set():
             return None
-        if (getattr(self.watcher, 'last_refusal', None)
-                == REFUSED_NOT_IN_FRONT):
-            print(f"  ERROR: {what} click skipped — another window was in "
-                  f"front of the game. Aborting song.")
-            self._fail(MSG_GAME_NOT_IN_FRONT)
+        refusal = REFUSAL_MESSAGES.get(
+            getattr(self.watcher, 'last_refusal', None))
+        if refusal:
+            print(f"  ERROR: {what} click skipped — {refusal} "
+                  f"Aborting song.")
+            self._fail(refusal)
         else:
             print(f"  ERROR: {what} click skipped — the cursor never "
                   f"reached the button. Aborting song.")

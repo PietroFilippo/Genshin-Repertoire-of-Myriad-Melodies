@@ -89,7 +89,10 @@ class Recorder:
 
 
 class FakeInput:
-    """InputBackend stand-in that records every call."""
+    """InputBackend stand-in that records every call. `cursor` (class-wide)
+    is where the last `move_to` left the mouse."""
+
+    cursor = None
 
     def __init__(self, converge=True):
         self.converge = converge
@@ -118,6 +121,7 @@ class FakeInput:
 
     def move_to(self, x, y, stop_evt=None, max_iters=15, tol=2):
         self._rec('move_to', x, y)
+        FakeInput.cursor = (x, y)
         if stop_evt is not None and stop_evt.is_set():
             return False
         return self.converge
@@ -557,6 +561,74 @@ class ScreenWatcherClicks(unittest.TestCase):
         self.assertIsNone(w.last_refusal)
         self.assertEqual([c[0] for c in ctrl.snapshot()].count('mouse_down'),
                          1)
+
+    def _cursor_watcher(self, ctrl, cursor, check=None):
+        return screen_watcher.ScreenWatcher(
+            REGION_1080, 1.0, 1.0, ctrl, self.stop, templates={},
+            target_check_fn=check, cursor_pos_fn=cursor)
+
+    def test_mouse_moved_during_hover_blocks_mouse_down(self):
+        """RG9-drift — the user moves the mouse onto another app during the
+        hover: mouse-down would press THERE, so nothing is pressed."""
+        ctrl = FakeInput()
+        pos = [(100, 100)]
+        checked = []
+        w = self._cursor_watcher(
+            ctrl, lambda: pos[0],
+            lambda x, y: checked.append((x, y)) or True)
+        real_wait = w.stop_wait
+
+        def hover(secs):
+            pos[0] = (600, 50)                       # dragged away
+            return real_wait(secs)
+
+        w.stop_wait = hover
+        with _quiet():
+            self.assertFalse(w.click_local(100, 100))
+        self.assertNotIn('mouse_down', [c[0] for c in ctrl.snapshot()])
+        self.assertEqual(w.last_refusal,
+                         screen_watcher.REFUSED_CURSOR_MOVED)
+        self.assertEqual(checked, [])
+
+    def test_unreadable_cursor_refuses(self):
+        def broken():
+            raise OSError('boom')
+
+        for reader in (lambda: None, broken):
+            ctrl = FakeInput()
+            w = self._cursor_watcher(ctrl, reader, lambda x, y: True)
+            with _quiet():
+                self.assertFalse(w.click_ref(100, 100))
+            self.assertNotIn('mouse_down', [c[0] for c in ctrl.snapshot()])
+            self.assertEqual(w.last_refusal,
+                             screen_watcher.REFUSED_CURSOR_MOVED)
+
+    def test_ownership_checked_where_the_cursor_actually_is(self):
+        """Within the tolerance the click goes ahead — the window check
+        runs at the cursor's real point, not the target."""
+        ctrl = FakeInput()
+        checked = []
+        w = self._cursor_watcher(
+            ctrl, lambda: (103, 98),
+            lambda x, y: checked.append((x, y)) or True)
+        with _quiet():
+            self.assertTrue(w.click_local(100, 100))
+        self.assertEqual(checked, [(103, 98)])
+        self.assertIn('mouse_down', [c[0] for c in ctrl.snapshot()])
+
+    def test_no_drift_check_without_a_cursor_reader(self):
+        ctrl = FakeInput()
+        checked = []
+        w = self._target_watcher(ctrl,
+                                 lambda x, y: checked.append((x, y)) or True)
+        with _quiet():
+            self.assertTrue(w.click_local(100, 100))
+        self.assertEqual(checked, [(100, 100)])
+
+    def test_read_cursor_pos_on_real_win32(self):
+        pos = screen_watcher.read_cursor_pos()
+        self.assertEqual(len(pos), 2)
+        self.assertTrue(all(isinstance(v, int) for v in pos))
 
     def test_geometry_change_during_cursor_travel_aborts_click(self):
         """RR1 — resized while move_to was in flight."""
@@ -1082,7 +1154,8 @@ class StandaloneRunner(unittest.TestCase):
             self.addCleanup(p.stop)
         # The run binds to GAME_HWND (owned by GAME_PID); `_run_real_viz`
         # swaps in its own fake.
-        stack = win32(FakeUser32(windows={GAME_HWND: (1920, 1080)}))
+        self.fake = FakeUser32(windows={GAME_HWND: (1920, 1080)})
+        stack = win32(self.fake)
         stack.__enter__()
         self.addCleanup(stack.__exit__, None, None, None)
 
@@ -1318,6 +1391,25 @@ class StandaloneRunner(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.25)
         self.assertEqual(self.rec.values('last_error'), [])
         self.assertEqual(len(FakeDetector.instances), 1)
+
+    def test_half_started_detector_is_stopped(self):
+        """RG10 — detector.start() fails part-way: the half-started
+        detector is still stopped (threads joined, keys released), the
+        process handle released, the run reported idle."""
+        class FailsToStart(FakeDetector):
+            def start(self):
+                super().start()
+                raise RuntimeError("can't start new thread")
+
+        with mock.patch.object(standalone_runner, 'NoteDetector',
+                               FailsToStart), _quiet():
+            with self.assertRaises(RuntimeError):
+                standalone_runner.run_standalone(
+                    self.stop, self.debug, status_cb=self.rec,
+                    pause_evt=self.pause, controller=FakeInput())
+        self.assertTrue(FakeDetector.instances[0].stopped)
+        self.assertEqual(self.rec.values('state')[-1], 'idle')
+        self.assertEqual(self.fake.closed, self.fake.opened)
 
     def test_unreadable_window_owner_refuses_to_start(self):
         """RG7 — no established PID: last_error, no detector, and no
@@ -1700,7 +1792,15 @@ class AlbumRunnerBase(unittest.TestCase):
         stack = win32(self.fake)
         stack.__enter__()
         self.addCleanup(stack.__exit__, None, None, None)
+        # The runner's real-cursor reader: where FakeInput's move_to left
+        # it, unless a test moves the mouse itself (`self.cursor`).
+        FakeInput.cursor = None
+        self.cursor = None
         patches = [
+            mock.patch.object(album, 'read_cursor_pos',
+                              side_effect=lambda: self.cursor
+                              if self.cursor is not None
+                              else FakeInput.cursor),
             mock.patch.object(album, 'find_game_window',
                               return_value=GAME_HWND),
             mock.patch.object(album.AlbumRunner, '_load_tpl',
@@ -2357,6 +2457,37 @@ class AlbumWindowChanged(AlbumWindowFixture):
                          [c[0] for c in r.controller.snapshot()])
         self.assertEqual(self.rec.values('last_error'),
                          [song_player.MSG_GAME_NOT_IN_FRONT])
+
+    def test_runner_wires_the_cursor_reader(self):
+        """Production wiring: the album watcher re-reads the real cursor
+        (album.read_cursor_pos) and checks ownership there."""
+        r = self.runner()
+        self.assertIs(r.watcher._cursor_pos_fn, album.read_cursor_pos)
+        self.assertIsNotNone(r.watcher._target_check_fn)
+
+    def test_intro_click_with_mouse_moved_away(self):
+        """RG9-drift — the user moved the mouse off Go Perform during the
+        hover: no mouse-down, MSG_CURSOR_MOVED."""
+        self._no_click_delays()
+        r = self.runner()
+        self.cursor = (5, 5)
+        with _quiet():
+            self.assertFalse(r.song_player.play('legendary'))
+        self.assertNotIn('mouse_down',
+                         [c[0] for c in r.controller.snapshot()])
+        self.assertEqual(self.rec.values('last_error'),
+                         [song_player.MSG_CURSOR_MOVED])
+
+    def test_next_song_with_mouse_moved_away(self):
+        self._no_click_delays()
+        r = self.runner()
+        self.cursor = (5, 5)
+        with _quiet():
+            self.assertFalse(r._next_song())
+        self.assertNotIn('mouse_down',
+                         [c[0] for c in r.controller.snapshot()])
+        self.assertEqual(self.rec.values('last_error'),
+                         [song_player.MSG_CURSOR_MOVED])
 
     def test_end_watcher_click_with_another_app_in_front_retries_later(self):
         """RG9 — the end watcher just doesn't click (retries next poll);

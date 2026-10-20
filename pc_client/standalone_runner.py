@@ -794,10 +794,12 @@ def run_standalone(stop_evt, debug_evt, status_cb=None, pause_evt=None,
             print(f"Starting per-key detection threads "
                   f"(poll {KEY_POLL_DELAY_S*1000:.0f}ms, "
                   f"strip {Y_SAMPLE_OFFSETS})")
-            detector.start()
 
             reason = VIZ_EXIT_STOP
             try:
+                # Inside the try: a detector that fails half-started is
+                # still stopped (its started threads joined, keys released).
+                detector.start()
                 # Viz loop self-gates on debug_evt and idles cheap when off.
                 reason = run_visualization(
                     capture_region, column_centers, hit_line_y,

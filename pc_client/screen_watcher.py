@@ -57,6 +57,24 @@ CLICK_SETTLE_S = 0.15
 # `last_refusal` reasons (why the last click on this thread wasn't issued),
 # for callers that report something more specific than "missed click".
 REFUSED_NOT_IN_FRONT = 'not_in_front'
+# The cursor wasn't on the target any more right before mouse-down (the
+# user moved the mouse during the hover) — the press would land elsewhere.
+REFUSED_CURSOR_MOVED = 'cursor_moved'
+
+# How far (px) the cursor may sit from the target when the button goes
+# down. Above the Arduino `move_to` convergence tolerance (2 px).
+CURSOR_TOLERANCE_PX = 4
+
+
+def read_cursor_pos():
+    """The real cursor position (screen px) via GetCursorPos, or None."""
+    pt = ctypes.wintypes.POINT()
+    try:
+        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            return None
+    except Exception:
+        return None
+    return pt.x, pt.y
 
 
 # Default match threshold when caller doesn't pass one at construction.
@@ -69,7 +87,7 @@ class ScreenWatcher:
     def __init__(self, region, scale_x, scale_y, controller, stop_evt,
                  templates, match_threshold=DEFAULT_MATCH_THRESHOLD,
                  live_geometry_fn=None, window_gone_fn=None,
-                 target_check_fn=None):
+                 target_check_fn=None, cursor_pos_fn=None):
         """
         Args:
             region: dict with keys top/left/width/height — the mss
@@ -107,6 +125,14 @@ class ScreenWatcher:
                 belongs to the game's process). Checked LAST, right
                 before mouse-down — an app alt-tabbed over the target
                 during the hover never gets the click. None = no check.
+            cursor_pos_fn: optional `callable() -> (x, y) | None` reading
+                the cursor (e.g. `read_cursor_pos`). Right before
+                mouse-down the press point is where the cursor IS: if it
+                can't be read or drifted more than CURSOR_TOLERANCE_PX
+                from the target (the user moved the mouse during the
+                hover), the click is refused; otherwise `target_check_fn`
+                runs at that actual point. None = no drift check (the
+                target point is checked).
         """
         if stop_evt is None:
             raise ValueError("ScreenWatcher requires a stop_evt — "
@@ -121,6 +147,7 @@ class ScreenWatcher:
         self._live_geometry_fn = live_geometry_fn
         self._window_gone_fn = window_gone_fn
         self._target_check_fn = target_check_fn
+        self._cursor_pos_fn = cursor_pos_fn
         # Per-thread `last_refusal` (the end watcher clicks on its own).
         self._click_state = threading.local()
         self.controller = controller
@@ -265,7 +292,13 @@ class ScreenWatcher:
             return False
         if not self._live_target_ok(sx, sy):
             return False
-        if not self._target_in_game(sx, sy):
+        # The press lands where the cursor IS — the user may have moved it
+        # during the hover — so check that point, not the target.
+        point = self._press_point(sx, sy)
+        if point is None:
+            self._click_state.refusal = REFUSED_CURSOR_MOVED
+            return False
+        if not self._target_in_game(*point):
             self._click_state.refusal = REFUSED_NOT_IN_FRONT
             return False
         self.controller.mouse_down('left')
@@ -307,6 +340,29 @@ class ScreenWatcher:
               f"({int(sx)},{int(sy)}) was for the old window")
         return False
 
+    def _press_point(self, sx, sy):
+        """Where mouse-down would press: the cursor, if it is still within
+        CURSOR_TOLERANCE_PX of (sx, sy) — else None (refuse). Without a
+        `cursor_pos_fn`, the target itself."""
+        fn = self._cursor_pos_fn
+        if fn is None:
+            return int(sx), int(sy)
+        try:
+            pos = fn()
+        except Exception as e:
+            print(f"    [watcher] cursor read failed: {e}")
+            pos = None
+        if pos is None:
+            print("    click SKIPPED — couldn't read the cursor position")
+            return None
+        px, py = int(pos[0]), int(pos[1])
+        if (abs(px - int(sx)) > CURSOR_TOLERANCE_PX
+                or abs(py - int(sy)) > CURSOR_TOLERANCE_PX):
+            print(f"    click SKIPPED — the cursor moved to ({px},{py}), "
+                  f"off the target ({int(sx)},{int(sy)})")
+            return None
+        return px, py
+
     def _target_in_game(self, sx, sy):
         """`target_check_fn` at the click point; a failing check refuses
         the click (never press into a window we can't vouch for)."""
@@ -326,7 +382,7 @@ class ScreenWatcher:
     @property
     def last_refusal(self):
         """Why the last click on THIS thread wasn't issued, when known
-        (REFUSED_NOT_IN_FRONT), else None."""
+        (REFUSED_NOT_IN_FRONT / REFUSED_CURSOR_MOVED), else None."""
         return getattr(self._click_state, 'refusal', None)
 
     def click_ref(self, ref_x, ref_y):
