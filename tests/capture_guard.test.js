@@ -1,6 +1,7 @@
 // Node-run regression test for the hotkey-capture guard in
-// pc_client/web/app.js (HK1 / HK2). Loads the real app.js into a vm with a
-// minimal fake DOM + fake pywebview bridge, then drives the capture flow.
+// pc_client/web/app.js (HK1 / HK2), plus the titlebar close confirmation and
+// the input-backend fallback. Loads the real app.js into a vm with a
+// minimal fake DOM + fake pywebview bridge, then drives the flows.
 //
 // Run:  node tests/capture_guard.test.js      (exit code 0 = pass)
 // Also run by tests/test_ux_hotkeys.py when node is on PATH.
@@ -78,11 +79,13 @@ function deferred() {
     return { promise, resolve, reject };
 }
 
-function makeEnv() {
+function makeEnv(preset) {
     const byId = {};
     const calls = [];            // [name, args]
     const pending = {};          // name -> [deferred, ...] (FIFO)
-    const autoReply = {};        // name -> value for calls nobody awaits
+    // name -> value for calls nobody awaits. `preset` seeds it before
+    // app.js loads (its init() calls get_initial_state at load time).
+    const autoReply = Object.assign({}, preset || {});
     const windowListeners = {};
 
     const document = {
@@ -331,6 +334,86 @@ test('U1: left click cancels capture and never binds', async () => {
     await flush();
     assert.strictEqual(env.callsOf('rebind').length, 0);
     assert.strictEqual(env.callsOf('capture_end').length, 1);
+});
+
+// --- titlebar close (v1.6.1) ---------------------------------------------------
+// close(true) tells Python the user already agreed in-app, which skips the
+// native allow_close() guard. Only an in-app dialog the user accepted may
+// send it; otherwise the page's possibly stale status would bypass the
+// authoritative check.
+
+function setStatus(env, status) {
+    env.sandbox.__testStatus = status;
+    vm.runInContext('STATE.lastStatus = __testStatus;', env.sandbox);
+}
+
+function closeClick(env) {
+    const handlers = env.el('#btn-close').__listeners.click || [];
+    assert.strictEqual(handlers.length, 1, 'one close handler');
+    return handlers[0]();
+}
+
+test('close: nothing unsaved -> plain close() so Python makes the check', async () => {
+    const env = makeEnv();
+    await flush();
+    setStatus(env, { macro_state: 'idle', macro_dirty: false, macro_events: 0 });
+    await closeClick(env);
+    await flush();
+    const closes = env.callsOf('close');
+    assert.strictEqual(closes.length, 1, 'close called once');
+    assert.deepStrictEqual(Array.from(closes[0][1]), [],
+        'close must not claim the user confirmed');
+    assert.notStrictEqual(env.sandbox.__closeConfirmed, true);
+    assert.strictEqual(vm.runInContext('DIALOG.open', env.sandbox), false,
+        'no in-app dialog when nothing is unsaved');
+});
+
+test('close: unsaved work -> close(true) only after the in-app Yes', async () => {
+    const env = makeEnv();
+    await flush();
+    setStatus(env, { macro_state: 'idle', macro_dirty: true, macro_events: 3 });
+    const done = closeClick(env);
+    await flush();
+    assert.strictEqual(env.callsOf('close').length, 0, 'closed before the answer');
+    assert.strictEqual(vm.runInContext('DIALOG.open', env.sandbox), true);
+    vm.runInContext('DIALOG.done(true)', env.sandbox);
+    await done;
+    await flush();
+    const closes = env.callsOf('close');
+    assert.strictEqual(closes.length, 1);
+    assert.deepStrictEqual(Array.from(closes[0][1]), [true]);
+});
+
+test('close: unsaved work, in-app Cancel -> no close at all', async () => {
+    const env = makeEnv();
+    await flush();
+    setStatus(env, { macro_state: 'recording', macro_events: 2 });
+    const done = closeClick(env);
+    await flush();
+    vm.runInContext('DIALOG.done(false)', env.sandbox);
+    await done;
+    await flush();
+    assert.strictEqual(env.callsOf('close').length, 0);
+    assert.notStrictEqual(env.sandbox.__closeConfirmed, true);
+});
+
+// --- input backend fallback (v1.6.1) -------------------------------------------
+// config.INPUT_BACKEND_DEFAULT is 'software'; the page must not assume Arduino
+// before (or without) an input_backend in the status.
+
+test('backend fallback is software when no status names one', async () => {
+    const env = makeEnv();
+    await flush();
+    assert.strictEqual(env.sandbox.currentBackend(), 'software');
+});
+
+test('initial state without input_backend seeds software', async () => {
+    const env = makeEnv({ get_initial_state: { macro: {} } });
+    await flush();
+    await flush();
+    assert.strictEqual(
+        vm.runInContext('(STATE.lastStatus || {}).input_backend', env.sandbox),
+        'software');
 });
 
 (async () => {

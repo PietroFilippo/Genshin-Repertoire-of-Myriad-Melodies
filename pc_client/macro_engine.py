@@ -6,7 +6,8 @@ The engine owns:
 - The event buffer and its `{time, device, key, event_type}` shape.
 - The auto-repeat suppression rule (drop consecutive `down` events
   for the same keyboard key).
-- The `double → down` event-type normalization.
+- The `double → down` event-type normalization (at record time; an
+  editor-entered `double` row, keyboard or mouse, plays as a `down`).
 - Playback routing: an Arduino backend with `play_timed_macro` may
   preload and schedule the whole event list on-device; every other
   backend keeps the host scheduler below. Both paths are cancellable
@@ -301,7 +302,8 @@ class MacroEngine:
         for prior in reversed(self._events):
             if prior['device'] != 'keyboard' or prior['key'] != name:
                 continue
-            return prior['event_type'] == 'down'
+            # A `double` row is a press too (playback treats it as `down`).
+            return prior['event_type'] in ('down', 'double')
         return False
 
     # ---- bulk editing (UI event-editor path) ----
@@ -428,8 +430,11 @@ class MacroEngine:
                 device = ev.get('device', 'keyboard')
                 etype = ev.get('event_type')
                 key = ev.get('key', '')
+                # `double` (editor-entered; recording already stores it as
+                # `down`) replays as a plain press for both devices -- the
+                # backends have no double-click primitive.
                 if device == 'keyboard':
-                    if etype == 'down':
+                    if etype in ('down', 'double'):
                         controller.key_down(key)
                         held_keys.add(key)
                     elif etype == 'up':

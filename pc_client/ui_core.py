@@ -427,13 +427,14 @@ def _accepts_kwarg(fn, name):
 
 
 def make_input_backend(name, cancel_evt=None):
-    """Factory: build the chosen input backend. 'arduino' (default)
-    uses real USB HID via the Leonardo; 'software' uses Win32
-    SendInput / mouse_event — no hardware, but no combat anti-cheat
-    bypass either (see `software_input.py` header). Imports are
-    inside the function so a missing pyserial / missing keyboard /
-    missing mouse package only breaks the backend that needs it,
-    not the whole UI.
+    """Factory: build the chosen input backend. 'arduino' uses real USB
+    HID via the Leonardo; 'software' uses synthetic Win32 input
+    (keybd_event / mouse_event / SetCursorPos) — no hardware, but no
+    combat anti-cheat bypass either (see `software_input.py` header).
+    An unknown or empty name means config.INPUT_BACKEND_DEFAULT
+    ('software' as shipped). Imports are inside the function so a
+    missing pyserial / missing keyboard / missing mouse package only
+    breaks the backend that needs it, not the whole UI.
 
     `cancel_evt` is forwarded to the Arduino constructor so a Stop
     during its ~2 s post-open settle aborts the build (it raises
@@ -678,18 +679,23 @@ def is_allowed_foreground(ui_hwnd):
 
 # Genshin's HWND, refreshed off the hot path.
 #
-# WHY THIS CACHE EXISTS: is_allowed_game_only() runs on the WH_MOUSE_LL /
-# WH_KEYBOARD_LL callback for every hotkey press. It used to call
-# _window_title(fg), and GetWindowTextW against a window owned by ANOTHER
-# process sends WM_GETTEXT and blocks until that process's message loop
-# replies. Doing that inside a low-level hook means a stuttering game can
-# overrun LowLevelHooksTimeout, at which point Windows silently and
-# permanently unhooks us: every later press vanishes with no error. That
-# was the "hotkey stops working until I wait a bit" bug.
-#
-# FindWindowW does not message the target, so it is safe to call from the
-# refresher thread; the hook callback then only does GetForegroundWindow
-# and an integer compare, neither of which can block.
+# WHY THIS CACHE EXISTS: is_allowed_game_only() runs for every hotkey
+# press and every recorded input event, on the keyboard / mouse packages'
+# event-processing threads (the handlers registered with keyboard.hook /
+# mouse.hook run there, fed by the WH_KEYBOARD_LL / WH_MOUSE_LL callbacks
+# through a FIFO queue) -- and, for the slot picker's SUPPRESSING hook,
+# inside the WH_KEYBOARD_LL callback itself. Those threads process events
+# one at a time, so anything slow there delays every later hotkey and
+# recording event queued behind it; inside the LL callback it can also
+# overrun LowLevelHooksTimeout. Title / process lookups don't belong on
+# that path: process-name matching costs an OpenProcess +
+# QueryFullProcessImageNameW + CloseHandle round of kernel calls per
+# event, and GetWindowTextW is only a cheap caption read for another
+# process's window -- for a window of THIS process it sends WM_GETTEXT and
+# waits on that window's thread. FindWindowW / the PID lookup therefore
+# run on the 1 s refresher thread; the gate itself only does
+# GetForegroundWindow, GetWindowThreadProcessId and integer compares,
+# none of which sends a window message.
 _game_hwnd_lock = threading.Lock()
 _game_hwnd = 0
 # PID owning _game_hwnd (0 = unknown), refreshed with it.
@@ -755,10 +761,11 @@ def is_allowed_game_only():
     hotkeys + macro recording capture: the macro tool should not arm or
     record while the user is in another app.
 
-    HOT PATH — runs inside a low-level hook callback. Only
-    GetForegroundWindow, GetWindowThreadProcessId and integer compares;
-    nothing here may send a window message or open a process handle (see
-    the note above)."""
+    HOT PATH — runs on the input packages' event threads for every
+    hotkey press / recorded event, and inside the WH_KEYBOARD_LL callback
+    for the slot picker's suppressing hook. Only GetForegroundWindow,
+    GetWindowThreadProcessId and integer compares; nothing here may send
+    a window message or open a process handle (see the note above)."""
     fg = _foreground_hwnd()
     if not fg:
         return False
@@ -1521,14 +1528,14 @@ class KeybindManager:
         # passed by the keyboard matcher and the mouse handler. None means
         # "now" (direct calls).
         def wrapper(event_time=None, *_args, **_kwargs):
-            # NOTHING slow may happen here. This runs on the WH_MOUSE_LL /
-            # WH_KEYBOARD_LL callback, and Windows permanently unhooks a
-            # low-level hook whose callback exceeds LowLevelHooksTimeout.
-            # Once that happens every later press vanishes with no trace --
-            # exactly the "spamming does nothing" failure. In particular NO
-            # print() here: print goes through QueueWriter, which mirrors to
-            # the original stdout, and in a --windowed build that is not a
-            # real console.
+            # NOTHING slow may happen here. This runs on the keyboard /
+            # mouse package's event-processing thread (not inside the LL
+            # hook callback itself), which handles events one at a time:
+            # any stall delays every later hotkey press and recording event
+            # queued behind it -- the "spamming does nothing, wait a moment
+            # and it works" failure. In particular NO print() here: print
+            # goes through QueueWriter, which mirrors to the original
+            # stdout, and in a --windowed build that is not a real console.
             self._last_hook_event = time.monotonic()
             if self._last_hook_event < self._suspended_until:
                 # Capture prompt open: dropped, not queued (see suspend).
@@ -1810,9 +1817,9 @@ class BotController:
         # backend build (Arduino's ~2 s settle) is honored. When a
         # provider is configured, a None return / exception is a hard,
         # user-visible failure — the runners are never allowed to fall
-        # back to building their own ArduinoHIDController (that path
-        # sys.exit()s on a missing board and would race the macro tool
-        # for the COM port). Without a provider (CLI-style use) the
+        # back to building their own ArduinoHIDController (that fallback
+        # ignores the selected Input backend and would race the macro
+        # tool for the COM port). Without a provider (CLI-style use) the
         # runners still build their own.
         self._controller_provider = controller_provider
         self._stop_evt = threading.Event()
@@ -2167,10 +2174,11 @@ class BotController:
             if not self._stop_evt.is_set():
                 self._report_error(str(e) or self.ALBUM_FAILED_MESSAGE)
         except SystemExit as e:
-            # Legacy paths (pre-ArduinoConnectionError controller, the
-            # album runner's window check) still sys.exit() deep inside
-            # constructors. In a worker thread that silently ends the
-            # thread and the UI just flips to idle; make it visible.
+            # Defensive: the bundled runners and backends no longer
+            # sys.exit() (ArduinoConnectionError / AlbumSetupError replaced
+            # it), but an older or third-party adapter might. In a worker
+            # thread that silently ends the thread and the UI just flips
+            # to idle; make it visible.
             # Deliberately SystemExit only, not BaseException:
             # KeyboardInterrupt is only ever raised in the main thread,
             # so there is nothing else here worth swallowing.
@@ -2351,8 +2359,6 @@ class MacroController:
         # hotkey fires. Only one pending action at a time; re-arming
         # cancels the prior one.
         self._pending_action = None
-        self._slot_hotkey_handles = []
-        self._slot_timer = None
         self._pending_slot_bank = 0
         self._pending_lock = threading.Lock()
         # Set to cancel the current picker's watcher thread (timeout +
@@ -3531,8 +3537,10 @@ class MacroController:
     # A suppressing hook runs INSIDE the WH_KEYBOARD_LL callback and its
     # return value is the verdict (truthy = let the key through, falsy =
     # swallow), so `_picker_key_hook` must stay hook-safe —
-    # is_allowed_game_only is just GetForegroundWindow + an int compare —
-    # and offload everything else to threads.
+    # is_allowed_game_only is just GetForegroundWindow +
+    # GetWindowThreadProcessId + int compares, none of which sends a
+    # window message — and offload everything else to threads. A slow
+    # callback here overruns LowLevelHooksTimeout.
     #
     # Keys only count while Genshin is the foreground window: a digit
     # typed after alt-tabbing into chat used to be swallowed AND
@@ -3578,15 +3586,6 @@ class MacroController:
         return True
 
     def _clear_pending_locked(self):
-        for h in self._slot_hotkey_handles:
-            try:
-                keyboard.remove_hotkey(h)
-            except Exception:
-                pass
-        self._slot_hotkey_handles.clear()
-        if self._slot_timer is not None:
-            self._slot_timer.cancel()
-            self._slot_timer = None
         if self._pending_cancel_evt is not None:
             self._pending_cancel_evt.set()
             self._pending_cancel_evt = None
@@ -3786,15 +3785,6 @@ class MacroController:
             print(f"[macro] {action} cancelled")
         self._emit()
 
-    def _slot_timeout_async(self):
-        with self._pending_lock:
-            action = self._pending_action
-            if action is None:
-                return
-            self._clear_pending_locked()
-        print(f"[macro] {action} timed out")
-        self._emit()
-
     # ---- shutdown ----
 
     def shutdown(self):
@@ -3833,7 +3823,7 @@ class MacroController:
     _SLOT_CMD_WAIT_S = 2.5
 
     _NO_BACKEND_MSG = ('Input backend unavailable - check the Arduino '
-                       'connection or switch to Software on the Main tab.')
+                       'connection or switch Input to Software at the top of the window.')
 
     @contextlib.contextmanager
     def _command(self, what, timeout=None):

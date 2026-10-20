@@ -230,12 +230,18 @@ $('#btn-close').addEventListener('click', async () => {
     // Python's allow_close() (`recording or dirty`), otherwise a case the
     // page skips is asked again natively after close().
     const loss = macroUnsavedSummary(true);
-    if (loss) {
-        const ok = await dlgConfirm('Close Genshin Rhythm Bot?',
-            `You have ${loss} that will be lost.`,
-            { ok: 'Discard and close', danger: true, focusCancel: true });
-        if (!ok) return;
+    if (!loss) {
+        // Nothing unsaved as far as this page's (possibly stale) status
+        // knows. Didn't ask, so don't claim the user agreed: the plain
+        // close() lets Python's allow_close() make the authoritative
+        // check and ask natively if something unsaved turned up.
+        callApi('close').catch(() => {});
+        return;
     }
+    const ok = await dlgConfirm('Close Genshin Rhythm Bot?',
+        `You have ${loss} that will be lost.`,
+        { ok: 'Discard and close', danger: true, focusCancel: true });
+    if (!ok) return;
     // The user already answered here; Python's `closing` handler must
     // not ask again. Mark it on the window (readable via evaluate_js)
     // and pass it as an argument; fall back to the no-argument close()
@@ -314,7 +320,7 @@ const _BACKEND_LABEL = { software: 'Software', arduino: 'Arduino HID' };
 function currentBackend() {
     return (STATE.lastStatus || {}).input_backend
         || $('#input-backend').value
-        || 'arduino';
+        || 'software';
 }
 
 $('#input-backend').addEventListener('change', async () => {
@@ -3121,7 +3127,7 @@ function init() {
             macro_error: macroSnap.macro_error || '',
             macro_active_macros: s.macro_active_macros || [],
             macro_conflict_policy: s.macro_conflict_policy || 'ignore',
-            input_backend: s.input_backend || 'arduino',
+            input_backend: s.input_backend || 'software',
         });
     });
 }

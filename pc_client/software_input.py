@@ -3,16 +3,18 @@
 Software-only input backend. Drop-in replacement for
 `ArduinoHIDController` for users who don't want to wire up an
 Arduino Leonardo. Uses the `keyboard` and `mouse` packages, which
-wrap Win32 `SendInput` (keyboard) and `mouse_event` (mouse) under
-the hood — same APIs BetterGenshinImpact uses for its own rhythm
-auto-player (`Simulation.SendInput.Keyboard.KeyDown`).
+on Windows call Win32 `keybd_event` (keys), `mouse_event` (mouse
+buttons) and `SetCursorPos` (cursor moves, absolute and relative)
+under the hood — the same kind of synthetic input BetterGenshinImpact
+uses for its own rhythm auto-player
+(`Simulation.SendInput.Keyboard.KeyDown`).
 
 What works in software mode
 ---------------------------
 - Rhythm minigame keys (`a s d j k l`). The minigame is not under
   Genshin's combat anti-cheat hook so synthetic keystrokes go
   through fine. Verified against BGI's `AutoMusicGameTask`.
-- Album-mode menu navigation. `mouse_event` absolute moves +
+- Album-mode menu navigation. `SetCursorPos` moves + `mouse_event`
   left-button down/up land clicks on every UI button the album
   runner needs.
 - Macro replay of keys + mouse buttons (the macro recorder doesn't
@@ -86,7 +88,8 @@ class SoftwareInputController:
         # first hook install elsewhere in the UI (KeybindManager,
         # MacroController) — nothing for us to spin up here.
         self._warm_keyboard_tables()
-        print("[input] software backend ready (Win32 SendInput / mouse_event)")
+        print("[input] software backend ready "
+              "(Win32 keybd_event / mouse_event / SetCursorPos)")
 
     @staticmethod
     def _warm_keyboard_tables():
@@ -165,17 +168,21 @@ class SoftwareInputController:
     def mouse_move(self, dx, dy):
         """Relative cursor delta in screen pixels. Provided for API
         parity with the Arduino backend; album-mode prefers
-        `move_to` for absolute positioning."""
+        `move_to` for absolute positioning. `mouse.move(...,
+        absolute=False)` reads the cursor position and `SetCursorPos`es
+        to position + delta — a cursor jump, not a relative mouse
+        event (camera rotation needs the Arduino; see the header)."""
         try:
             mouse.move(int(dx), int(dy), absolute=False)
         except Exception as e:
             print(f"[sw-input] mouse_move ({dx},{dy}) failed: {e}")
 
     def move_to(self, x, y, stop_evt=None, max_iters=None, tol=None):
-        """Absolute move to (x, y). One shot — `mouse_event` with
-        `MOUSEEVENTF_ABSOLUTE` jumps directly to the target pixel
-        regardless of EPP / pointer-precision settings, so we don't
-        need the iterative convergence the Arduino backend does.
+        """Absolute move to (x, y). One shot — `mouse.move(...,
+        absolute=True)` is a single `SetCursorPos`, which jumps directly
+        to the target pixel regardless of EPP / pointer-precision
+        settings, so we don't need the iterative convergence the Arduino
+        backend does.
         `max_iters` / `tol` accepted for signature parity with
         `ArduinoHIDController.move_to` and ignored.
         Returns True on dispatch, False if the caller's stop_evt

@@ -10,14 +10,14 @@ SERIAL_PORT = None
 BAUD_RATE = 115200
 
 # Default input backend for first-launch / unset settings. 'software' uses
-# SoftwareInputController which synthesizes input via Win32 SendInput /
-# mouse_event — no hardware required, works for rhythm minigame + menu
-# clicks (the only combat path it can't drive is in-combat camera/aim,
-# blocked by anti-cheat). 'arduino' uses ArduinoHIDController (real USB
-# HID via the Leonardo) and is the right pick for users who want combat
-# macros or already have the board wired up. The UI persists this per-user
-# in ui_settings.json — existing users keep whatever they last selected;
-# only fresh installs see this default.
+# SoftwareInputController which synthesizes input via Win32 keybd_event /
+# mouse_event / SetCursorPos — no hardware required, works for rhythm
+# minigame + menu clicks (the only combat path it can't drive is in-combat
+# camera/aim, blocked by anti-cheat). 'arduino' uses ArduinoHIDController
+# (real USB HID via the Leonardo) and is the right pick for users who want
+# combat macros or already have the board wired up. The UI persists this
+# per-user in ui_settings.json — existing users keep whatever they last
+# selected; only fresh installs see this default.
 INPUT_BACKEND_DEFAULT = 'software'
 
 # Gameplay config
@@ -125,10 +125,13 @@ MACRO_HOTKEYS = {
 # === UI hotkeys (ui.py) ===
 # Defaults loaded when no ui_settings.json override is present. Names follow
 # the `keyboard` package convention ('f8', 'ctrl+shift+a', etc.); mouse
-# buttons use the 'mouse:<btn>' prefix where <btn> is one of left / right /
-# middle / x / x2. Bot hotkeys (start_stop / pause / debug) fire when either
-# Genshin or the UI is focused. Macro hotkeys fire only when Genshin is
-# focused — the macro tool also captures input only inside the game.
+# buttons use the 'mouse:<btn>' prefix where <btn> is one of right / middle /
+# x (Mouse 4) / x2 (Mouse 5). 'mouse:left' is never bindable (it is every
+# attack and album click): validate_hotkey refuses it, and a saved one is
+# reset to the default (or left unbound) on load. Bot hotkeys (start_stop /
+# pause / debug) fire when either Genshin or the UI is focused. Macro hotkeys
+# fire only when Genshin is focused — the macro tool also captures input only
+# inside the game.
 UI_KEYBINDS_DEFAULT = {
     'start_stop': 'f8',   # toggle bot run / stop
     'pause':      'f9',   # pause / resume (releases keys, halts album clicker)

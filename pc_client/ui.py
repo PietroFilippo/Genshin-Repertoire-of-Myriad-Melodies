@@ -125,7 +125,7 @@ def _release_ll_hooks():
 
 import ui_core
 from config import (ALBUM_DIFFICULTY, ALBUM_DIFFICULTY_COORDS,
-                    ALBUM_SONG_COUNT)
+                    ALBUM_SONG_COUNT, INPUT_BACKEND_DEFAULT)
 from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
                      ACTION_MACRO_RECORD, ACTION_MACRO_SAVE,
                      ACTION_MACRO_STOP, ACTION_PAUSE, ACTION_START_STOP,
@@ -133,7 +133,7 @@ from ui_core import (ACTION_DEBUG, ACTION_MACRO_LOAD, ACTION_MACRO_PLAY,
                      KeybindManager, MACRO_ACTIONS, MACRO_CONFLICT_IGNORE,
                      MACRO_CONFLICT_INTERRUPT, MACRO_SLOT_COUNT,
                      MacroController, QueueWriter,
-                     APP_VERSION, UI_WINDOW_TITLE, focus_game_window, is_admin,
+                     APP_VERSION, UI_WINDOW_TITLE, is_admin,
                      is_frozen, js_event_to_hotkey, load_settings,
                      macros_dir, make_input_backend, save_settings,
                      warn_if_not_admin)
@@ -608,7 +608,8 @@ class BridgeApi:
             ],
             'macro_conflict_policy': self._settings.get(
                 'macro_conflict_policy', MACRO_CONFLICT_IGNORE),
-            'input_backend': self._settings.get('input_backend', 'arduino'),
+            'input_backend': self._settings.get(
+                'input_backend', INPUT_BACKEND_DEFAULT),
         }
 
         self._log_queue = queue.Queue(maxsize=LOG_QUEUE_SIZE)
@@ -803,7 +804,8 @@ class BridgeApi:
                 ],
                 'macro_conflict_policy': self._settings.get(
                     'macro_conflict_policy', MACRO_CONFLICT_IGNORE),
-                'input_backend': self._settings.get('input_backend', 'arduino'),
+                'input_backend': self._settings.get(
+                    'input_backend', INPUT_BACKEND_DEFAULT),
             }
 
     def dismiss_prereq_tip(self):
@@ -1087,9 +1089,10 @@ class BridgeApi:
 
     def macro_toggle_record(self, force=False):
         """Start or stop recording. If the bot is running, refuse unless
-        `force` is set — JS prompts the user with window.confirm and
-        re-calls with force=True. Check + (forced bot stop) + start run
-        under _engine_lock so a bot Start can't slip in between."""
+        `force` is set — JS asks the user in an in-app dialog
+        (dlgConfirm) and re-calls with force=True. Check + (forced bot
+        stop) + start run under _engine_lock so a bot Start can't slip in
+        between."""
         if self._macro.state() == MacroController.STATE_RECORDING:
             # Stopping takes over nothing — no engine hand-off needed.
             return dict(self._macro.stop_record())
@@ -1150,11 +1153,13 @@ class BridgeApi:
 
     def set_input_backend(self, name, force=False):
         """Switch the active input backend. 'arduino' (real USB HID via
-        the Leonardo) or 'software' (Win32 SendInput / mouse_event, no
-        hardware). Refuses while bot or macro is busy unless `force` is
-        set — JS prompts the user on conflict and re-calls with
-        force=True. Closes the current backend so its COM port / hooks
-        come down before the next caller lazy-builds the new one."""
+        the Leonardo) or 'software' (synthetic Win32 input: keybd_event /
+        mouse_event / SetCursorPos, no hardware). An unset setting means
+        config.INPUT_BACKEND_DEFAULT. Refuses while bot or macro is busy
+        unless `force` is set — JS prompts the user on conflict and
+        re-calls with force=True. Closes the current backend so its COM
+        port / hooks come down before the next caller lazy-builds the new
+        one."""
         name = (name or '').lower()
         if name not in ('arduino', 'software'):
             return {'ok': False, 'reason': 'bad_backend'}
@@ -1167,7 +1172,8 @@ class BridgeApi:
             if self._tearing_down:
                 return {'ok': False, 'reason': 'closing'}
             with self._lock:
-                current = self._settings.get('input_backend', 'arduino')
+                current = self._settings.get('input_backend',
+                                             INPUT_BACKEND_DEFAULT)
             if name == current:
                 return {'ok': True, 'reason': 'unchanged'}
             if self._bot.is_running() or self._macro.is_busy():
@@ -2070,14 +2076,14 @@ class BridgeApi:
         return kb_names, mouse_btns
 
     def _get_arduino(self, cancel_evt=None):
-        """Lazy-build the chosen input backend (Arduino HID or
-        software SendInput, per `_settings['input_backend']`). Returns
-        the controller or None on init failure (the user-facing reason is
-        left in `self._backend_error`). The Arduino backend raises
-        `ArduinoConnectionError` (older builds: `sys.exit`, so SystemExit
-        is still trapped) — UI keeps running so the user can fix wiring
-        or switch to the software backend. Failures don't latch: the next
-        caller retries from scratch.
+        """Lazy-build the chosen input backend (Arduino HID or software
+        input, per `_settings['input_backend']`; INPUT_BACKEND_DEFAULT
+        when unset). Returns the controller or None on init failure (the
+        user-facing reason is left in `self._backend_error`). The Arduino
+        backend raises `ArduinoConnectionError` (older builds: `sys.exit`,
+        so SystemExit is still trapped) — UI keeps running so the user
+        can fix wiring or switch to the software backend. Failures don't
+        latch: the next caller retries from scratch.
 
         A cached backend that reports `healthy == False` (e.g. the board
         was unplugged mid-session) is closed and rebuilt rather than
@@ -2115,7 +2121,8 @@ class BridgeApi:
                 except Exception as e:
                     print(f'[ui] unhealthy backend close error: {e}')
             with self._lock:
-                backend = self._settings.get('input_backend', 'arduino')
+                backend = self._settings.get('input_backend',
+                                             INPUT_BACKEND_DEFAULT)
             self._backend_error = ''
             try:
                 self._arduino = make_input_backend(backend,
@@ -2131,7 +2138,7 @@ class BridgeApi:
             except SystemExit:
                 self._backend_error = (
                     f'{backend} backend failed to start — check the '
-                    'connection, or switch Input method in the Main tab')
+                    'connection, or switch Input at the top of the window')
                 print(f'[ui] {backend} backend init failed — '
                       'check connection and try again, or switch to '
                       'the other backend in the UI.')
@@ -2194,7 +2201,8 @@ class BridgeApi:
         if healthy:
             return
         with self._lock:
-            backend = self._settings.get('input_backend', 'arduino')
+            backend = self._settings.get('input_backend',
+                                         INPUT_BACKEND_DEFAULT)
         msg = ('Arduino disconnected — press Stop, then Start to reconnect'
                if backend == 'arduino' else
                'Input backend stopped working — press Stop, then Start')

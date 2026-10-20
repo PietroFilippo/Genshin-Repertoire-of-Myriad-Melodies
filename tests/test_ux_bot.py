@@ -14,6 +14,7 @@ Run:  python -m unittest discover -s tests -p "test_*.py"
 """
 import json
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -681,6 +682,46 @@ class BridgeBackendTests(unittest.TestCase):
         self.assertTrue(old.closed)
         self.assertEqual(built, ['software'])
         self.assertEqual(got['c'].kind, 'software')
+
+    def test_unset_backend_setting_means_config_default(self):
+        """v1.6.1: an unset `input_backend` means config's
+        INPUT_BACKEND_DEFAULT ('software'), never a hard-coded
+        'arduino' — for the lazy build, the switch's "unchanged" check,
+        the status payloads and the dead-backend message."""
+        default = ui_core.INPUT_BACKEND_DEFAULT
+        self.assertEqual('software', default)
+        api = self.make_api()
+        del api._settings['input_backend']
+        built = []
+
+        def factory(name, cancel_evt=None):
+            built.append(name)
+            return _FakeCtrl(name)
+        with mock.patch.object(ui, 'make_input_backend', side_effect=factory):
+            api._get_arduino()
+        self.assertEqual([default], built)
+        self.assertEqual({'ok': True, 'reason': 'unchanged'},
+                         api.set_input_backend(default))
+        self.save_settings.assert_not_called()
+
+        reported = []
+        api._bot = _FakeBot(running=True)
+        api._bot.report_error = lambda msg: reported.append(msg) or True
+        api._arduino = _FakeCtrl(default, healthy=False)
+        api._check_backend_health()
+        self.assertEqual(1, len(reported))
+        self.assertNotIn('Arduino', reported[0])
+
+    def test_status_payloads_default_to_config_backend(self):
+        # Static: the status seed and get_initial_state are too entangled
+        # to build headless; the page side is covered behaviorally by
+        # tests/capture_guard.test.js.
+        src = (Path(__file__).resolve().parents[1] / 'pc_client' / 'ui.py'
+               ).read_text(encoding='utf-8')
+        fallbacks = re.findall(
+            r"_settings\.get\(\s*'input_backend',\s*([^)\s]+)\s*\)", src)
+        self.assertTrue(fallbacks)
+        self.assertEqual({'INPUT_BACKEND_DEFAULT'}, set(fallbacks))
 
     def test_forced_switch_refused_if_worker_does_not_stop(self):
         api = self.make_api('arduino')

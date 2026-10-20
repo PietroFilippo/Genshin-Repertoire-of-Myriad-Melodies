@@ -385,6 +385,39 @@ class ArduinoKeyMapTests(unittest.TestCase):
         self.assertIn("mouse button 'x2' isn't supported", log)
 
 
+# ------------------------------------------------- v1.6.1 keyboard `double`
+
+class KeyboardDoubleTimedTests(unittest.TestCase):
+    """The events editor offers `double` for keyboard rows too. Like a
+    mouse `double`, it must play as a press on the board scheduler — not
+    be rejected (which silently forced the host scheduler)."""
+
+    EVENTS = [
+        _event(0.0, 'keyboard', 'e', 'double'),
+        _event(0.05, 'keyboard', 'e', 'up'),
+    ]
+
+    def test_compiler_encodes_keyboard_double_as_key_down(self):
+        packed, _ = controller_module._compile_timed_macro_events(self.EVENTS)
+        self.assertEqual([
+            (0, controller_module._TIMED_KEY_DOWN, ord('e')),
+            (50, controller_module._TIMED_KEY_UP, ord('e')),
+        ], packed)
+
+    def test_keyboard_double_macro_stays_on_the_board_scheduler(self):
+        fw = ModelFirmwareSerial()
+        ctrl = _bare_controller(fw)
+        engine = MacroEngine()
+        engine._events = [dict(ev) for ev in self.EVENTS]
+        _, log = _quiet(engine.play, ctrl)
+        self.assertNotIn('using host scheduler', log)
+        self.assertEqual(
+            ((0, controller_module._TIMED_KEY_DOWN, ord('e')),
+             (50, controller_module._TIMED_KEY_UP, ord('e'))),
+            fw.started[-1])
+        self.assertNotIn('K:101:DOWN', fw.writes)    # host path never ran
+
+
 # ---------------------------------------------------------------- R11
 
 class ArduinoHealthTests(unittest.TestCase):

@@ -159,11 +159,14 @@ def _compile_timed_macro_events(events):
         event_type = str(event.get('event_type', '')).lower()
         key = str(event.get('key', '')).lower()
         if device == 'keyboard':
+            # An editor-entered keyboard `double` is a press, exactly like
+            # a mouse `double` below and like MacroEngine's host scheduler.
             code = _key_code(key)
-            if not code or code > 255 or event_type not in ('down', 'up'):
+            if (not code or code > 255
+                    or event_type not in ('down', 'up', 'double')):
                 raise ValueError(f"event {index} is not firmware-compatible")
-            op = (_TIMED_KEY_DOWN if event_type == 'down'
-                  else _TIMED_KEY_UP)
+            op = (_TIMED_KEY_UP if event_type == 'up'
+                  else _TIMED_KEY_DOWN)
         elif device == 'mouse':
             # x / x2 have no MOUSE_MAP entry -> rejected here, so the
             # host scheduler runs the macro and mouse_down/up log + skip

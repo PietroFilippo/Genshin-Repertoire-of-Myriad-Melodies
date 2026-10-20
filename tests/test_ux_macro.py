@@ -200,6 +200,38 @@ class BufferRevisionTests(_TempSlots):
         self.assertTrue(res)
         self.assertEqual('double', self.macro.get_events()[0]['event_type'])
 
+    def test_keyboard_double_row_plays_as_a_press(self):
+        """v1.6.1: the editor offers `double` for keyboard rows; the host
+        scheduler used to skip them silently (a mouse `double` already
+        played as a down)."""
+        res = self.macro.apply_events([
+            _ev(0, 'e', 'double'),
+            _ev(0.01, 'e', 'up'),
+        ])
+        self.assertTrue(res)
+        self.assertEqual('double', self.macro.get_events()[0]['event_type'])
+        ctrl = _Recorder()
+        ui_core.MacroEngine.play_events(self.macro.get_events(), ctrl)
+        self.assertEqual([('key_down', 'e'), ('key_up', 'e')],
+                         [c for c in ctrl.calls if c[1] == 'e'])
+
+    def test_held_keyboard_double_is_released_by_the_safety_sweep(self):
+        ctrl = _Recorder()
+        ui_core.MacroEngine.play_events([_ev(0, 'e', 'double')], ctrl)
+        self.assertEqual([('key_down', 'e'), ('key_up', 'e')],
+                         [c for c in ctrl.calls if c[1] == 'e'])
+
+    def test_auto_repeat_rule_treats_a_double_row_as_a_press(self):
+        engine = ui_core.MacroEngine()
+        engine.begin_record()
+        engine._events.append(_ev(0, 'e', 'double'))
+        engine.record_keyboard('e', 'down')          # auto-repeat: dropped
+        self.assertEqual(1, engine.event_count())
+        engine.record_keyboard('e', 'up')
+        engine.record_keyboard('e', 'down')          # a new press: kept
+        self.assertEqual(['double', 'up', 'down'],
+                         [e['event_type'] for e in engine.events])
+
     def test_save_marks_clean_only_the_revision_it_wrote(self):
         self.macro.apply_events([_ev(0, 'a', 'down')])
 
