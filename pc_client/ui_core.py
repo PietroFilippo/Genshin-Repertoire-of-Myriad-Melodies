@@ -378,6 +378,7 @@ def load_settings():
             'macro_active_macros': _default_active_macros(),
             'macro_conflict_policy': MACRO_CONFLICT_IGNORE,
             'bot_options': default_bot_options(),
+            'prereq_tip_dismissed': False,
         }
     try:
         with p.open('r', encoding='utf-8') as fh:
@@ -394,6 +395,10 @@ def load_settings():
             'macro_active_macros': active,
             'macro_conflict_policy': policy,
             'bot_options': normalize_bot_options(data.get('bot_options')),
+            # Main-tab prerequisites tip (Hu Tao theme / English UI)
+            # hidden for good once dismissed. Strict bool only.
+            'prereq_tip_dismissed':
+                data.get('prereq_tip_dismissed') is True,
         }
     except Exception as e:
         print(f"[ui] failed to load settings: {e} — using defaults")
@@ -403,6 +408,7 @@ def load_settings():
             'macro_active_macros': _default_active_macros(),
             'macro_conflict_policy': MACRO_CONFLICT_IGNORE,
             'bot_options': default_bot_options(),
+            'prereq_tip_dismissed': False,
         }
 
 
@@ -484,28 +490,89 @@ def save_settings(settings):
 
 # --- log pane plumbing ------------------------------------------------------
 
+class _LineStamper:
+    """Prefixes every log LINE with local `HH:MM:SS ` (24 h + one space) —
+    the format the Logs tab parses (`^(\\d\\d:\\d\\d:\\d\\d) (?:\\[tag\\])?`).
+    Tracks whether the stream is at the start of a line across writes, so
+    print()'s separate arg / sep / '\\n' writes and multi-line strings
+    are stamped exactly once per line. One instance per queue (stdout and
+    stderr feed the same pane, so they must share line state)."""
+
+    __slots__ = ('lock', 'at_line_start')
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.at_line_start = True
+
+    def stamp(self, s, now=None):
+        """Return `s` with a timestamp inserted at every line start.
+        Caller holds `self.lock`."""
+        ts = time.strftime('%H:%M:%S ', time.localtime(now))
+        parts = s.split('\n')
+        last = len(parts) - 1
+        out = []
+        at_start = self.at_line_start
+        for i, part in enumerate(parts):
+            if i < last:
+                if at_start:
+                    out.append(ts)
+                out.append(part)
+                out.append('\n')
+                at_start = True
+            elif part:
+                if at_start:
+                    out.append(ts)
+                out.append(part)
+                at_start = False
+        self.at_line_start = at_start
+        return ''.join(out)
+
+
+def _stamper_for(q):
+    """The shared _LineStamper for queue `q` (created on first use and
+    parked on the queue object itself, so every QueueWriter on the same
+    queue — stdout AND stderr — shares one line-start state)."""
+    stamper = getattr(q, '_ui_line_stamper', None)
+    if stamper is None:
+        stamper = _LineStamper()
+        try:
+            q._ui_line_stamper = stamper
+        except Exception:
+            pass
+    return stamper
+
+
 class QueueWriter:
     """File-like object that pushes writes onto a thread-safe queue. The UI
     drain loop pops from this queue and forwards to the JS log pane via
     evaluate_js. Avoids any UI-thread coupling — every worker thread
-    (detector, album loop, keyboard package listener) writes here lock-free."""
+    (detector, album loop, keyboard package listener) writes here. Each
+    line gets a local `HH:MM:SS ` prefix (see _LineStamper); the only
+    lock held is around the stamp + non-blocking put, never around the
+    console mirror (which can block in a --windowed build)."""
 
     def __init__(self, q, mirror=None):
         self._q = q
         # mirror lets us tee to the real stdout/stderr too — handy when
         # ui.py is launched from a console for live debugging.
         self._mirror = mirror
+        self._stamper = _stamper_for(q)
 
     def write(self, s):
         if not s:
             return 0
-        try:
-            self._q.put_nowait(s)
-        except queue.Full:
-            pass
+        stamper = self._stamper
+        # Stamp + enqueue under one lock so the line-start state follows
+        # the exact order chunks land in the queue.
+        with stamper.lock:
+            text = stamper.stamp(s)
+            try:
+                self._q.put_nowait(text)
+            except queue.Full:
+                pass
         if self._mirror is not None:
             try:
-                self._mirror.write(s)
+                self._mirror.write(text)
             except Exception:
                 pass
         return len(s)
@@ -1490,6 +1557,9 @@ class BotController:
         # current run — the crash fallback must not clobber a specific
         # message (e.g. "Not on album page") with the generic one.
         self._run_error_reported = False
+        # Last merged album_progress dict (None = no album run yet / reset
+        # by Start). See _merge_album_progress.
+        self._album_progress = None
         self._timer_boosted = False
         self.state = self.STATE_IDLE
         self._mode = ''
@@ -1531,10 +1601,15 @@ class BotController:
         self._mode_options = dict(options)
         self._run_error_reported = False
         self.state = self.STATE_RUNNING
-        # A new Start clears whatever the previous run reported.
+        # A new Start clears whatever the previous run reported:
+        # last_error, the album progress strip (the album runner re-emits
+        # it from index 0) and the elapsed-clock origin (set again once
+        # the run actually begins, see _mark_run_started).
         self._emit({'state': self.state, 'mode': mode,
                     'debug': self._debug_evt.is_set(),
-                    'last_error': ''})
+                    'last_error': '',
+                    'album_progress': None,
+                    'run_started_at': 0})
 
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name=f'bot-{mode}')
@@ -1636,10 +1711,37 @@ class BotController:
         # minimized-window wait ended) — re-arm the fallback then.
         if isinstance(update, dict) and 'last_error' in update:
             self._run_error_reported = bool(update.get('last_error'))
+        if isinstance(update, dict) and 'album_progress' in update:
+            update = dict(update)
+            update['album_progress'] = self._merge_album_progress(
+                update['album_progress'])
         try:
             self._on_status(update)
         except Exception:
             pass
+
+    def _merge_album_progress(self, value):
+        """album_progress updates from the runner: None resets; a dict is
+        merged over the previous value (the runner normally sends the full
+        object, a partial one still works). Lists are copied — the runner
+        may keep mutating its own `results` list, and the drain's
+        change-detection compares against the previous snapshot by value,
+        so an aliased list would hide the change."""
+        if not isinstance(value, dict):
+            self._album_progress = None
+            return None
+        merged = dict(self._album_progress or {})
+        for k, v in value.items():
+            merged[k] = list(v) if isinstance(v, (list, tuple)) else v
+        self._album_progress = merged
+        return dict(merged)
+
+    def _mark_run_started(self):
+        """Elapsed-clock origin for the UI (`run_started_at`, epoch secs):
+        set once the run actually begins (backend built, runner about to
+        start); 0 from Start until then. Kept after the run ends so the
+        UI can show the final elapsed; the next Start resets it."""
+        self._emit({'run_started_at': time.time()})
 
     def _report_error(self, message):
         """Surface `message` as last_error unless this run already
@@ -1702,6 +1804,8 @@ class BotController:
                     return
             if self._stop_evt.is_set():
                 return
+            if self._mode in ('standalone', 'album'):
+                self._mark_run_started()
             if self._mode == 'standalone':
                 run_standalone(self._stop_evt, self._debug_evt,
                                status_cb=self._emit,

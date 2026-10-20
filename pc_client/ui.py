@@ -146,6 +146,22 @@ try:
     from controller import ArduinoConnectionError
 except ImportError:
     ArduinoConnectionError = RuntimeError
+# Live lane state for the Main-tab lane strip (`lanes`). Looked up with
+# getattr each tick so a detector module without active_lanes() just
+# reports all-idle lanes instead of breaking the drain.
+try:
+    import detector as _detector_mod
+except Exception:
+    _detector_mod = None
+try:
+    from game_window import find_game_window as _find_game_window
+except Exception:
+    _find_game_window = None
+
+# Lane order matches config.KEYS (a s d j k l).
+_LANE_COUNT = 6
+# `game_window_found` poll period (FindWindowW — never blocks).
+GAME_WINDOW_POLL_S = 0.5
 
 
 def _resource_dir():
@@ -519,6 +535,10 @@ class BridgeApi:
         self._backend_error = ''
         # Window rect saved by toggle_maximize (None = not maximized).
         self._restore_rect = None
+        # Set once the user agreed to discard unsaved macro work (in-app
+        # dialog → close(confirmed=True), or the native prompt) so the
+        # close isn't asked about twice. See allow_close.
+        self._close_confirmed = False
 
         self._status_lock = threading.Lock()
         self._status = {
@@ -529,6 +549,20 @@ class BridgeApi:
             'debug': False,
             # Why the last bot run ended badly (cleared on every Start).
             'last_error': '',
+            # Direction A data contract (ui-data-contract.md):
+            # lanes — a s d j k l pressed by the detector (drain-polled).
+            'lanes': [False] * _LANE_COUNT,
+            # album_progress — None or {index, total, difficulty,
+            # difficulties, results} from the album runner; reset by
+            # Start, kept after the run ends.
+            'album_progress': None,
+            # run_started_at — epoch secs the current/last run began
+            # (0 from Start until it begins); UI derives Elapsed.
+            'run_started_at': 0,
+            # game_window_found — FindWindowW poll (drain, ~500 ms).
+            'game_window_found': False,
+            'prereq_tip_dismissed': bool(
+                self._settings.get('prereq_tip_dismissed', False)),
             'admin': is_admin(),
             'keybinds': dict(self._settings['keybinds']),
             'macro_state': MacroController.STATE_IDLE,
@@ -690,6 +724,8 @@ class BridgeApi:
             return {
                 **self._opts,
                 'last_error': last_error,
+                'prereq_tip_dismissed': bool(
+                    self._settings.get('prereq_tip_dismissed', False)),
                 'admin': is_admin(),
                 'keybinds': dict(self._settings['keybinds']),
                 'difficulties': list(ALBUM_DIFFICULTY_COORDS),
@@ -702,6 +738,17 @@ class BridgeApi:
                     'macro_conflict_policy', MACRO_CONFLICT_IGNORE),
                 'input_backend': self._settings.get('input_backend', 'arduino'),
             }
+
+    def dismiss_prereq_tip(self):
+        """Hide the Main-tab prerequisites tip for good: persists
+        `prereq_tip_dismissed: true` (atomic settings write) and mirrors
+        it into the status snapshot. Idempotent."""
+        with self._lock:
+            if self._settings.get('prereq_tip_dismissed') is not True:
+                self._settings['prereq_tip_dismissed'] = True
+                save_settings(self._settings)
+        self._enqueue_status({'prereq_tip_dismissed': True})
+        return {'ok': True}
 
     def start_stop(self):
         # Ownership check + start under _engine_lock so a macro Play /
@@ -1356,13 +1403,99 @@ class BridgeApi:
         except Exception:
             pass
 
-    def close(self):
+    def close(self, confirmed=False):
+        """Titlebar close. `confirmed=True` means the page already asked
+        "discard the unsaved macro?" in its own dialog and the user agreed,
+        so the native prompt in the `closing` handler (allow_close) is
+        skipped. With the default False — old JS, or any caller that
+        didn't ask — the closing handler asks natively when there is
+        unsaved macro work. Returns True once the window is closing /
+        closed, False if the user cancelled at the native prompt."""
+        if confirmed:
+            self._close_confirmed = True
         if self._window is not None:
             try:
                 self._window.destroy()
             except Exception as e:
+                if confirmed:
+                    self._close_confirmed = False
                 print(f"[ui] close failed: {e}")
+                return False
+            # destroy() returns after FormClosing ran: detached = closed,
+            # not detached = a closing handler cancelled it.
+            return bool(self._detached)
         return True
+
+    def allow_close(self):
+        """`closing`-event gate. Runs on the WinForms UI thread BEFORE
+        detach()'s hide-then-teardown — every close path goes through it
+        (titlebar, Alt+F4, taskbar "Close window"). True = let the window
+        close. False = the user chose to keep an unsaved / in-progress
+        macro; the handler then returns False, which cancels the close
+        (pywebview 6.2.1 winforms on_closing: any `closing` handler
+        returning False sets FormClosingEventArgs.Cancel)."""
+        if self._detached or getattr(self, '_close_confirmed', False):
+            return True
+        if not self._macro_has_unsaved_work():
+            return True
+        if self._ask_discard_unsaved_macro():
+            self._close_confirmed = True
+            return True
+        print('[ui] close cancelled — unsaved macro kept')
+        return False
+
+    def _macro_has_unsaved_work(self):
+        """Recording in progress, or the macro buffer is dirty (unsaved
+        changes) — the same rule the page's in-app close confirm uses."""
+        try:
+            if self._macro.state() == MacroController.STATE_RECORDING:
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(self._macro._engine.is_dirty())
+        except Exception:
+            pass
+        try:
+            return bool(self._macro.snapshot().get('macro_dirty'))
+        except Exception:
+            return False
+
+    def _ask_discard_unsaved_macro(self):
+        """Native Yes/No MessageBoxW owned by the UI window ("No" is the
+        default button). True = discard and close. If the box can't be
+        shown at all, allow the close rather than trap the user in a
+        window that can't be closed."""
+        try:
+            recording = (self._macro.state()
+                         == MacroController.STATE_RECORDING)
+        except Exception:
+            recording = False
+        detail = ('A macro recording is still in progress.' if recording
+                  else 'The current macro has unsaved changes — save it '
+                       'to a slot first to keep it.')
+        text = f'Discard the unsaved macro and close?\n\n{detail}'
+        MB_YESNO, MB_ICONWARNING, MB_DEFBUTTON2 = 0x4, 0x30, 0x100
+        MB_SETFOREGROUND, MB_TOPMOST = 0x10000, 0x40000
+        IDYES = 6
+        try:
+            owner = getattr(self, '_hwnd_cache', 0) or self._ui_hwnd()
+            W = ctypes.wintypes
+            # Private WinDLL: keep these argtypes off the shared user32.
+            user32 = ctypes.WinDLL('user32')
+            user32.MessageBoxW.argtypes = [W.HWND, W.LPCWSTR, W.LPCWSTR,
+                                           ctypes.c_uint]
+            user32.MessageBoxW.restype = ctypes.c_int
+            rc = user32.MessageBoxW(
+                owner or None, text, UI_WINDOW_TITLE,
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2
+                | MB_SETFOREGROUND | MB_TOPMOST)
+        except Exception as e:
+            print(f"[ui] close prompt failed: {e}")
+            return True
+        if rc == 0:
+            return True
+        return rc == IDYES
 
     # ---- internal ----
 
@@ -1772,6 +1905,40 @@ class BridgeApi:
         if self._bot.report_error(msg):
             print(f'[ui] {msg}')
 
+    def _read_lanes(self):
+        """`lanes`: which of a s d j k l the detector holds down right now
+        (6 bools, KEYS order). All False when the bot isn't running or the
+        detector module has no active_lanes() (yet). Called every drain
+        tick — one function call + a 6-element list, nothing more. Always
+        a NEW list, so the drain's by-value change detection sees edits."""
+        idle = [False] * _LANE_COUNT
+        fn = getattr(_detector_mod, 'active_lanes', None)
+        if fn is None or not self._bot.is_running():
+            return idle
+        try:
+            lanes = fn()
+        except Exception:
+            return idle
+        if lanes is None:
+            return idle
+        try:
+            out = [bool(x) for x in list(lanes)[:_LANE_COUNT]]
+        except Exception:
+            return idle
+        out.extend([False] * (_LANE_COUNT - len(out)))
+        return out
+
+    def _poll_game_window(self):
+        """`game_window_found`: FindWindowW over the game titles. Cheap and
+        non-blocking (no message is sent to the game), drain-polled every
+        GAME_WINDOW_POLL_S."""
+        if _find_game_window is None:
+            return False
+        try:
+            return bool(_find_game_window())
+        except Exception:
+            return False
+
     def _drain_loop(self):
         """Single-thread drain: snapshot status + drain log queue every
         POLL_MS, push both to the page in one evaluate_js call. Decoupling
@@ -1785,6 +1952,8 @@ class BridgeApi:
         last_status = None
         last_push = 0.0
         last_health_check = 0.0
+        last_window_poll = 0.0
+        game_window_found = False
         while not self._drain_stop.is_set():
             try:
                 # Drain *all* queued log chunks each tick.
@@ -1797,8 +1966,14 @@ class BridgeApi:
                 if time.monotonic() - last_health_check >= 1.0:
                     last_health_check = time.monotonic()
                     self._check_backend_health()
+                if time.monotonic() - last_window_poll >= GAME_WINDOW_POLL_S:
+                    last_window_poll = time.monotonic()
+                    game_window_found = self._poll_game_window()
                 debug = self._sync_debug_opts()
+                lanes = self._read_lanes()
                 with self._status_lock:
+                    self._status['lanes'] = lanes
+                    self._status['game_window_found'] = game_window_found
                     status = dict(self._status)
                 status['admin'] = is_admin()
                 status['debug'] = debug
@@ -2000,11 +2175,24 @@ def main():
     # tearing down for hundreds of ms, holding its own input hooks.
     # Doing cleanup early gives the LL hooks a chance to come down
     # before the slow part starts.
+    #
+    # First, though, the unsaved-macro gate: Alt+F4 / taskbar "Close
+    # window" never pass through the page's in-app confirm, so ask
+    # natively here (allow_close) BEFORE detach's hide-then-teardown.
+    # Returning False from a `closing` handler cancels the close
+    # (pywebview 6.2.1: winforms on_closing → closing.set() → any False
+    # return sets args.Cancel); the lambda must pass the value through.
     def _safe_closing():
+        try:
+            if not api.allow_close():
+                return False
+        except Exception as e:
+            print(f"[ui] close gate error: {e}")
         try:
             api.detach()
         except Exception as e:
             print(f"[ui] detach in closing: {e}")
+        return None
     try:
         window.events.closing += lambda: _safe_closing()
     except Exception:

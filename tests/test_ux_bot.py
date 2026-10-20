@@ -739,5 +739,315 @@ class BridgeBackendTests(unittest.TestCase):
                 t.join(1.0)
 
 
+# --- Direction A data contract (genshin-ui-mocks/ui-data-contract.md) -------
+
+_STAMP_RE = r'^\d\d:\d\d:\d\d '
+
+
+class LogTimestampTests(unittest.TestCase):
+    """QueueWriter prefixes every log LINE with `HH:MM:SS `."""
+
+    def _drain(self, q):
+        out = ''
+        while not q.empty():
+            out += q.get_nowait()
+        return out
+
+    def test_every_line_stamped_once(self):
+        q = queue.Queue()
+        w = ui_core.QueueWriter(q)
+        print('[album] song', 3, file=w)      # print = 4 separate writes
+        w.write('first\nsecond\n')
+        w.write('par')
+        w.write('tial line\n')
+        w.write('\n')
+        lines = self._drain(q).split('\n')
+        self.assertEqual(lines[-1], '')
+        lines = lines[:-1]
+        self.assertEqual(len(lines), 5)
+        for line in lines:
+            self.assertRegex(line, _STAMP_RE)
+        self.assertEqual([ln[9:] for ln in lines],
+                         ['[album] song 3', 'first', 'second',
+                          'partial line', ''])
+
+    def test_js_regex_contract(self):
+        import re
+        q = queue.Queue()
+        ui_core.QueueWriter(q).write('[sw-input] ready\nuntagged\n')
+        pat = re.compile(r'^(\d\d:\d\d:\d\d) (?:\[([^\]]+)\]\s*)?(.*)$')
+        first, second = self._drain(q).splitlines()
+        m1, m2 = pat.match(first), pat.match(second)
+        self.assertEqual((m1.group(2), m1.group(3)), ('sw-input', 'ready'))
+        self.assertEqual((m2.group(2), m2.group(3)), (None, 'untagged'))
+
+    def test_stdout_and_stderr_share_line_state(self):
+        q = queue.Queue()
+        out = ui_core.QueueWriter(q)
+        err = ui_core.QueueWriter(q)
+        out.write('no newline yet')
+        err.write(' + tail\n')                 # same pane line
+        self.assertEqual(self._drain(q).count(':'), 2)   # one stamp
+
+    def test_mirror_gets_stamped_text_and_return_is_input_len(self):
+        q = queue.Queue()
+        mirror = mock.Mock()
+        w = ui_core.QueueWriter(q, mirror=mirror)
+        self.assertEqual(w.write('hello\n'), len('hello\n'))
+        self.assertRegex(mirror.write.call_args[0][0], _STAMP_RE + 'hello\n')
+
+    def test_concurrent_writers_keep_lines_whole(self):
+        q = queue.Queue()
+        w = ui_core.QueueWriter(q)
+
+        def spam(tag):
+            for i in range(200):
+                w.write(f'[{tag}] line {i}\n')
+        threads = [threading.Thread(target=spam, args=(t,))
+                   for t in ('a', 'b', 'c')]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        lines = self._drain(q).splitlines()
+        self.assertEqual(len(lines), 600)
+        for line in lines:
+            self.assertRegex(line, _STAMP_RE + r'\[[abc]\] line \d+$')
+
+
+class RunMetadataTests(_BotTestBase):
+    """album_progress + run_started_at owned by BotController."""
+
+    def test_start_resets_then_run_sets_started_at(self):
+        started = threading.Event()
+        with mock.patch.object(ui_core, 'run_standalone',
+                               _blocking_standalone(started)):
+            bot = self.make_bot(lambda: object())
+            t0 = time.time()
+            bot.start('standalone', {})
+            first = self.sink.updates[0]
+            self.assertEqual(first['run_started_at'], 0)
+            self.assertIsNone(first['album_progress'])
+            self.assertTrue(started.wait(2.0))
+            self.assertGreaterEqual(self.sink.get('run_started_at'), t0)
+            bot.stop()
+            self.wait_idle(bot)
+        # Kept after the run ends (UI shows the final elapsed).
+        self.assertGreaterEqual(self.sink.get('run_started_at'), t0)
+
+    def test_backend_failure_never_sets_started_at(self):
+        with mock.patch.object(ui_core, 'run_standalone', mock.Mock()):
+            bot = self.make_bot(lambda: None)
+            bot.start('standalone', {})
+            self.wait_idle(bot)
+        self.assertEqual(self.sink.get('run_started_at'), 0)
+
+    def test_album_progress_merged_copied_kept_and_reset(self):
+        results = []
+
+        class FakeAlbum:
+            def __init__(self, status_cb=None, **kw):
+                self.cb = status_cb
+
+            def run(self, songs_count=None):
+                self.cb({'album_progress': {
+                    'index': 0, 'total': 2, 'difficulty': 'hard',
+                    'difficulties': ['hard'], 'results': results}})
+                results.append('played')
+                self.cb({'album_progress': {'index': 1,
+                                            'results': results}})
+                results.append('skipped')       # mutated after emitting
+                return 'completed'
+
+            def close(self):
+                pass
+
+        with mock.patch.object(ui_core, 'AlbumRunner', FakeAlbum):
+            bot = self.make_bot(lambda: object())
+            bot.start('album', {'difficulty': ['hard']})
+            self.wait_idle(bot)
+        prog = self.sink.get('album_progress')
+        self.assertEqual(prog, {'index': 1, 'total': 2, 'difficulty': 'hard',
+                                'difficulties': ['hard'],
+                                'results': ['played']})
+        # Next Start resets it to None.
+        with mock.patch.object(ui_core, 'run_standalone',
+                               lambda *a, **k: None):
+            bot.start('standalone', {})
+            self.wait_idle(bot)
+        self.assertIsNone(self.sink.get('album_progress'))
+
+
+@unittest.skipIf(ui is None, 'ui.py not importable headless')
+class DirectionABridgeTests(unittest.TestCase):
+    def make_api(self, backend='software'):
+        api = BridgeBackendTests.make_api(self, backend)
+        api._detached = False
+        api._close_confirmed = False
+        api._window = None
+        api._hwnd_cache = 0
+        return api
+
+    # -- prereq tip ----------------------------------------------------------
+
+    def test_dismiss_prereq_tip_persists_and_mirrors(self):
+        api = self.make_api()
+        self.assertEqual(api.dismiss_prereq_tip(), {'ok': True})
+        self.assertIs(api._settings['prereq_tip_dismissed'], True)
+        self.assertEqual(self.save_settings.call_count, 1)
+        self.assertIs(api._status['prereq_tip_dismissed'], True)
+        api.dismiss_prereq_tip()                 # idempotent: no re-save
+        self.assertEqual(self.save_settings.call_count, 1)
+        api._macro.snapshot = lambda: {}
+        api._settings['keybinds'] = {}
+        self.assertIs(api.get_initial_state()['prereq_tip_dismissed'], True)
+
+    def test_prereq_tip_setting_sanitized(self):
+        for raw, want in ((True, True), ('yes', False), (1, False),
+                          (None, False)):
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as td:
+                path = Path(td) / 'ui_settings.json'
+                path.write_text(json.dumps({'prereq_tip_dismissed': raw}),
+                                encoding='utf-8')
+                with mock.patch.object(ui_core, 'settings_path',
+                                       return_value=path):
+                    self.assertIs(
+                        ui_core.load_settings()['prereq_tip_dismissed'], want)
+
+    # -- lanes / game window -------------------------------------------------
+
+    def test_lanes_fallbacks_and_normalization(self):
+        api = self.make_api()
+        idle = [False] * 6
+        with mock.patch.object(ui, '_detector_mod', object()):
+            api._bot.running = True
+            self.assertEqual(api._read_lanes(), idle)      # no function
+        fake = mock.Mock()
+        with mock.patch.object(ui, '_detector_mod', fake):
+            fake.active_lanes.return_value = (1, 0, 0, 0, 0, 1)
+            api._bot.running = False
+            self.assertEqual(api._read_lanes(), idle)      # bot idle
+            api._bot.running = True
+            self.assertEqual(api._read_lanes(),
+                             [True, False, False, False, False, True])
+            fake.active_lanes.return_value = None
+            self.assertEqual(api._read_lanes(), idle)
+            fake.active_lanes.return_value = [True]
+            self.assertEqual(api._read_lanes(), [True] + [False] * 5)
+            fake.active_lanes.side_effect = RuntimeError('torn down')
+            self.assertEqual(api._read_lanes(), idle)
+
+    def test_game_window_poll(self):
+        api = self.make_api()
+        with mock.patch.object(ui, '_find_game_window', return_value=1234):
+            self.assertIs(api._poll_game_window(), True)
+        with mock.patch.object(ui, '_find_game_window', return_value=None):
+            self.assertIs(api._poll_game_window(), False)
+        with mock.patch.object(ui, '_find_game_window',
+                               side_effect=OSError('x')):
+            self.assertIs(api._poll_game_window(), False)
+
+    def test_drain_pushes_lanes_and_window_state(self):
+        api = self.make_api()
+        api._window = object()
+        api._stopping = False
+        api._drain_stop = threading.Event()
+        api._log_queue = queue.Queue()
+        api._orig_stderr = sys.__stderr__
+        pushes = []
+        api._push = lambda status, log: pushes.append(dict(status)) or True
+        lanes = {'v': [False] * 6}
+        api._read_lanes = lambda: list(lanes['v'])
+        with mock.patch.object(ui, 'is_admin', return_value=True), \
+                mock.patch.object(ui, '_find_game_window', return_value=7):
+            t = threading.Thread(target=api._drain_loop, daemon=True)
+            t.start()
+            try:
+                self.assertTrue(_wait_until(lambda: len(pushes) >= 1, 1.0))
+                self.assertIs(pushes[0]['game_window_found'], True)
+                self.assertEqual(pushes[0]['lanes'], [False] * 6)
+                n = len(pushes)
+                lanes['v'] = [False, True, False, False, False, False]
+                self.assertTrue(_wait_until(lambda: len(pushes) > n, 1.0))
+                self.assertEqual(pushes[-1]['lanes'][1], True)
+            finally:
+                api._drain_stop.set()
+                t.join(1.0)
+
+    # -- window close --------------------------------------------------------
+
+    def _macro_with(self, recording=False, dirty=False):
+        m = _FakeMacro()
+        m.state = lambda: 'recording' if recording else 'idle'
+        m._engine = mock.Mock()
+        m._engine.is_dirty.return_value = dirty
+        return m
+
+    def test_allow_close_without_unsaved_work_never_asks(self):
+        api = self.make_api()
+        api._macro = self._macro_with()
+        api._ask_discard_unsaved_macro = mock.Mock(return_value=False)
+        self.assertTrue(api.allow_close())
+        api._ask_discard_unsaved_macro.assert_not_called()
+
+    def test_allow_close_asks_when_dirty_or_recording(self):
+        for kw in ({'dirty': True}, {'recording': True}):
+            with self.subTest(**kw):
+                api = self.make_api()
+                api._macro = self._macro_with(**kw)
+                api._ask_discard_unsaved_macro = mock.Mock(return_value=False)
+                self.assertFalse(api.allow_close())        # No → cancel
+                api._ask_discard_unsaved_macro.return_value = True
+                self.assertTrue(api.allow_close())         # Yes → close
+                self.assertTrue(api._close_confirmed)
+                api._ask_discard_unsaved_macro.reset_mock()
+                self.assertTrue(api.allow_close())         # asked once
+                api._ask_discard_unsaved_macro.assert_not_called()
+
+    def test_close_confirmed_skips_native_prompt(self):
+        api = self.make_api()
+        api._macro = self._macro_with(dirty=True)
+        api._ask_discard_unsaved_macro = mock.Mock(return_value=False)
+        gate = {}
+
+        class FakeWindow:
+            def destroy(self_inner):
+                # destroy() → FormClosing → our closing handler.
+                gate['allowed'] = api.allow_close()
+                if gate['allowed']:
+                    api._detached = True
+
+        api._window = FakeWindow()
+        self.assertTrue(api.close(True))
+        self.assertTrue(gate['allowed'])
+        api._ask_discard_unsaved_macro.assert_not_called()
+
+    def test_close_unconfirmed_can_be_cancelled(self):
+        api = self.make_api()
+        api._macro = self._macro_with(dirty=True)
+        api._ask_discard_unsaved_macro = mock.Mock(return_value=False)
+
+        class FakeWindow:
+            def destroy(self_inner):
+                if api.allow_close():
+                    api._detached = True
+
+        api._window = FakeWindow()
+        self.assertFalse(api.close())
+        api._ask_discard_unsaved_macro.assert_called_once()
+        self.assertFalse(api._detached)
+
+    def test_pywebview_closing_false_cancels(self):
+        """The installed pywebview must treat a False return from a
+        `closing` handler as cancel — the close gate relies on it."""
+        from webview.event import Event
+        evt = Event(None, True)                # closing is a locking event
+        evt += lambda: False
+        self.assertTrue(evt.set())             # True → args.Cancel = True
+        ok = Event(None, True)
+        ok += lambda: None
+        self.assertFalse(ok.set())
+
+
 if __name__ == '__main__':
     unittest.main()
