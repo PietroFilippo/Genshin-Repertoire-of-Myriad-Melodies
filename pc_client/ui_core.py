@@ -771,8 +771,13 @@ def is_allowed_game_only():
     if not _same_hwnd(fg, cached):
         return False
     # Recycled-HWND guard (see is_allowed_foreground): GetWindowThreadProcessId
-    # doesn't message the window. Unknown PID keeps the HWND-only answer.
-    return not cached_pid or _window_pid(fg) == cached_pid
+    # doesn't message the window. Only a KNOWN mismatch rejects; an unknown
+    # cached or live PID keeps the HWND-only answer so a failed lookup can
+    # never lock the real game out of its own macro hotkeys.
+    if not cached_pid:
+        return True
+    live = _window_pid(fg)
+    return not live or live == cached_pid
 
 
 FOCUS_GAME_NOT_FOUND = 'game_not_found'

@@ -1044,6 +1044,19 @@ class AppScopeFastPathChecksPid(unittest.TestCase):
         self.proc = p.start()
         self.addCleanup(p.stop)
 
+    def test_game_only_gate_rejects_only_known_pid_mismatch(self):
+        """N1: the game-only gate (macro hotkeys + recording) rejects a
+        recycled HWND with a different PID, but a failed live PID lookup
+        (0) must keep the HWND answer instead of locking the game out."""
+        for live, expected in ((self.GAME_PID, True), (self.OTHER_PID, False),
+                               (0, True)):
+            with mock.patch.object(ui_core, '_window_pid', return_value=live):
+                self.assertIs(ui_core.is_allowed_game_only(), expected, live)
+        with mock.patch.object(ui_core, '_game_pid', 0), \
+                mock.patch.object(ui_core, '_window_pid',
+                                  return_value=self.OTHER_PID):
+            self.assertTrue(ui_core.is_allowed_game_only())   # PID unknown
+
     def test_same_hwnd_and_pid_passes_without_lookups(self):
         with mock.patch.object(ui_core, '_window_pid',
                                return_value=self.GAME_PID):

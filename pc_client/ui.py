@@ -550,6 +550,11 @@ class BridgeApi:
         # Highest update sequence applied to _editor_dirty; every bridge
         # call runs on its own thread, so updates can arrive reordered.
         self._editor_dirty_seq = 0
+        # Bumped by every get_initial_state (one per page load) and handed
+        # to the page; dirty updates carry it so calls a previous page left
+        # in flight can never override the current page — no reliance on
+        # the page's clock.
+        self._editor_page_gen = 0
         # Set first thing in detach(): every start path, the backend
         # switch and _get_arduino refuse from then on.
         self._tearing_down = False
@@ -781,8 +786,13 @@ class BridgeApi:
         with self._status_lock:
             last_error = self._status.get('last_error', '')
         with self._lock:
+            # A (re)loaded page starts with no editor edits.
+            self._editor_page_gen = getattr(self, '_editor_page_gen', 0) + 1
+            self._editor_dirty = False
+            self._editor_dirty_seq = 0
             return {
                 **self._opts,
+                'page_gen': self._editor_page_gen,
                 'last_error': last_error,
                 'prereq_tip_dismissed': bool(
                     self._settings.get('prereq_tip_dismissed', False)),
@@ -1215,7 +1225,7 @@ class BridgeApi:
             events, expected_rev=expected_rev, expected_slot=expected_slot,
             persist=bool(persist)))
 
-    def macro_set_editor_dirty(self, dirty, seq=None):
+    def macro_set_editor_dirty(self, dirty, seq=None, page_gen=None):
         """The events editor gained / lost local edits that are not in
         the macro buffer yet (JS mirrors its flag on every flip, cleared
         on save, discard and hide, and re-asserts it every few seconds).
@@ -1227,13 +1237,29 @@ class BridgeApi:
         bridge call on its own thread, so an older "false" can land after
         a newer "true". An update whose seq is not above the last applied
         one is dropped (returns False). Without `seq` (older page) the
-        update always applies."""
+        update always applies.
+
+        `page_gen` (from get_initial_state): updates from an older page
+        load are dropped outright, and `seq` is then a plain per-page
+        counter compared only within the current page."""
         with self._lock:
             if seq is not None:
                 try:
                     seq = int(seq)
                 except (TypeError, ValueError):
                     seq = None
+            if page_gen is not None:
+                try:
+                    page_gen = int(page_gen)
+                except (TypeError, ValueError):
+                    page_gen = None
+            if page_gen is not None:
+                current_gen = getattr(self, '_editor_page_gen', 0)
+                if page_gen < current_gen:
+                    return False
+                if page_gen > current_gen:
+                    self._editor_page_gen = page_gen
+                    self._editor_dirty_seq = 0
             if seq is not None:
                 if seq <= getattr(self, '_editor_dirty_seq', 0):
                     return False

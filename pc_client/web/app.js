@@ -1801,6 +1801,12 @@ async function loadSlotFlow(n) {
         const label = name ? ` ("${name}")` : '';
         const loss = macroUnsavedSummary(false, view);
         const expected = view.macro_rev;
+        if (expected === null || expected === undefined) {
+            // Never load unpinned: without a revision Python can't tell
+            // whether newer unsaved work appeared while we were asking.
+            showMacroHint("Couldn't read the current macro — nothing was loaded. Try again.");
+            return;
+        }
         if (loss) {
             const ok = await dlgConfirm(`Load slot ${n}${label}?`,
                 `This replaces the current macro, and you have ${loss} that will be lost.`,
@@ -2344,12 +2350,21 @@ function syncEditorDirty() {
     if (!api()) return;
     const now = Date.now();
     if (dirty === _editorDirtySent && now - _editorDirtySentAt < EDITOR_DIRTY_REASSERT_MS) return;
+    const gen = STATE.pageGen;
+    if (gen === undefined) return;   // init() hasn't answered yet; re-asserted later
     _editorDirtySent = dirty;
     _editorDirtySentAt = now;
-    // Clock-seeded, so a reloaded page still outranks calls the old one
-    // left in flight.
-    _editorDirtySeq = Math.max(_editorDirtySeq + 1, now);
-    callApi('macro_set_editor_dirty', dirty, _editorDirtySeq).catch(() => {});
+    if (gen > 0) {
+        // Python issued this page's generation, so a plain per-page
+        // counter is enough: calls the previous page left in flight carry
+        // an older generation and are dropped regardless of clocks.
+        _editorDirtySeq += 1;
+        callApi('macro_set_editor_dirty', dirty, _editorDirtySeq, gen).catch(() => {});
+    } else {
+        // Older Python without page_gen: clock-seeded fallback.
+        _editorDirtySeq = Math.max(_editorDirtySeq + 1, now);
+        callApi('macro_set_editor_dirty', dirty, _editorDirtySeq).catch(() => {});
+    }
 }
 
 function updateEvtButtons() {
@@ -3070,6 +3085,9 @@ function init() {
     STATE.initialized = true;
     callApi('get_initial_state').then((s) => {
         if (!s) return;
+        STATE.pageGen = (typeof s.page_gen === 'number') ? s.page_gen : 0;
+        _editorDirtySent = null;   // force the next sync to (re)send
+        syncEditorDirty();
         if (typeof s.songs === 'number') {
             $('#songs').value = s.songs;
             MAIN.lastSongs = s.songs;

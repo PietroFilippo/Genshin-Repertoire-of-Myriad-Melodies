@@ -1079,6 +1079,28 @@ class DirectionABridgeTests(unittest.TestCase):
                       True)
         self.assertFalse(api._editor_dirty)
 
+    def test_editor_dirty_page_generation_beats_clocks(self):
+        """G5 (round 2): a reloaded page whose clock stepped backwards must
+        still outrank calls the previous page left in flight — the page
+        generation comes from Python, not from Date.now()."""
+        api = self.make_api()
+        api._settings['keybinds'] = {}
+        api._macro = self._macro_with()
+        api._macro.snapshot = lambda: {}
+        api._ask_discard_unsaved_macro = mock.Mock(return_value=False)
+        gen1 = api.get_initial_state()['page_gen']
+        self.assertIs(api.macro_set_editor_dirty(False, 1, gen1), True)
+        gen2 = api.get_initial_state()['page_gen']     # page reloaded
+        self.assertGreater(gen2, gen1)
+        self.assertFalse(api._editor_dirty)            # fresh page, no edits
+        self.assertIs(api.macro_set_editor_dirty(True, 1, gen2), True)
+        # Old page's late 'false' (higher seq, older generation) is dropped.
+        self.assertIs(api.macro_set_editor_dirty(False, 99, gen1), False)
+        self.assertFalse(api.allow_close())            # still asks
+        self.assertIs(api.macro_set_editor_dirty(True, 1, gen2), False)  # dup
+        self.assertIs(api.macro_set_editor_dirty(False, 2, gen2), True)
+        self.assertTrue(api.allow_close())
+
     def test_close_confirmed_skips_prompt_for_editor_edits(self):
         api = self.make_api()
         api._macro = self._macro_with()
