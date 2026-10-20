@@ -90,14 +90,12 @@ class ScreenWatcher:
                 hasn't published yet still stops the click. None = no
                 live check (caller-published geometry only).
             window_gone_fn: optional `callable() -> bool`, True once the
-                game is gone (AlbumRunner passes its `_window_gone`, which
-                also reports it and — on the runner's own thread only —
-                adopts a window the game recreated, so `live_geometry_fn`
-                then reads the new one; on any other thread it's a pure
-                no-op returning False). `wait_for` gives up as soon as it
-                says so instead of polling a closed game until the
-                timeout; the pre-click live check re-reads once when it
-                says "not gone". None = no check.
+                game window is no longer usable — game closed or window
+                changed (AlbumRunner passes its `_window_gone`, which also
+                reports it). `wait_for` gives up as soon as it says so
+                instead of polling until the timeout. None = no check.
+                (The pre-click check is `live_geometry_fn`'s job: return
+                None once the window isn't the game's.)
         """
         if stop_evt is None:
             raise ValueError("ScreenWatcher requires a stop_evt — "
@@ -265,24 +263,11 @@ class ScreenWatcher:
         any click would land on whatever is behind it."""
         if self._live_geometry_fn is None:
             return True
-        generation = self._geom[3]
         try:
             live = self._live_geometry_fn()
-            if (live is None and self._window_gone_fn is not None
-                    and not self._window_gone()):
-                # Not closed: minimized / re-create gap — or the game
-                # recreated its window and window_gone_fn just adopted the
-                # new one (caller's own thread only); read again.
-                live = self._live_geometry_fn()
         except Exception as e:
             print(f"    [watcher] live window check failed: {e}")
             return True
-        if self._geom[3] != generation:
-            # window_gone_fn adopted a recreated window and published its
-            # geometry: (sx, sy) was computed for the old one.
-            print("    click SKIPPED — the game recreated its window; "
-                  "target was for the old one")
-            return False
         if live is None:
             print("    click SKIPPED — game window isn't usable right now "
                   "(minimized / closed / off-screen)")

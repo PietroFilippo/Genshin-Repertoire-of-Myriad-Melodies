@@ -34,7 +34,7 @@ from config import (ALBUM_BEGIN_PERFORMANCE_XY, ALBUM_DIFFICULTY_COORDS,
                     ALBUM_END_POLL_S, ALBUM_GO_PERFORM_XY,
                     PIXEL_THRESHOLD, Y_SAMPLE_OFFSETS)
 from detector import NoteDetector
-from game_window import same_hwnd, scaled_layout
+from game_window import scaled_layout
 from standalone_runner import run_visualization
 
 
@@ -157,17 +157,6 @@ class SongPlayer:
         self.region = dict(region)
         self.scale_x = scale_x
         self.scale_y = scale_y
-
-    def update_hwnd(self, hwnd, pid=0):
-        """The game recreated its window (fullscreen toggle, display-mode
-        change): new HWND for the detector's GDI reads and focus gate
-        (`pid`: the game process, unchanged unless it was unknown).
-        `_rhythm_phase` rebuilds the detector (+ viz) on its next tick.
-        Called from the album runner's thread only (the thread running
-        `_rhythm_phase`) — never from the end watcher."""
-        self.hwnd = hwnd
-        if pid:
-            self.game_pid = pid
 
     def play(self, difficulty, skip_intro=False):
         """Play one song at `difficulty`. Returns True on normal
@@ -388,7 +377,7 @@ class SongPlayer:
             if time.time() >= next_geom:
                 next_geom = time.time() + GEOMETRY_POLL_S
                 if not self._refresh_geometry(block=False):
-                    return _GATE_STOP      # game closed (reported)
+                    return _GATE_STOP      # closed / changed (reported)
         if self.stop_evt.is_set():
             return _GATE_STOP
         print("  resumed")
@@ -412,17 +401,17 @@ class SongPlayer:
         window is moved or resized. A resize changes the lane layout and
         rebuilds the detector; a move only restarts the viz (the
         detector reads client-relative pixels, so a move doesn't affect
-        it). A minimized game keeps the last-known geometry; a closed one
-        (`refresh_geometry_fn(False)` returns False, while playing or
-        paused) ends the song at once. Returns False only if the game
-        window disappeared (already reported); True on song end or
-        stop."""
+        it). A minimized game keeps the last-known geometry; a closed
+        game or a changed window (`refresh_geometry_fn(False)` returns
+        False, while playing or paused) ends the song at once. Returns
+        False only if the game window is no longer usable (already
+        reported); True on song end or stop."""
         watcher_evt = threading.Event()
         end_watcher_thread = threading.Thread(
             target=self._end_watcher, args=(watcher_evt,), daemon=True)
         end_watcher_thread.start()
 
-        st = {'detector': None, 'layout': None, 'hwnd': None,
+        st = {'detector': None, 'layout': None,
               'viz_thread': None, 'viz_stop': threading.Event(),
               'viz_region': None}
 
@@ -447,7 +436,6 @@ class SongPlayer:
         def start_detection(layout):
             column_centers, hit_line_y = layout
             st['layout'] = layout
-            st['hwnd'] = self.hwnd
             st['detector'] = NoteDetector(self.hwnd, column_centers,
                                           hit_line_y, self.controller,
                                           pid=self.game_pid)
@@ -486,7 +474,7 @@ class SongPlayer:
                         time.sleep(0.1)
                         if time.time() >= next_geom:
                             if not self._refresh_geometry(block=False):
-                                # Game closed while paused (reported).
+                                # Closed / changed while paused (reported).
                                 window_lost = not self.stop_evt.is_set()
                                 break
                             next_geom = time.time() + GEOMETRY_POLL_S
@@ -505,23 +493,14 @@ class SongPlayer:
 
                 if st['detector'] is not None:
                     if not self._refresh_geometry(block=False):
-                        # Game closed mid-song (already reported) — the
+                        # Closed / changed mid-song (reported) — the
                         # finally below stops the detector, releasing
                         # every held key.
                         window_lost = not self.stop_evt.is_set()
                         break
                 layout = scaled_layout(self.scale_x, self.scale_y)
-                # A recreated game window (new HWND, via update_hwnd)
-                # needs a fresh detector too: the old one reads — and
-                # gates focus on — a handle that no longer exists.
-                recreated = (st['detector'] is not None
-                             and not same_hwnd(self.hwnd, st['hwnd']))
-                if (st['detector'] is None or layout != st['layout']
-                        or recreated):
-                    if recreated:
-                        print("  game window recreated — rebuilding the "
-                              "detector for the new window")
-                    elif st['detector'] is not None:
+                if st['detector'] is None or layout != st['layout']:
+                    if st['detector'] is not None:
                         print("  game window resized — rebuilding the "
                               "detector for the new lane layout")
                     stop_detection()
@@ -653,10 +632,10 @@ class SongPlayer:
                 pass
 
     def _fail(self, message):
-        # A step that failed because the game was closed (click refused,
-        # screen never appeared) was reported as that by
-        # `refresh_geometry_fn` (returns False) — don't bury it under a
-        # misleading "click failed" / "check the game".
+        # A step that failed because the game closed or its window
+        # changed (click refused, screen never appeared) was reported as
+        # that by `refresh_geometry_fn` (returns False) — don't bury it
+        # under a misleading "click failed" / "check the game".
         if not self._refresh_geometry(block=False):
             return
         self._emit({'last_error': message})

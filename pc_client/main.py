@@ -17,10 +17,11 @@ import time
 from config import (DEBUG_MODE, KEY_POLL_DELAY_S, Y_SAMPLE_OFFSETS,
                     INPUT_BACKEND_DEFAULT)
 from detector import NoteDetector
-from game_window import MSG_WINDOW_CLOSED, find_game_window, auto_detect
+from game_window import (MSG_WINDOW_CHANGED, MSG_WINDOW_CLOSED,
+                         find_game_window, auto_detect)
 from standalone_runner import (GEOMETRY_POLL_S, VIZ_EXIT_GEOMETRY,
-                               VIZ_EXIT_WINDOW_GONE, WINDOW_GONE,
-                               WINDOW_REPLACED, GeometryTracker,
+                               VIZ_EXIT_WINDOW_CHANGED, VIZ_EXIT_WINDOW_GONE,
+                               WINDOW_CHANGED, WINDOW_GONE, GeometryTracker,
                                run_visualization, layout_changed)
 from system_setup import boost_timer, restore_timer, set_dpi_aware
 from ui_core import make_input_backend
@@ -81,11 +82,10 @@ def main():
 
     # Windowed Genshin can be moved / resized while we run. A move needs
     # nothing (the detector reads client-relative pixels; the viz retargets
-    # its capture itself); a resize changes the lane layout, and a window
-    # the game recreated (fullscreen toggle, ...) has a new HWND, so
-    # rebuild the detector for either (the tracker holds the new HWND). The
-    # tracker anchors the run to the game's PID (captured here), polled
-    # from this main thread only.
+    # its capture itself); a resize changes the lane layout, so rebuild the
+    # detector for it. The tracker holds the game's window + PID + process
+    # handle for the run: a closed game or a changed window (destroyed /
+    # recycled — never followed) ends the CLI with a message.
     tracker = GeometryTracker(hwnd, capture_region, column_centers,
                               hit_line_y, tag='[cli]')
     detector = NoteDetector(hwnd, column_centers, hit_line_y, controller,
@@ -103,8 +103,13 @@ def main():
                                 pid=tracker.pid)
         detector.start()
 
-    # Set when Genshin is closed mid-run: shut down cleanly, then exit 1.
-    game_closed = False
+    # Why the run ended on the game window (closed / changed): shut down
+    # cleanly, print it, then exit 1.
+    lost = None
+    lost_by_reason = {VIZ_EXIT_WINDOW_GONE: MSG_WINDOW_CLOSED,
+                      VIZ_EXIT_WINDOW_CHANGED: MSG_WINDOW_CHANGED,
+                      WINDOW_GONE: MSG_WINDOW_CLOSED,
+                      WINDOW_CHANGED: MSG_WINDOW_CHANGED}
     try:
         if DEBUG_MODE:
             print("DEBUG_MODE on - visualization window will open. Close it "
@@ -115,8 +120,8 @@ def main():
                                            pin_console=True,
                                            game_hwnd=tracker.hwnd,
                                            geometry_poll=tracker.poll)
-                if reason == VIZ_EXIT_WINDOW_GONE:
-                    game_closed = True
+                if reason in (VIZ_EXIT_WINDOW_GONE, VIZ_EXIT_WINDOW_CHANGED):
+                    lost = lost_by_reason[reason]
                     break
                 if reason != VIZ_EXIT_GEOMETRY:
                     break
@@ -131,26 +136,26 @@ def main():
                     ctypes.windll.user32.SetWindowPos(hwnd_console, -1, 0, 0, 0, 0, 0x13)
                 old = tracker.current
                 new = tracker.poll()
-                if new == WINDOW_GONE:
-                    game_closed = True
+                if new in (WINDOW_GONE, WINDOW_CHANGED):
+                    lost = lost_by_reason[new]
                     break
-                if new == WINDOW_REPLACED or (
-                        new is not None and layout_changed(old, new)):
+                if new is not None and layout_changed(old, new):
                     _rebuild_detector()
                 time.sleep(GEOMETRY_POLL_S)
     except KeyboardInterrupt:
         print("\nCtrl+C received")
     finally:
-        if game_closed:
-            print(f"ERROR: {MSG_WINDOW_CLOSED}")
+        if lost:
+            print(f"ERROR: {lost}")
         print("Shutting down")
         detector.stop()
         controller.close()
+        tracker.close()
         cv2.destroyAllWindows()
         if timer_boosted:
             restore_timer()
         print("Shutdown complete")
-    if game_closed:
+    if lost:
         sys.exit(1)
 
 
