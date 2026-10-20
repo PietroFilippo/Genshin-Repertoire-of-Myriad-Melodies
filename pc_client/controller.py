@@ -438,12 +438,20 @@ def _open_failure_message(port, exc):
 class ArduinoHIDController:
     # Link-health state. Class-level defaults (all immutable) so test
     # doubles built with `__new__` behave like a freshly opened link.
-    # `_link_failed` latches True on the first hard serial error and
-    # never resets: a Windows COM handle doesn't come back after the
-    # board is unplugged, even if it re-enumerates on the same port.
+    # `_link_failed` latches True on the first hard serial error (or on
+    # close()) and never resets: a Windows COM handle doesn't come back
+    # after the board is unplugged, even if it re-enumerates on the same
+    # port.
+    #
+    # Both fields are only ever changed while holding `_write_lock`, in
+    # the same critical section as the port I/O they describe. The timeout
+    # run must follow the order writes actually hit the port: counting
+    # after releasing the lock let six detector threads interleave
+    # (timeout -> another thread's success -> timeout -> timeout read as
+    # 3 in a row), latching a live link and swallowing the key-ups that
+    # would have released held keys. Logging happens after release.
     _link_failed = False
     _write_timeouts = 0
-    _health_lock = threading.Lock()   # only taken on the failure path
 
     def __init__(self, cancel_evt=None):
         """Open the serial link to the Leonardo.
@@ -533,36 +541,50 @@ class ArduinoHIDController:
         lock = getattr(self, '_write_lock', None)
         if lock is not None and lock.acquire(blocking=False):
             failure = None
+            latched = False
             try:
-                ser.in_waiting
-            except (serial.SerialException, OSError) as exc:
-                failure = exc
+                if not self._link_failed:
+                    try:
+                        ser.in_waiting
+                    except (serial.SerialException, OSError) as exc:
+                        failure = exc
+                        latched = self._latch_link_failed_locked()
             finally:
                 lock.release()
-            if failure is not None:
-                self._mark_link_failed('port check', failure)
+            if latched:
+                self._log_link_failure('port check', failure)
         return not self._link_failed
 
-    def _mark_link_failed(self, context, exc):
-        """Latch the link as dead and log it ONCE. Every later write is
-        skipped (see `_write_line`) instead of re-failing — and re-logging
-        — through the dead handle on every keystroke."""
-        with self._health_lock:
-            if self._link_failed:
-                return
-            self._link_failed = True
+    def _latch_link_failed_locked(self):
+        """Latch the link as dead. Caller MUST hold `_write_lock`.
+        Returns True only for the call that flipped the latch, so exactly
+        one caller logs it (via `_log_link_failure`, after releasing the
+        lock). Every later write is skipped (see `_write_line`) instead
+        of re-failing — and re-logging — through the dead handle on
+        every keystroke."""
+        if self._link_failed:
+            return False
+        self._link_failed = True
+        return True
+
+    @staticmethod
+    def _log_link_failure(context, exc):
         print(f"[serial] {context} failed: {exc}")
         print("[serial] Arduino disconnected — stop and press Start again "
               "to reconnect")
 
     def _close_port_quietly(self):
+        """Close the port without raising. Returns True if `close()`
+        completed, False if there was no port or it raised."""
         ser = getattr(self, 'ser', None)
         if ser is None:
-            return
+            return False
         try:
             ser.close()
+            return True
         except Exception as e:
             print(f"[serial] close failed: {e}")
+            return False
 
     def _write_line(self, cmd):
         """Write one protocol line. Returns write duration in seconds or
@@ -571,27 +593,47 @@ class ArduinoHIDController:
         execution time — the Leonardo owns that clock."""
         if self._link_failed:
             return None
-        if self.ser and self.ser.is_open:
-            cmd_str = f"{cmd}\n"
+        ser = self.ser
+        if not ser or not ser.is_open:
+            return None
+        payload = f"{cmd}\n".encode('utf-8')
+        timeout_exc = hard_exc = None
+        latched = False
+        started = time.perf_counter()
+        with self._write_lock:
+            # Re-check under the lock: another writer may have latched
+            # the link while this one was queued behind it.
+            if self._link_failed:
+                return None
             try:
-                started = time.perf_counter()
-                with self._write_lock:
-                    self.ser.write(cmd_str.encode('utf-8'))
-                self._write_timeouts = 0
-                return time.perf_counter() - started
+                ser.write(payload)
             except serial.SerialTimeoutException as e:
                 # Don't let a transient write failure crash a worker thread.
                 # A run of them (no success in between) means the board is
                 # gone or hung — latch the link dead instead of stalling
                 # 0.5 s per write forever.
+                timeout_exc = e
                 self._write_timeouts += 1
-                print(f"[serial] write failed for {cmd!r}: {e}")
-                if self._write_timeouts >= _MAX_CONSECUTIVE_WRITE_TIMEOUTS:
-                    self._mark_link_failed(
-                        f"{self._write_timeouts} consecutive writes", e)
+                timeouts = self._write_timeouts
+                if timeouts >= _MAX_CONSECUTIVE_WRITE_TIMEOUTS:
+                    latched = self._latch_link_failed_locked()
             except (serial.SerialException, OSError) as e:
                 # Hard failure (unplugged, handle invalid): never transient.
-                self._mark_link_failed(f"write {cmd!r}", e)
+                hard_exc = e
+                latched = self._latch_link_failed_locked()
+            else:
+                if self._write_timeouts:
+                    self._write_timeouts = 0
+                return time.perf_counter() - started
+        # Failure path only — log outside the lock so other writers aren't
+        # held up behind console / UI-queue output.
+        if timeout_exc is not None:
+            print(f"[serial] write failed for {cmd!r}: {timeout_exc}")
+            if latched:
+                self._log_link_failure(f"{timeouts} consecutive writes",
+                                       timeout_exc)
+        elif latched:
+            self._log_link_failure(f"write {cmd!r}", hard_exc)
         return None
 
     def _send_command(self, cmd):
@@ -600,14 +642,25 @@ class ArduinoHIDController:
 
     def _read_response_lines(self):
         """Read complete firmware response lines without blocking."""
-        if self._link_failed or not self.ser or not self.ser.is_open:
+        if self._link_failed:
             return []
-        try:
-            with self._write_lock:
-                waiting = self.ser.in_waiting
-                chunk = self.ser.read(waiting) if waiting else b''
-        except (serial.SerialException, OSError) as exc:
-            self._mark_link_failed('read', exc)
+        ser = self.ser
+        if not ser or not ser.is_open:
+            return []
+        failure = None
+        latched = False
+        with self._write_lock:
+            if self._link_failed:
+                return []
+            try:
+                waiting = ser.in_waiting
+                chunk = ser.read(waiting) if waiting else b''
+            except (serial.SerialException, OSError) as exc:
+                failure = exc
+                latched = self._latch_link_failed_locked()
+        if failure is not None:
+            if latched:
+                self._log_link_failure('read', failure)
             return []
         if chunk:
             self._rx_buffer.extend(chunk)
@@ -912,8 +965,19 @@ class ArduinoHIDController:
                 time.sleep(0.04)
         return False
 
+    def _mark_closed(self):
+        """Terminal state for a deliberate close: no later write or read
+        goes through, and `healthy` is False even if `ser.close()` raised
+        and pyserial left `is_open` True. Not logged as a disconnect."""
+        with self._write_lock:
+            self._link_failed = True
+
     def close(self):
-        if self.ser and self.ser.is_open:
+        ser = self.ser
+        if not ser or not ser.is_open:
+            self._mark_closed()
+            return
+        try:
             # Send UP to all standard rhythm keys just in case. Skipped
             # internally (no write, no log spam) if the link already died.
             for k in ['a', 's', 'd', 'j', 'k', 'l']:
@@ -921,8 +985,12 @@ class ArduinoHIDController:
             # Release mouse just in case
             self.mouse_up('left')
             self.mouse_up('right')
-            self._close_port_quietly()
-            print("Serial connection closed")
+        finally:
+            # Latch BEFORE closing the port so no writer slips in between,
+            # and latch regardless of how the sweep or close() went.
+            self._mark_closed()
+            if self._close_port_quietly():
+                print("Serial connection closed")
 
 if __name__ == "__main__":
     # Test script if run directly

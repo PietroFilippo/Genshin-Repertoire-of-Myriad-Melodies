@@ -150,6 +150,65 @@ class ScriptedSerial:
         return len(payload)
 
 
+class PatternSerial:
+    """Serial double whose outcome depends on the ORDER writes reach the
+    port. `write` runs under the controller's write lock, so `index` is
+    the true serialized order regardless of thread interleaving."""
+
+    def __init__(self, is_timeout):
+        self.is_open = True
+        self.is_timeout = is_timeout
+        self.index = 0
+        self.writes = []
+        self.outcomes = []
+
+    in_waiting = 0
+
+    def read(self, count):
+        return b''
+
+    def close(self):
+        self.is_open = False
+
+    def write(self, payload):
+        index = self.index
+        self.index += 1
+        timed_out = self.is_timeout(index)
+        self.outcomes.append(timed_out)
+        if timed_out:
+            raise serial.SerialTimeoutException('Write timeout')
+        self.writes.append(payload.decode('ascii').strip())
+        return len(payload)
+
+
+class HookedLock:
+    """Drop-in for threading.Lock that runs a one-shot `after_release`
+    hook in the releasing thread right after release. Lets a test park
+    a writer in the gap between leaving the lock and any bookkeeping it
+    does afterwards — the window the racy timeout counter lived in."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.after_release = None
+
+    def acquire(self, blocking=True, timeout=-1):
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self):
+        self._lock.release()
+        hook, self.after_release = self.after_release, None
+        if hook is not None:
+            hook()
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release()
+        return False
+
+
 def _bare_controller(ser):
     """ArduinoHIDController without touching a real port — mirrors the
     fixture style in test_scheduled_macro.py."""
@@ -387,15 +446,50 @@ class ArduinoHealthTests(unittest.TestCase):
         self.assertEqual(0, ser.attempts)     # probe never writes
         self.assertEqual(1, log.count('Arduino disconnected'))
 
-    def test_close_makes_controller_unhealthy_and_never_raises(self):
+    def test_close_sweeps_then_makes_controller_unhealthy(self):
+        ser = ScriptedSerial()
+        ctrl = _bare_controller(ser)
+        _, log = _quiet(ctrl.close)
+        self.assertIn('K:97:UP', ser.writes)          # rhythm sweep ran
+        self.assertIn('M:1:UP', ser.writes)
+        self.assertTrue(ser.closed)
+        self.assertFalse(ctrl.healthy)
+        self.assertEqual(1, log.count('Serial connection closed'))
+
+        writes = list(ser.writes)
+        _, log2 = _quiet(ctrl.close)                  # idempotent
+        _quiet(ctrl.key_down, 'a')
+        self.assertEqual(writes, ser.writes)
+        self.assertNotIn('Serial connection closed', log2)
+
+    def test_failed_port_close_still_disables_the_same_controller(self):
+        # pyserial can raise from close() and leave is_open True; the
+        # controller must still be terminally dead afterwards.
         ser = ScriptedSerial()
         ser.close = mock.Mock(side_effect=OSError('handle already gone'))
         ctrl = _bare_controller(ser)
-        _quiet(ctrl.close)                    # must not raise
-        ser2 = ScriptedSerial()
-        ctrl2 = _bare_controller(ser2)
-        _quiet(ctrl2.close)
-        self.assertFalse(ctrl2.healthy)
+        _, log = _quiet(ctrl.close)                   # must not raise
+        self.assertTrue(ser.is_open)                  # fake really stayed open
+        self.assertIn('K:97:UP', ser.writes)          # sweep attempted first
+        self.assertIn('close failed', log)
+        self.assertNotIn('Serial connection closed', log)
+        self.assertFalse(ctrl.healthy)
+
+        writes = list(ser.writes)
+        _quiet(ctrl.key_down, 'a')
+        _quiet(ctrl.mouse_down, 'left')
+        self.assertEqual(writes, ser.writes)
+        self.assertEqual([], _quiet(ctrl._read_response_lines)[0])
+
+    def test_close_marks_dead_even_if_the_sweep_is_interrupted(self):
+        ser = ScriptedSerial()
+        ctrl = _bare_controller(ser)
+        with mock.patch.object(ctrl, 'key_up',
+                               side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                _quiet(ctrl.close)
+        self.assertTrue(ser.closed)
+        self.assertFalse(ctrl.healthy)
 
     def test_close_on_dead_link_skips_the_sweep_writes(self):
         ser = ScriptedSerial([serial.SerialException('gone')])
@@ -406,6 +500,96 @@ class ArduinoHealthTests(unittest.TestCase):
         self.assertEqual(attempts, ser.attempts)
         self.assertTrue(ser.closed)
         self.assertNotIn('write', log)
+
+    def test_success_from_another_thread_breaks_the_timeout_run(self):
+        # Reviewer's interleaving: in port order A times out, B succeeds,
+        # then C and D time out. That is never 3 consecutive timeouts, so
+        # the link must stay up and B's key must still be releasable.
+        timeout = serial.SerialTimeoutException('Write timeout')
+        ser = ScriptedSerial([timeout, None, timeout, timeout])
+        ctrl = _bare_controller(ser)
+        lock = HookedLock()
+        ctrl._write_lock = lock
+
+        def run_b_in_the_gap():
+            # A has just left the lock after its timeout. B's entire
+            # successful write (and any reset it does) lands right here,
+            # before A's thread gets to run another line.
+            b = threading.Thread(target=ctrl.key_down, args=('s',))
+            b.start()
+            b.join(5)
+
+        lock.after_release = run_b_in_the_gap
+
+        def scenario():
+            a = threading.Thread(target=ctrl.key_down, args=('a',))
+            a.start()
+            a.join(5)
+            ctrl.key_down('d')          # C: timeout
+            ctrl.key_down('j')          # D: timeout
+            ctrl.key_up('s')            # must still reach the board
+
+        _, log = _quiet(scenario)
+        self.assertIn('K:115:DOWN', ser.writes)
+        self.assertIn('K:115:UP', ser.writes)
+        self.assertNotIn('Arduino disconnected', log)
+        self.assertTrue(ctrl.healthy)
+
+        _quiet(ctrl.close)
+        self.assertIn('K:97:UP', ser.writes)        # sweep not suppressed
+
+    def test_detector_threads_never_latch_without_three_timeouts_in_a_row(self):
+        # Six rhythm-detector-style threads hammer the port; every third
+        # write (in port order) succeeds. Whatever the interleaving, the
+        # link must stay up, and the latch must agree with port order.
+        ser = PatternSerial(lambda index: index % 3 != 2)
+        ctrl = _bare_controller(ser)
+        keys = ['a', 's', 'd', 'j', 'k', 'l']
+        start = threading.Barrier(len(keys))
+
+        def hammer(key):
+            start.wait()
+            for _ in range(150):
+                ctrl.key_down(key)
+                ctrl.key_up(key)
+
+        previous = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            def scenario():
+                threads = [threading.Thread(target=hammer, args=(k,))
+                           for k in keys]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(30)
+            _, log = _quiet(scenario)
+        finally:
+            sys.setswitchinterval(previous)
+
+        self.assertEqual(len(keys) * 300, ser.index)
+        self.assertNotIn('Arduino disconnected', log)
+        self.assertTrue(ctrl.healthy)
+
+    def test_latch_happens_at_the_third_consecutive_timeout_in_port_order(self):
+        # Two successes then timeouts forever: exactly 3 timeouts reach
+        # the port, then every later write (from any thread) is skipped.
+        ser = PatternSerial(lambda index: index >= 2)
+        ctrl = _bare_controller(ser)
+
+        def scenario():
+            threads = [threading.Thread(
+                target=lambda k=k: [ctrl.key_down(k) for _ in range(20)])
+                for k in ['a', 's', 'd', 'j', 'k', 'l']]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+
+        _, log = _quiet(scenario)
+        self.assertEqual([False, False, True, True, True], ser.outcomes)
+        self.assertEqual(1, log.count('Arduino disconnected'))
+        self.assertFalse(ctrl.healthy)
 
     def test_software_backend_is_always_healthy(self):
         import software_input
