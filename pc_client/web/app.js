@@ -244,22 +244,42 @@ $('#btn-max').addEventListener('click', toggleMaximize);
 // `dblclick`: the drag region hands the first press to the OS move loop
 // (WM_NCLBUTTONDOWN), which may swallow the mouseup the DOM `dblclick`
 // needs, while mousedowns keep arriving.
+//
+// Compared in SCREEN space: during a drag the window follows the
+// pointer, so client coordinates stay put and two quick drags looked
+// like a double click. The pending first press is also voided when the
+// pointer moves more than TB_DBLCLICK_SLOP_PX (when the DOM sees the
+// move), when the window itself moved between the presses (the OS move
+// loop doesn't deliver mousemoves, but window.screenX/Y change), when
+// the pointer leaves the region, or when the window loses focus.
 const TB_DBLCLICK_MS = 450;
-let _tbLastDown = { at: 0, x: 0, y: 0 };
+const TB_DBLCLICK_SLOP_PX = 4;
+let _tbPending = null;   // first press of a possible double click
+function tbForgetPress() { _tbPending = null; }
+function tbMovedPast(p, sx, sy) {
+    return Math.abs(sx - p.sx) > TB_DBLCLICK_SLOP_PX || Math.abs(sy - p.sy) > TB_DBLCLICK_SLOP_PX;
+}
 $$('.pywebview-drag-region').forEach((el) => {
     el.addEventListener('mousedown', (ev) => {
         if (ev.button !== 0) return;
         const now = Date.now();
-        const prev = _tbLastDown;
-        _tbLastDown = { at: now, x: ev.clientX, y: ev.clientY };
-        if (now - prev.at <= TB_DBLCLICK_MS
-            && Math.abs(ev.clientX - prev.x) <= 4 && Math.abs(ev.clientY - prev.y) <= 4) {
-            _tbLastDown = { at: 0, x: 0, y: 0 };   // a third press starts over
+        const prev = _tbPending;
+        const wx = window.screenX, wy = window.screenY;
+        _tbPending = { at: now, sx: ev.screenX, sy: ev.screenY, wx, wy };
+        if (prev && now - prev.at <= TB_DBLCLICK_MS
+            && !tbMovedPast(prev, ev.screenX, ev.screenY)
+            && wx === prev.wx && wy === prev.wy) {
+            _tbPending = null;   // a third press starts over
             ev.preventDefault();
             toggleMaximize();
         }
     });
+    el.addEventListener('mousemove', (ev) => {
+        if (_tbPending && tbMovedPast(_tbPending, ev.screenX, ev.screenY)) _tbPending = null;
+    });
+    el.addEventListener('mouseleave', tbForgetPress);
 });
+window.addEventListener('blur', tbForgetPress);
 
 // Resize grab zones (eight invisible edge / corner strips in index.html).
 // Left button only; Python owns the resize loop until the button is
@@ -434,13 +454,24 @@ function resolveTheme(pref) {
     return (mql && mql.matches) ? 'dark' : 'light';
 }
 
+// The select shows THEME.pref whenever it isn't focused (setting the
+// value of a focused select closes its open option list under the
+// user); a focused select catches up on blur (and on focus, before the
+// list opens), so an update that arrived while it was open can't leave
+// it showing a stale value — picking the shown value fires no `change`.
+function syncThemeSelect(force) {
+    const sel = $('#theme-select');
+    if (!sel) return;
+    if (!force && sel === activeEl()) return;
+    if (sel.value !== THEME.pref) sel.value = THEME.pref;
+}
+
 function renderTheme() {
     const root = document.documentElement;
     const resolved = resolveTheme(THEME.pref);
     if (resolved === 'score') root.removeAttribute('data-theme');
     else root.setAttribute('data-theme', resolved);
-    const sel = $('#theme-select');
-    if (sel && sel.value !== THEME.pref && sel !== activeEl()) sel.value = THEME.pref;
+    syncThemeSelect(false);
 }
 
 function applyTheme(name, persist) {
@@ -455,6 +486,18 @@ function applyTheme(name, persist) {
 $('#theme-select').addEventListener('change', () => {
     applyTheme($('#theme-select').value, true);
 });
+$('#theme-select').addEventListener('focus', () => syncThemeSelect(true));
+$('#theme-select').addEventListener('blur', () => syncThemeSelect(true));
+
+// Start from the localStorage mirror (the inline bootstrap in index.html
+// painted it already): the runtime pref, the select and a `system`
+// listener then agree with the paint even under an older Python that
+// never sends `theme`. get_initial_state() overrides it when it does.
+(function adoptStoredTheme() {
+    let stored = null;
+    try { stored = localStorage.getItem('theme'); } catch (e) { stored = null; }
+    if (THEMES.includes(stored)) applyTheme(stored, false);
+})();
 
 // --- mode + album options --------------------------------------------------
 
@@ -3083,8 +3126,9 @@ window.updateStatus = function updateStatus(data) {
             sel.value = data.input_backend;
         }
     }
-    if ('theme' in data && typeof data.theme === 'string' && data.theme !== THEME.pref) {
-        applyTheme(data.theme, false);
+    if ('theme' in data && typeof data.theme === 'string') {
+        if (data.theme !== THEME.pref) applyTheme(data.theme, false);
+        else syncThemeSelect(false);   // same pref, but the select may lag
     }
     if ('maximized' in data && typeof data.maximized === 'boolean') {
         setMaximized(data.maximized);

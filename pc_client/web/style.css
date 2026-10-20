@@ -24,6 +24,7 @@
     --gold-dim: rgba(214, 191, 143, .16);
     --ok: #86c99b;
     --ok-text: #86c99b;               /* success used as text */
+    --ok-ink: #1b1710;                /* text on a success fill, 9.2:1 */
     --warn: #e6b45c;
     --bad: #e2756a;
     --bad-text: #f0a79e;
@@ -71,6 +72,7 @@
     --gold-dim: rgba(168, 132, 46, .14);
     --ok: #246e3b;
     --ok-text: #246e3b;
+    --ok-ink: #ffffff;                /* text on a success fill, 7.0:1 */
     --warn: #9a5f06;
     --bad: #c0392b;
     --bad-text: #a0281c;
@@ -119,6 +121,7 @@
     --gold-dim: rgba(52, 107, 241, .16);
     --ok: #10b981;                    /* T3 success */
     --ok-text: #34d399;               /* T3 success text */
+    --ok-ink: #052e16;                /* text on a success fill, 7.2:1 (white is 2.5:1) */
     --warn: #fe9a00;                  /* T3 warning */
     --bad: #fb414a;                   /* T3 destructive */
     --bad-text: #ff6467;              /* T3 destructive text */
@@ -1035,9 +1038,10 @@ button:disabled { cursor: not-allowed; }
 
 .hk-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 10px;
+    gap: 6px 10px;
     background: var(--bg);
     border: 1px solid var(--line);
     border-radius: 7px;
@@ -1045,7 +1049,15 @@ button:disabled { cursor: not-allowed; }
     min-width: 0;
 }
 
+/* The label keeps its natural width on the line; when label + cap don't
+   both fit (a long binding such as Ctrl+Shift+Insert in a narrow column)
+   the cap wraps under it instead of the label being squeezed to 0 px.
+   Alone on a line the label can still ellipsize, never vanish. A cap
+   on its own line sits under the label's left edge (label / value),
+   not at the far right of the row. */
 .hk-row > span {
+    flex: 1 1 auto;
+    min-width: 0;
     color: var(--ink-2);
     white-space: nowrap;
     overflow: hidden;
@@ -1310,7 +1322,7 @@ button.key:disabled { color: var(--ink-3); }
 }
 
 .active-macro-row.assigned .am-letter { color: var(--gold-text); border-color: color-mix(in srgb, var(--gold) 50%, transparent); background: var(--gold-dim); }
-.active-macro-row.active-playing .am-letter { color: var(--gold-ink); background: var(--ok); border-color: var(--ok); }
+.active-macro-row.active-playing .am-letter { color: var(--ok-ink); background: var(--ok); border-color: var(--ok); }
 .active-macro-row .sel, .active-macro-row .sel select { width: 100%; min-width: 0; }
 .active-macro-row .sel select { height: 28px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
 /* slot choice locked while a macro plays (the row's Play stays live) */
@@ -1686,6 +1698,13 @@ html[data-maximized="1"] .app { box-shadow: none; }
     .lane-row { max-width: 960px; width: 100%; margin: 0 auto; }
     .stage { padding: 18px 22px 16px; }
 
+    /* Slot tiles: six columns when each tile keeps >= 100 px (the hover
+       action pair "Rename | Clear" needs ~45 px a side), fewer columns
+       below that. The min is the larger of 100 px and a sixth of the
+       row, so auto-fill never places a seventh column; the 1 px slack
+       in the sixth keeps floating-point rounding from dropping to five. */
+    .slots { grid-template-columns: repeat(auto-fill, minmax(max(100px, calc((100% - 36px) / 6)), 1fr)); }
+
     /* Macros: two columns — editing on the right, full height. */
     .panel-active[data-panel="macros"] {
         display: grid;
@@ -1717,11 +1736,14 @@ html[data-maximized="1"] .app { box-shadow: none; }
     #events-card .card-h { flex-wrap: wrap; row-gap: 6px; }
     #events-card .card-h .right { flex-wrap: wrap; justify-content: flex-end; }
     #events-card .evt-empty { flex: 1; display: grid; place-items: center; }
-    #macro-hotkeys-card .hk { grid-template-columns: repeat(3, 1fr); }
+    /* As many hotkey columns as keep a row >= 190 px (two columns still
+       fit beside the editor at 960 px with a classic scrollbar; a long
+       cap then stacks under its label); a fixed five erased the labels
+       at 1240-1400. */
+    #macro-hotkeys-card .hk { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 }
 
 @media (min-width: 1240px) {
-    #macro-hotkeys-card .hk { grid-template-columns: repeat(5, 1fr); }
     #hotkeys-card .hk { max-width: 900px; }
 }
 
@@ -1732,9 +1754,13 @@ html[data-maximized="1"] .app { box-shadow: none; }
     #album-card .field .val .sub { flex-basis: auto; white-space: nowrap; }
     #album-card .field > label, #album-card .field > .help { margin-top: 0; }
     #album-card .field { align-items: center; }
-    /* 18 slots as 9 x 2 instead of 6 x 3: shorter column, tiles still wide. */
-    .slots { grid-template-columns: repeat(9, 1fr); }
     .panel-active[data-panel="macros"] { grid-template-columns: minmax(0, 1fr) minmax(400px, 520px); }
+}
+
+@media (min-width: 1560px) {
+    /* 18 slots as 9 x 2 instead of 6 x 3: shorter column, and from here
+       nine tiles still measure >= 100 px next to the 520 px editor. */
+    .slots { grid-template-columns: repeat(9, 1fr); }
 }
 
 /* Logs: full width is the right call for log lines; nothing to cap.
@@ -1748,19 +1774,28 @@ html[data-maximized="1"] .app { box-shadow: none; }
 /* Eight invisible zones on the app's edges (6 px) and corners (12 px).
    mousedown (left button) on one calls start_window_resize(edge) and
    Python runs the resize loop until the button is released. They sit
-   outside both pywebview-drag-region islands, above every panel and the
-   dialog scrim (a 6 px band at the very edge blocks nothing that
-   matters), and disappear while maximized, with the hairline. */
+   outside both pywebview-drag-region islands, above the titlebar and
+   the dialog scrim (a 6 px band at the very edge blocks nothing that
+   matters there), and disappear while maximized, with the hairline. */
+:root { --rz-edge: 6px; --rz-corner: 12px; }
 .rz { position: absolute; z-index: 120; -webkit-app-region: no-drag; background: transparent; }
-.rz-n  { top: 0; left: 12px; right: 12px; height: 6px; cursor: ns-resize; }
-.rz-s  { bottom: 0; left: 12px; right: 12px; height: 6px; cursor: ns-resize; }
-.rz-e  { right: 0; top: 12px; bottom: 12px; width: 6px; cursor: ew-resize; }
-.rz-w  { left: 0; top: 12px; bottom: 12px; width: 6px; cursor: ew-resize; }
-.rz-ne { top: 0; right: 0; width: 12px; height: 12px; cursor: nesw-resize; }
-.rz-nw { top: 0; left: 0; width: 12px; height: 12px; cursor: nwse-resize; }
-.rz-se { bottom: 0; right: 0; width: 12px; height: 12px; cursor: nwse-resize; }
-.rz-sw { bottom: 0; left: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+.rz-n  { top: 0; left: var(--rz-corner); right: var(--rz-corner); height: var(--rz-edge); cursor: ns-resize; }
+.rz-s  { bottom: 0; left: var(--rz-corner); right: var(--rz-corner); height: var(--rz-edge); cursor: ns-resize; }
+.rz-e  { right: 0; top: var(--rz-corner); bottom: var(--rz-corner); width: var(--rz-edge); cursor: ew-resize; }
+.rz-w  { left: 0; top: var(--rz-corner); bottom: var(--rz-corner); width: var(--rz-edge); cursor: ew-resize; }
+.rz-ne { top: 0; right: 0; width: var(--rz-corner); height: var(--rz-corner); cursor: nesw-resize; }
+.rz-nw { top: 0; left: 0; width: var(--rz-corner); height: var(--rz-corner); cursor: nwse-resize; }
+.rz-se { bottom: 0; right: 0; width: var(--rz-corner); height: var(--rz-corner); cursor: nwse-resize; }
+.rz-sw { bottom: 0; left: 0; width: var(--rz-corner); height: var(--rz-corner); cursor: nesw-resize; }
 html[data-maximized="1"] .rz { display: none; }
+
+/* The scrolling panel ends where the east and south zones begin, so its
+   10 px scrollbar (and a horizontal one, if ever) is never under a grab
+   zone: a drag on the scrollbar scrolls, a drag in the 6 px gutter
+   resizes. The gutter shows the page background like the panel itself,
+   so nothing visible changes. Maximized: no zones, so no gutter. */
+.panel { margin-right: var(--rz-edge); margin-bottom: var(--rz-edge); }
+html[data-maximized="1"] .panel { margin-right: 0; margin-bottom: 0; }
 
 /* --- events editor: the Key column ------------------------------------- */
 /* The Key column had no width of its own, so in the wide two-column
