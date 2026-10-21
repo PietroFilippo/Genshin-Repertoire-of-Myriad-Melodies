@@ -35,7 +35,7 @@ from standalone_runner import run_standalone
 from system_setup import boost_timer, restore_timer, set_dpi_aware
 
 
-APP_VERSION = '1.6.1'
+APP_VERSION = '1.6.2'
 # Bumped by hand on every build that goes to the user. Printed at startup
 # and stamped into the window title so "which build is running" is never
 # a guess — a whole debugging round was lost to that ambiguity.
